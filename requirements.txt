@@ -1,0 +1,20 @@
+# --- Core Deep Learning & Local 4GB VRAM Inference ---
+torch>=2.2.0
+transformers>=4.43.0
+accelerate>=0.31.0
+bitsandbytes>=0.43.1
+safetensors>=0.4.3
+huggingface-hub>=0.23.0
+
+# --- Data Contracts, Configuration & Scientific Computing ---
+pydantic>=2.7.0
+PyYAML>=6.0.1
+numpy>=1.26.0
+scipy>=1.13.0
+networkx>=3.3
+
+# --- System Profiling, Console Telemetry & Testing ---
+psutil>=5.9.8
+rich>=13.7.1
+pytest>=8.2.0
+httpx>=0.27.0

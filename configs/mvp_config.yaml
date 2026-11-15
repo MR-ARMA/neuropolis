@@ -1,0 +1,74 @@
+# ==============================================================================
+# MVP CONFIGURATION: TUNED FOR 4GB NVIDIA VRAM LAPTOP & RAPID VERIFICATION
+# ==============================================================================
+simulation_meta:
+  experiment_id: "mvp_bilateral_trust_market_v1"
+  random_seed: 42
+  num_agents: 6
+  num_ticks: 8
+  environment_type: "BILATERAL_TRUST_MARKET"
+  db_path: "data/mvp_world_state.sqlite"
+  telemetry_jsonl_path: "data/mvp_telemetry.jsonl"
+
+hardware_and_backend:
+  backend_type: "WHITE_BOX_PYTORCH"          # Options: WHITE_BOX_PYTORCH | BLACK_BOX_API
+  model_id: "Qwen/Qwen2.5-0.5B-Instruct"     # Fits comfortably in <3.2 GB VRAM in FP16/4-bit
+  models_dir: "./models"
+  quantization_mode: "fp16"                  # Options: "nf4_4bit" (~1.3GB VRAM) | "fp16" (~3.0GB VRAM)
+  device: "cuda"                             # Auto-falls back to "cpu" if CUDA is unavailable
+  max_new_tokens: 180
+  temperature: 0.4
+  batch_size: 1                              # Sequential conflict-free execution for 4GB VRAM
+  vram_ceiling_gb: 3.2
+  black_box_api_url: "http://localhost:11434/v1/chat/completions"
+  black_box_api_key: "EMPTY"
+
+mechanistic_steering:
+  enabled: true
+  mode: "MASTER_EQUATION_MVP"                # Options: NONE | PASTA | ITI | MASTER_EQUATION_MVP
+  calibration_pairs_count: 16                # Fast <10s contrastive SVD calibration on startup
+  target_layer_fraction: 0.55                # Middle-upper layers for Value & Attention steering
+  # --- Active MVP High-ROI Master Equation Terms ---
+  omega_fin_stress: 2.2                      # Term 1a: State-coupled boost on SPAN_DRIVES_AND_FINANCE
+  omega_peer_salience: 1.8                   # Term 1b: State-coupled boost on SPAN_PEER_MEMORY
+  gamma_cynicism_scale: 0.85                 # Term 3a: Value-space projection removing u_trust
+  eta_anxiety_scale: 0.65                    # Term 3b: Value-space projection injecting u_threat
+  kappa_dissonance_sink: 2.8                 # Term 8: Logit boost on <bos> sink under dissonance
+  logit_clip_z_max: 4.5                      # Variance-preserving additive bias ceiling
+  # --- Post-MVP Master Equation Parameters (Preserved in Config) ---
+  lambda_rope_construal: 0.35                # Term 4: Construal RoPE phase warping
+  alpha_sys1_gate: 0.40                      # Term 5a: System-1 induction head boost
+  beta_sys2_gate: 0.40                       # Term 5b: System-2 deliberative head suppression
+  epsilon_mirror_contagion: 0.50             # Term 6: Latent KV-prefix affective contagion
+  beta_0_temperature: 1.0                    # Term 7: Yerkes-Dodson baseline inverse temperature
+  zeta_panic: 1.5                            # Term 7a: Panic sharpening coefficient
+  zeta_fatigue: 0.8                          # Term 7b: Fatigue flattening coefficient
+  mu_hebbian_trace: 0.60                     # Term 9: Short-term Hebbian rumination weight
+
+entropy_tms_router:
+  enabled: true
+  probe_tokens_k: 5                          # Semantic tokens probed after '{"internal_thought": "'
+  top_p_truncation: 0.90                     # Top-p vocabulary support for Shannon entropy
+  entropy_threshold_tau: 0.68                # Halts & routes ASK_EXPERT if H_bar > tau
+  communication_cost_xi: 0.05
+
+memory_and_cognition:
+  stm_capacity: 12
+  ebbinghaus_base_half_life_ticks: 4.0
+  consolidation_salience_threshold: 1.85
+  habit_router_arousal_threshold: 0.15       # Below this + no incoming msg -> fast System-1 Habit
+  habit_router_rpe_threshold: 0.10
+  slovic_pos_trust_rate: 0.12                # Asymmetric trust building rate (eta_+)
+  slovic_neg_trust_rate: 0.30                # Asymmetric trust destruction rate (eta_- = 2.5 * eta_+)
+
+economy_and_institutions:
+  initial_agent_cash: 100.0
+  initial_treasury_cash: 200.0
+  initial_bank_reserves: 300.0
+  initial_firm_sector_cash: 400.0
+  base_wage_per_tick: 12.0
+  survival_food_consumption_per_tick: 1
+  reference_food_price: 15.0
+  reference_tech_price: 35.0
+  sales_tax_rate: 0.05
+  max_action_retries: 2
