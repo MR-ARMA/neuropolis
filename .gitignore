@@ -218,3 +218,36 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# Python & Environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Model Weights & Mechanistic Caches
+models/*
+!models/.gitkeep
+*.safetensors
+*.bin
+*.gguf
+*.pt
+*.pth
+
+# Simulation Databases & Telemetry Outputs
+*.db
+*.db-wal
+*.db-shm
+*.duckdb
+*.parquet
+*.jsonl
+runs/
+outputs/
+
+# Secrets & IDE
+.env
+.vscode/
+.idea/
