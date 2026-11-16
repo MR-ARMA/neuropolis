@@ -1,25 +1,16 @@
 """
 src/brain/inference_brain.py
 MODULE 2 (M2) & MODULE 7 (PromptSpanCompiler):
-Implements:
-  1. `PromptSpanCompiler`: Assembles structured XML semantic tags and maps exact token
-     intervals into `TokenSpanMap` (`SPAN_SINK`, `SPAN_SELF_IDENTITY`,
-     `SPAN_DRIVES_AND_FINANCE`, `SPAN_CORE_BELIEF`, `SPAN_PEER_MEMORY[j]`,
-     `SPAN_INCOMING_MSG[j]`, `SPAN_APPRAISAL_AND_TOM`).
-  2. `WhiteBoxPyTorchBrain`:
-     - Attaches `AttentionSteeringLab` Value hooks (`v_proj`) and key-bias masks (`B_env`, `Sink`).
-     - Prefills the prompt + deterministic JSON key prefix `{"internal_thought": "`
-       (Audit Flaw 4 Resolution) and extracts middle-layer speaker residual vector `h_bar^{(l*)}`.
-     - Probes the first `K_probe = 5` unconstrained semantic tokens via `EntropyTMSRouter`.
-     - Halts and rewinds KV-cache if `H_bar > tau_TMS`, or completes JSON generation.
-  3. `BlackBoxAPIBrain`: OpenAI-compatible HTTP endpoint fallback with `NoOpBypassSteerer`.
+Executes causal in-model attention steering (`attach_steering_hooks`) across both
+Prefill (`Stage A`) and Autoregressive Decoding (`Stages B & C`), reading real
+post-softmax attention weights directly from `prefill_out.attentions`.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 import torch
@@ -51,16 +42,11 @@ from src.core.contracts import (
     TokenSpanMap,
 )
 from src.memory.scoped_memory import ScopedAgentMemoryView
-from src.steering.attention_lab import AttentionSteeringLab, MechanisticCalibrator
+from src.steering.attention_lab import AttentionSteeringLab
 from src.steering.entropy_tms import EntropyTMSRouter
 
 
 class PromptSpanCompiler:
-    """
-    Compiles an agent's scoped psychological, financial, relational, and incoming
-    message context into a prompt with exact token-interval mappings (`TokenSpanMap`).
-    """
-
     JSON_THOUGHT_PREFIX = '{"internal_thought": "'
 
     def __init__(self, tokenizer: Optional[PreTrainedTokenizerBase] = None) -> None:
@@ -81,13 +67,8 @@ class PromptSpanCompiler:
         is_responder_wave: bool,
         retry_diagnostic_feedback: Optional[str] = None,
     ) -> CompiledPromptPacket:
-        """
-        Builds the structured prompt segmented by explicit XML tags and computes
-        exact token index intervals `[start_idx, end_idx)` for every semantic span.
-        """
         segments: List[Tuple[str, str]] = []
 
-        # 0. System & Sink Anchor
         segments.append(
             (
                 SPAN_SINK,
@@ -96,7 +77,6 @@ class PromptSpanCompiler:
             )
         )
 
-        # 1. Self Identity Span
         segments.append(
             (
                 SPAN_SELF_IDENTITY,
@@ -107,7 +87,6 @@ class PromptSpanCompiler:
             )
         )
 
-        # 2. Drives & Finance Span
         inv_str = ", ".join(f"{k}:{v}" for k, v in external_state.inventory.items())
         segments.append(
             (
@@ -119,7 +98,6 @@ class PromptSpanCompiler:
             )
         )
 
-        # 3. Core Belief Span
         segments.append(
             (
                 SPAN_CORE_BELIEF,
@@ -128,7 +106,6 @@ class PromptSpanCompiler:
             )
         )
 
-        # 4. Scoped Peer Memory Spans (Pass 1 Direct Counterparty + Pass 2 Mentioned Entities)
         for peer_id, edge in scoped_edges.items():
             pmodel = scoped_models.get(peer_id)
             summary = pmodel.narrative_summary if pmodel else "No prior notes."
@@ -146,7 +123,6 @@ class PromptSpanCompiler:
                 )
             )
 
-        # 5. Cognitive Appraisal & Theory-of-Mind Forecast Span
         role_str = "RESPONDER (decide ACCEPT or REJECT)" if is_responder_wave else "INITIATOR (propose trade)"
         segments.append(
             (
@@ -157,7 +133,6 @@ class PromptSpanCompiler:
             )
         )
 
-        # 6. Incoming Message & Proposal Span
         sender_tag = counterparty_id or "MARKET"
         retry_block = (
             f"\n[GAME MASTER REJECTION ALERT]: {retry_diagnostic_feedback}"
@@ -172,7 +147,6 @@ class PromptSpanCompiler:
             )
         )
 
-        # 7. Output Schema Instruction + Deterministic JSON Prefix Anchor
         schema_instruction = (
             "<|im_end|>\n<|im_start|>user\n"
             "Emit a JSON object with keys: "
@@ -187,7 +161,6 @@ class PromptSpanCompiler:
         )
         segments.append(("SPAN_JSON_PREFIX", schema_instruction))
 
-        # Tokenize incrementally to build exact token index intervals
         spans_dict: Dict[str, List[Tuple[int, int]]] = {SPAN_SINK: [(0, 1)]}
         accumulated_ids: List[int] = []
         raw_text_parts: List[str] = []
@@ -198,7 +171,6 @@ class PromptSpanCompiler:
             if self.tokenizer is not None:
                 chunk_ids = self.tokenizer.encode(text_chunk, add_special_tokens=False)
             else:
-                # Whitespace fallback when running in pure Black-Box mode without local tokenizer
                 chunk_ids = [hash(w) % 30000 for w in text_chunk.split()]
             accumulated_ids.extend(chunk_ids)
             end_idx = len(accumulated_ids)
@@ -208,7 +180,7 @@ class PromptSpanCompiler:
         full_prompt = "".join(raw_text_parts)
         span_map = TokenSpanMap(
             total_prompt_tokens=len(accumulated_ids),
-            semantic_probe_start_idx=len(accumulated_ids),
+            semantic_probe_Start_idx=len(accumulated_ids),
             spans=spans_dict,
         )
 
@@ -229,14 +201,8 @@ def parse_or_repair_agent_json(
     available_food: int,
     is_responder_wave: bool,
 ) -> AgentTurnOutput:
-    """
-    Reconstructs the full JSON string by prepending `PromptSpanCompiler.JSON_THOUGHT_PREFIX`
-    and parses into `AgentTurnOutput`, with deterministic regex extraction fallback if
-    a small 1.5B model truncates closing braces.
-    """
     full_candidate = PromptSpanCompiler.JSON_THOUGHT_PREFIX + raw_completion_after_prefix.strip()
 
-    # Extract balanced or first JSON object block
     first_brace = full_candidate.find("{")
     last_brace = full_candidate.rfind("}")
     if first_brace != -1 and last_brace > first_brace:
@@ -248,7 +214,6 @@ def parse_or_repair_agent_json(
         parsed = json.loads(json_slice)
         return AgentTurnOutput.model_validate(parsed)
     except Exception:
-        # Regex self-healing parser for partial/malformed JSON from 1.5B models
         thought_match = re.search(r'"internal_thought"\s*:\s*"([^"]*)"', full_candidate)
         thought = (
             thought_match.group(1)
@@ -293,8 +258,8 @@ def parse_or_repair_agent_json(
 
 class WhiteBoxPyTorchBrain:
     """
-    Local White-Box PyTorch Inference Engine with full Mechanistic Steering Hooks,
-    Semantic-Offset Entropy-TMS Probing, and Middle-Layer Latent Affect Extraction.
+    Local White-Box PyTorch Inference Engine with True In-Model Pre-Softmax Key-Bias
+    Steering (`B_env` + `Sink`) and Value-Space Rotation (`Dual-Space QK-V`).
     """
 
     def __init__(
@@ -321,21 +286,13 @@ class WhiteBoxPyTorchBrain:
         domain_hint: ExpertiseDomain,
         is_responder_wave: bool = False,
     ) -> Tuple[AgentTurnOutput, SteeringTelemetryPacket, Optional[List[float]]]:
-        """
-        Executes the 3-Stage Steered Forward & Decode Pipeline:
-          Stage A: Prefill prompt up to `{"internal_thought": "` with `v_proj` hooks active;
-                   extract speaker middle-layer residual vector and post-softmax attention mass.
-          Stage B: Decode `K_probe = 5` semantic tokens while recording unmasked vocabulary logits
-                   for `EntropyTMSRouter`. If `H_bar > tau_TMS`, rewind KV-cache and emit `TMS_QUERY`.
-          Stage C: Complete remaining JSON tokens and parse into `AgentTurnOutput`.
-        """
         input_ids = torch.tensor(
             [prompt_packet.input_ids], dtype=torch.long, device=self.device
         )
         seq_len = input_ids.shape[1]
 
-        # Attach Dual-Space QK-V Value Projection Hooks for Prefill
-        self.steering_lab.attach_prefill_value_hooks(
+        # Attach both Pre-Softmax Key-Bias (`self_attn`) and Value-Projection (`v_proj`) hooks
+        self.steering_lab.attach_steering_hooks(
             model=self.model,
             span_map=prompt_packet.token_span_map,
             state=prompt_packet.endogenous_state,
@@ -347,7 +304,7 @@ class WhiteBoxPyTorchBrain:
 
         try:
             with torch.no_grad():
-                # --- STAGE A: PREFILL PASS ---
+                # --- STAGE A: STEERED PREFILL PASS ---
                 prefill_out = self.model(
                     input_ids=input_ids,
                     use_cache=True,
@@ -356,41 +313,46 @@ class WhiteBoxPyTorchBrain:
                 )
                 past_kv = prefill_out.past_key_values
 
-                # Extract middle-layer mean residual vector h_bar^{(l*)} for Mirror-Neuron Contagion
                 if prefill_out.hidden_states:
                     mid_idx = len(prefill_out.hidden_states) // 2
-                    mid_hidden = prefill_out.hidden_states[mid_idx]  # [1, S, D_model]
+                    mid_hidden = prefill_out.hidden_states[mid_idx]
                     speaker_latent_vec = (
                         mid_hidden[0, -16:, :].float().mean(dim=0).cpu().tolist()[:32]
                     )
 
-                # Compute exact Steered Attention Telemetry on target middle layer
+                # Extract REAL in-model post-softmax attention weights from target calibrated layer
                 if prefill_out.attentions:
-                    mid_attn_idx = len(prefill_out.attentions) // 2
-                    # Convert last-query attention probs back to log-space logits to apply exact B_env + Sink shift
-                    last_q_probs = torch.clamp(
-                        prefill_out.attentions[mid_attn_idx][:, :, -1:, :].float(),
-                        min=1e-9,
-                    )
-                    approx_qk_logits = torch.log(last_q_probs)
+                    if (
+                        self.steering_lab.calibration is not None
+                        and self.steering_lab.calibration.target_layer_indices
+                    ):
+                        target_l = self.steering_lab.calibration.target_layer_indices[
+                            len(self.steering_lab.calibration.target_layer_indices) // 2
+                        ]
+                    else:
+                        target_l = int(
+                            len(prefill_out.attentions)
+                            * self.steering_lab.spec.target_layer_fraction
+                        )
+                    target_l = max(0, min(len(prefill_out.attentions) - 1, target_l))
+                    in_model_last_q_probs = prefill_out.attentions[target_l][:, :, -1:, :]
                 else:
-                    approx_qk_logits = torch.zeros((1, 4, 1, seq_len), device=self.device)
+                    in_model_last_q_probs = torch.full(
+                        (1, 4, 1, seq_len), 1.0 / max(1, seq_len), device=self.device
+                    )
 
-                _, telemetry = self.steering_lab.compute_steered_attention_telemetry(
-                    unsteered_qk_logits=approx_qk_logits,
+                telemetry = self.steering_lab.extract_in_model_attention_telemetry(
+                    in_model_attn_probs=in_model_last_q_probs,
                     span_map=prompt_packet.token_span_map,
                     state=prompt_packet.endogenous_state,
                     tick=prompt_packet.tick,
                 )
 
-                # Detach prefill Value hooks before autoregressive token loop
-                self.steering_lab.remove_hooks()
-
-                next_token_logits = prefill_out.logits[:, -1, :]  # [1, |V|]
+                next_token_logits = prefill_out.logits[:, -1, :]
 
                 # --- STAGE B: SEMANTIC-OFFSET ENTROPY PROBE (First K_probe tokens) ---
                 k_probe = self.tms_router.spec.probe_tokens_k
-                for step in range(k_probe):
+                for _ in range(k_probe):
                     probe_logits.append(next_token_logits[0].detach())
                     next_tok = self._sample_next_token(
                         next_token_logits, temperature=self.hw_spec.temperature
@@ -406,7 +368,6 @@ class WhiteBoxPyTorchBrain:
                     past_kv = step_out.past_key_values
                     next_token_logits = step_out.logits[:, -1, :]
 
-                # Evaluate Entropy-TMS Router on semantic tokens
                 tms_decision = self.tms_router.evaluate_and_route(
                     vocab_logits_list=probe_logits,
                     scoped_memory=scoped_memory,
@@ -416,7 +377,6 @@ class WhiteBoxPyTorchBrain:
                 telemetry.tms_triggered = tms_decision.halted_generation
 
                 if tms_decision.halted_generation and not is_responder_wave:
-                    # KV-Cache Rewind & Direct TMS Expert Query Emission
                     del past_kv
                     tms_turn = self.tms_router.build_tms_query_turn_output(
                         decision=tms_decision,
@@ -426,7 +386,7 @@ class WhiteBoxPyTorchBrain:
 
                 # --- STAGE C: COMPLETE STRUCTURED JSON DECODING ---
                 remaining_budget = max(10, self.hw_spec.max_new_tokens - len(generated_ids))
-                brace_depth = 1  # Because prompt ended with `{"internal_thought": "`
+                brace_depth = 1
                 for _ in range(remaining_budget):
                     next_tok = self._sample_next_token(
                         next_token_logits, temperature=self.hw_spec.temperature
@@ -468,7 +428,6 @@ class WhiteBoxPyTorchBrain:
             return torch.argmax(logits, dim=-1)
         scaled = logits / max(0.05, float(temperature))
         probs = torch.softmax(scaled, dim=-1)
-        # Top-k=32 nucleus filtering for clean JSON syntax stability
         top_probs, top_indices = torch.topk(probs, k=min(32, probs.shape[-1]), dim=-1)
         top_probs = top_probs / torch.clamp(top_probs.sum(dim=-1, keepdim=True), min=1e-9)
         sampled_rel = torch.multinomial(top_probs, num_samples=1).squeeze(-1)
@@ -476,11 +435,6 @@ class WhiteBoxPyTorchBrain:
 
 
 class BlackBoxAPIBrain:
-    """
-    OpenAI-compatible HTTP Endpoint Fallback (`vLLM`, `Ollama`, `LM Studio`, `OpenAI`)
-    with `NoOpBypassSteerer` and verbal confidence TMS fallback (Audit Flaw 7 Resolution).
-    """
-
     def __init__(self, hw_spec: HardwareBackendSpec, tms_router: EntropyTMSRouter) -> None:
         self.hw_spec = hw_spec
         self.tms_router = tms_router
@@ -531,7 +485,6 @@ class BlackBoxAPIBrain:
             is_responder_wave=is_responder_wave,
         )
 
-        # Audit Flaw 7 Black-Box Verbal Confidence Gate for TMS Routing
         implied_uncertainty = 1.0 - turn_output.epistemic_confidence
         telemetry.probed_shannon_entropy = round(implied_uncertainty, 4)
         if (

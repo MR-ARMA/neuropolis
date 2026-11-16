@@ -1,5 +1,5 @@
 # ==============================================================================
-# MVP CONFIGURATION: TUNED FOR 4GB NVIDIA VRAM LAPTOP & RAPID VERIFICATION
+# MVP CONFIGURATION: TUNED FOR ASUS TUF F15 (4GB NVIDIA VRAM, 16GB SYSTEM RAM)
 # ==============================================================================
 simulation_meta:
   experiment_id: "mvp_bilateral_trust_market_v1"
@@ -12,29 +12,29 @@ simulation_meta:
 
 hardware_and_backend:
   backend_type: "WHITE_BOX_PYTORCH"          # Options: WHITE_BOX_PYTORCH | BLACK_BOX_API
-  model_id: "Qwen/Qwen2.5-0.5B-Instruct"     # Fits comfortably in <3.2 GB VRAM in FP16/4-bit
+  model_id: "Qwen/Qwen2.5-1.5B-Instruct"     # Default 1.5B model (or swap to "Qwen/Qwen2.5-7B-Instruct")
   models_dir: "./models"
-  quantization_mode: "fp16"                  # Options: "nf4_4bit" (~1.3GB VRAM) | "fp16" (~3.0GB VRAM)
+  quantization_mode: "nf4_4bit"              # "nf4_4bit" (~1.25GB VRAM for 1.5B) | "fp16" (~3.05GB VRAM)
   device: "cuda"                             # Auto-falls back to "cpu" if CUDA is unavailable
   max_new_tokens: 180
   temperature: 0.4
   batch_size: 1                              # Sequential conflict-free execution for 4GB VRAM
-  vram_ceiling_gb: 3.2
+  vram_ceiling_gb: 3.2                       # Enforces GPU memory cap with automatic CPU RAM offload for 7B/8B
   black_box_api_url: "http://localhost:11434/v1/chat/completions"
   black_box_api_key: "EMPTY"
 
 mechanistic_steering:
   enabled: true
   mode: "MASTER_EQUATION_MVP"                # Options: NONE | PASTA | ITI | MASTER_EQUATION_MVP
-  calibration_pairs_count: 16                # Fast <10s contrastive SVD calibration on startup
-  target_layer_fraction: 0.55                # Middle-upper layers for Value & Attention steering
+  calibration_pairs_count: 16                # Contrastive SVD calibration on startup
+  target_layer_fraction: 0.55                # Middle-upper layers (e.g. [14, 15, 16] on 28-layer 1.5B)
   # --- Active MVP High-ROI Master Equation Terms ---
-  omega_fin_stress: 2.2                      # Term 1a: State-coupled boost on SPAN_DRIVES_AND_FINANCE
-  omega_peer_salience: 1.8                   # Term 1b: State-coupled boost on SPAN_PEER_MEMORY
+  omega_fin_stress: 2.4                      # Term 1a: Pre-softmax key bias on SPAN_DRIVES_AND_FINANCE
+  omega_peer_salience: 1.9                   # Term 1b: Pre-softmax key bias on SPAN_PEER_MEMORY
   gamma_cynicism_scale: 0.85                 # Term 3a: Value-space projection removing u_trust
   eta_anxiety_scale: 0.65                    # Term 3b: Value-space projection injecting u_threat
-  kappa_dissonance_sink: 2.8                 # Term 8: Logit boost on <bos> sink under dissonance
-  logit_clip_z_max: 4.5                      # Variance-preserving additive bias ceiling
+  kappa_dissonance_sink: 3.0                 # Term 8: Pre-softmax logit boost on <bos> sink under dissonance
+  logit_clip_z_max: 4.5                      # Bounded tanh key-bias ceiling
   # --- Post-MVP Master Equation Parameters (Preserved in Config) ---
   lambda_rope_construal: 0.35                # Term 4: Construal RoPE phase warping
   alpha_sys1_gate: 0.40                      # Term 5a: System-1 induction head boost
@@ -56,10 +56,10 @@ memory_and_cognition:
   stm_capacity: 12
   ebbinghaus_base_half_life_ticks: 4.0
   consolidation_salience_threshold: 1.85
-  habit_router_arousal_threshold: 0.15       # Below this + no incoming msg -> fast System-1 Habit
+  habit_router_arousal_threshold: 0.15
   habit_router_rpe_threshold: 0.10
-  slovic_pos_trust_rate: 0.12                # Asymmetric trust building rate (eta_+)
-  slovic_neg_trust_rate: 0.30                # Asymmetric trust destruction rate (eta_- = 2.5 * eta_+)
+  slovic_pos_trust_rate: 0.12
+  slovic_neg_trust_rate: 0.30
 
 economy_and_institutions:
   initial_agent_cash: 100.0

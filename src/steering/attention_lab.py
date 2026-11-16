@@ -1,25 +1,20 @@
 """
 src/steering/attention_lab.py
 MODULE 3 (M3): Mechanistic Attention Steering Lab (`MasterEquationHookEngine`).
-Implements:
-  1. `MechanisticCalibrator`: Contrastive SVD / Mean-Difference calibration extracting
-     Gram-Schmidt orthonormalized Value-space concept vectors `u_hat_trust` and `u_hat_threat`
-     at target transformer layers.
-  2. MVP High-ROI Master Equation Terms (100% Working PyTorch Tensor Operations):
-     - Term 1 (`B_env(E_t)`): State-Coupled Dynamic Attention Bias boosting
-       `SPAN_DRIVES_AND_FINANCE` under financial stress and `SPAN_PEER_MEMORY` under distrust,
-       with Audit Flaw 2 Pre-Beta Variance-Preserving Logit Renormalization.
-     - Term 3 (`Dual-Space QK-V Steering`): Norm-preserving spherical Value rotation
-       removing `u_hat_trust` proportional to cynicism `gamma` and injecting `u_hat_threat`
-       proportional to anxiety `eta` exclusively on `SPAN_INCOMING_MSG` tokens.
-     - Term 8 (`Cognitive Dissonance Sink Routing`): Boosting `<bos>` (index 0) attention
-       logits by `+kappa_sink * D_t(i)` when incoming messages clash with core beliefs.
-  3. Post-MVP Master Equation Stubs (Terms 4, 5, 6, 7, 9) with exact mathematical docstrings.
+Implements TRUE CAUSAL IN-MODEL STEERING:
+  1. `MechanisticCalibrator`: Contrastive calibration extracting Gram-Schmidt
+     orthonormalized Value-space concept vectors `u_hat_trust` and `u_hat_threat`.
+  2. Pre-Softmax Causal Attention Injection (`_make_attn_pre_hook` on `self_attn`):
+     Injects the 1D Broadcastable Key-Bias Vector `Delta_B(s)` (combining Term 1 `B_env(E_t)`
+     and Term 8 `s_sink(D_t)`) directly into the 4D `attention_mask` entering `Qwen2Attention` /
+     `LlamaAttention` BEFORE `torch.softmax`, safely handling both Prefill (`q_len == S`)
+     and Autoregressive Decode (`q_len == 1, kv_len == S + step`).
+  3. Dual-Space QK-V Value Rotation (`_make_v_hook` on `self_attn.v_proj`):
+     Spherical norm-preserving rotation of `V_s` on `SPAN_INCOMING_MSG` tokens.
 """
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -28,12 +23,10 @@ import torch.nn as nn
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from src.core.contracts import (
-    SPAN_CORE_BELIEF,
     SPAN_DRIVES_AND_FINANCE,
     SPAN_INCOMING_MSG_PREFIX,
     SPAN_PEER_MEMORY_PREFIX,
     SPAN_SINK,
-    CompiledPromptPacket,
     EndogenousStatePacket,
     MechanisticSteeringSpec,
     SteeringMode,
@@ -42,9 +35,6 @@ from src.core.contracts import (
 )
 
 
-# ==============================================================================
-# 1. CONTRASTIVE CONCEPT SUBSPACE CALIBRATOR (Gram-Schmidt Orthonormalized)
-# ==============================================================================
 CONTRASTIVE_TRUST_THREAT_PAIRS: List[Tuple[str, str]] = [
     (
         "My partner honored every contract fairly, transparent pricing, mutual cooperation and verified trust.",
@@ -110,14 +100,14 @@ class MechanisticCalibrator:
         v1_f = v1.float()
         v2_f = v2.float()
         u1 = v1_f / torch.clamp(torch.norm(v1_f, p=2), min=eps)
-        proj = torch.dot(v2_f, u1) * u1
-        v2_orth = v2_f - proj
-        if torch.norm(v2_orth, p=2) < eps:
-            # Construct deterministic orthogonal fallback if collinear
+        v2_orth = v2_f - torch.dot(v2_f, u1) * u1
+        v2_orth = v2_orth - torch.dot(v2_orth, u1) * u1
+        if torch.norm(v2_orth, p=2) < 1e-5:
             alt = torch.roll(u1, shifts=1, dims=0)
             v2_orth = alt - torch.dot(alt, u1) * u1
+            v2_orth = v2_orth - torch.dot(v2_orth, u1) * u1
         u2 = v2_orth / torch.clamp(torch.norm(v2_orth, p=2), min=eps)
-        return u1.to(v1.dtype), u2.to(v2.dtype)
+        return u1, u2
 
     def calibrate_or_load(
         self,
@@ -144,14 +134,12 @@ class MechanisticCalibrator:
             except Exception:
                 pass
 
-        # Run rapid contrastive forward pass over trust vs. threat stimuli
         captured_v: Dict[int, List[torch.Tensor]] = {idx: [] for idx in target_indices}
         hooks = []
 
         def _make_capture_hook(layer_idx: int) -> Callable:
             def _hook(module: nn.Module, inputs: Any, output: torch.Tensor) -> None:
-                # output shape: [B, S, D_v]
-                mean_tok = output.detach().float().mean(dim=1).squeeze(0)
+                mean_tok = output.detach().float().mean(dim=1).squeeze(0).cpu()
                 captured_v[layer_idx].append(mean_tok)
 
             return _hook
@@ -180,12 +168,10 @@ class MechanisticCalibrator:
 
         for idx in target_indices:
             vecs = captured_v[idx]
-            trust_vecs = torch.stack(vecs[0::2], dim=0)   # Even indices: trust stimuli
-            threat_vecs = torch.stack(vecs[1::2], dim=0)  # Odd indices: threat stimuli
-            global_mean = 0.5 * (trust_vecs.mean(dim=0) + threat_vecs.mean(dim=0))
-
-            raw_trust = trust_vecs.mean(dim=0) - global_mean
-            raw_threat = threat_vecs.mean(dim=0) - global_mean
+            trust_vecs = torch.stack(vecs[0::2], dim=0)
+            threat_vecs = torch.stack(vecs[1::2], dim=0)
+            raw_trust = trust_vecs.mean(dim=0)
+            raw_threat = threat_vecs.mean(dim=0) - trust_vecs.mean(dim=0)
             u_tr, u_th = self.gram_schmidt_orthonormalize(raw_trust, raw_threat)
             u_trust_map[idx] = u_tr.to(device)
             u_threat_map[idx] = u_th.to(device)
@@ -209,18 +195,14 @@ class MechanisticCalibrator:
         )
 
 
-# ==============================================================================
-# 2. MASTER EQUATION HOOK ENGINE (MVP High-ROI Terms + Post-MVP Stubs)
-# ==============================================================================
 class AttentionSteeringLab:
     """
-    Executes the Unified Cognitive Attention Master Equation v2.0 during White-Box
-    prefill & generation:
-      - Constructs the 1D Key-Bias Vector `b_key(s)` for `B_env(E_t)` and `s_sink(D_t)`.
-      - Attaches norm-preserving spherical Value-projection hooks on `v_proj` over
-        `SPAN_INCOMING_MSG` tokens.
-      - Applies Audit Flaw 2 Pre-Beta Variance-Preserving Logit Renormalization.
-      - Computes exact post-softmax attention mass telemetry across semantic spans.
+    Executes the Unified Cognitive Attention Master Equation v2.0 INSIDE the Transformer
+    forward pass via:
+      1. `self_attn` Pre-Hooks (`_make_attn_pre_hook`): Injects `B_env(E_t)` and `s_sink(D_t)`
+         into the 4D additive `attention_mask` prior to `torch.softmax`.
+      2. `self_attn.v_proj` Forward Hooks (`_make_v_hook`): Rotates Value vectors on
+         `SPAN_INCOMING_MSG` tokens using orthonormal `u_hat_trust` and `u_hat_threat`.
     """
 
     def __init__(
@@ -243,17 +225,14 @@ class AttentionSteeringLab:
     ) -> torch.Tensor:
         """
         Builds the 1D Broadcastable Key-Bias Vector `Delta_B(s)` in R^{seq_len}:
-          1. State-Coupled Bias `B_env(E_t)`:
-             + omega_1 * Stress_fin(i,t) on `SPAN_DRIVES_AND_FINANCE`
-             + omega_2 * PeerDistrust(i,j,t) on `SPAN_PEER_MEMORY`
-          2. Bounded tanh clipping:
-             Delta_B(s) = Z_max * tanh( raw_bias(s) / Z_max )
-          3. Cognitive Dissonance Sink Routing `s_sink(D_t)` at s = 0 (<bos>):
-             Delta_B(0) += kappa_sink * D_t(i)
+          - Term 1a: `+ omega_fin_stress * Stress_fin` on `SPAN_DRIVES_AND_FINANCE`
+          - Term 1b: `+ omega_peer_salience * PeerDistrust` on `SPAN_PEER_MEMORY`
+          - Bounded tanh ceiling `Z_max * tanh(bias / Z_max)`
+          - Term 8: `+ kappa_dissonance_sink * D_t` on `<bos>` (`s = 0`) and attenuation on `SPAN_INCOMING_MSG`.
         """
-        bias_1d = torch.zeros(seq_len, device=device, dtype=dtype)
+        bias_1d = torch.zeros(seq_len, device=device, dtype=torch.float32)
         if not self.spec.enabled or self.spec.mode == SteeringMode.NONE:
-            return bias_1d
+            return bias_1d.to(dtype)
 
         fin_indices = [
             i for i in span_map.get_token_indices_for_span(SPAN_DRIVES_AND_FINANCE) if i < seq_len
@@ -263,30 +242,29 @@ class AttentionSteeringLab:
         ]
 
         if fin_indices and state.financial_stress > 0.0:
-            boost_fin = self.spec.omega_fin_stress * float(state.financial_stress)
-            bias_1d[fin_indices] += boost_fin
+            bias_1d[fin_indices] += float(self.spec.omega_fin_stress * state.financial_stress)
 
         if peer_indices and state.peer_distrust_salience > 0.0:
-            boost_peer = self.spec.omega_peer_salience * float(state.peer_distrust_salience)
-            bias_1d[peer_indices] += boost_peer
+            bias_1d[peer_indices] += float(
+                self.spec.omega_peer_salience * state.peer_distrust_salience
+            )
 
-        # Bounded tanh saturation on non-sink tokens
         z_max = max(0.5, float(self.spec.logit_clip_z_max))
         bias_1d = z_max * torch.tanh(bias_1d / z_max)
 
-        # Term 8: Dissonance Sink Routing on token s = 0 (<bos>)
         if seq_len > 0 and state.dissonance_score_d > 0.0:
-            bias_1d[0] += self.spec.kappa_dissonance_sink * float(state.dissonance_score_d)
-            # Slightly attenuate incoming message logits when dissonance is high
+            bias_1d[0] += float(self.spec.kappa_dissonance_sink * state.dissonance_score_d)
             msg_indices = [
-                i for i in span_map.get_token_indices_for_span(SPAN_INCOMING_MSG_PREFIX) if i < seq_len
+                i
+                for i in span_map.get_token_indices_for_span(SPAN_INCOMING_MSG_PREFIX)
+                if 0 < i < seq_len
             ]
             if msg_indices:
-                bias_1d[msg_indices] -= 0.65 * self.spec.kappa_dissonance_sink * float(
-                    state.dissonance_score_d
+                bias_1d[msg_indices] -= float(
+                    0.65 * self.spec.kappa_dissonance_sink * state.dissonance_score_d
                 )
 
-        return bias_1d
+        return bias_1d.to(dtype)
 
     @staticmethod
     def apply_variance_preserving_logit_shift(
@@ -294,11 +272,8 @@ class AttentionSteeringLab:
         key_bias_1d: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Implements Audit Flaw 2 Resolution (Pre-Beta Variance-Preserving Logit Renormalization):
-        Given unbiassed query-key logits Z_0 of shape [..., S_k] and additive key bias Delta_B(s):
-          1. For non-sink tokens (s >= 1), shifts direction by Delta_B(s) and rescales variance
-             so Std(Z_dir[..., 1:]) never exceeds Std(Z_0[..., 1:]), preventing Softmax collapse.
-          2. Applies the exact Dissonance Sink boost Delta_B(0) at index s = 0.
+        Pre-Beta Variance-Preserving Logit Renormalization on non-sink tokens (`s >= 1`),
+        preventing additive bias terms from artificially inflating Softmax sharpness.
         """
         s_k = raw_qk_logits.shape[-1]
         bias = key_bias_1d[:s_k].to(raw_qk_logits.device, dtype=raw_qk_logits.dtype)
@@ -333,12 +308,9 @@ class AttentionSteeringLab:
         eps: float = 1e-6,
     ) -> Tuple[torch.Tensor, float]:
         """
-        Implements Term 3 (Dual-Space QK-V Steering with Norm-Preserving Spherical Rotation):
-          For every token s in `SPAN_INCOMING_MSG`:
-            V_raw_s = V_s - gamma * <V_s, u_hat_trust> * u_hat_trust
-                          + eta * ||V_s||_2 * u_hat_threat
-            V_tilde_s = ||V_s||_2 * ( V_raw_s / max(||V_raw_s||_2, eps) )
-        Returns `(V_tilde, norm_preservation_ratio)`.
+        Spherical norm-preserving Value-space projection on `SPAN_INCOMING_MSG` tokens:
+          V_raw_s = V_s - gamma * <V_s, u_hat_trust> u_hat_trust + eta * ||V_s||_2 u_hat_threat
+          V_tilde_s = ||V_s||_2 * (V_raw_s / max(||V_raw_s||_2, eps))
         """
         if not msg_token_indices or (cynicism_gamma <= 0.0 and anxiety_eta <= 0.0):
             return v_tensor, 1.0
@@ -349,18 +321,16 @@ class AttentionSteeringLab:
             return v_tensor, 1.0
 
         v_out = v_tensor.clone()
-        v_slice = v_out[:, valid_idx, :].float()  # [B, M, D_v]
+        v_slice = v_out[:, valid_idx, :].float()
 
         u_tr = u_hat_trust.float().to(v_tensor.device)
         u_th = u_hat_threat.float().to(v_tensor.device)
 
-        orig_norm = torch.norm(v_slice, p=2, dim=-1, keepdim=True)  # [B, M, 1]
+        orig_norm = torch.norm(v_slice, p=2, dim=-1, keepdim=True)
 
-        # Project out trust component when cynicism_gamma > 0
-        trust_dot = torch.matmul(v_slice, u_tr).unsqueeze(-1)  # [B, M, 1]
+        trust_dot = torch.matmul(v_slice, u_tr).unsqueeze(-1)
         v_mod = v_slice - float(cynicism_gamma) * trust_dot * u_tr.view(1, 1, -1)
 
-        # Inject threat vector scaled to original activation norm when anxiety_eta > 0
         if anxiety_eta > 0.0:
             v_mod = v_mod + float(anxiety_eta) * orig_norm * u_th.view(1, 1, -1)
 
@@ -373,61 +343,173 @@ class AttentionSteeringLab:
         v_out[:, valid_idx, :] = v_spherical.to(v_tensor.dtype)
         return v_out, norm_ratio
 
-    def attach_prefill_value_hooks(
+    def attach_steering_hooks(
         self,
         model: PreTrainedModel,
         span_map: TokenSpanMap,
         state: EndogenousStatePacket,
     ) -> None:
         """
-        Registers PyTorch forward hooks on `self_attn.v_proj` across calibrated layers
-        to perform Dual-Space QK-V Value rotation during the prompt prefill pass.
+        Attaches BOTH:
+          1. Pre-softmax `self_attn` hooks injecting `B_env(E_t)` and `s_sink(D_t)` into the
+             4D additive `attention_mask` across the middle-upper semantic layers.
+          2. Post-projection `self_attn.v_proj` hooks applying Dual-Space QK-V Value rotation
+             across the calibrated layers.
+        Handles both Prefill (`q_len == S`) and Autoregressive Decode (`q_len == 1, kv_len == S + step`).
         """
         self.remove_hooks()
         self._last_v_norm_ratios.clear()
 
-        if (
-            not self.spec.enabled
-            or self.spec.mode == SteeringMode.NONE
-            or self.calibration is None
-        ):
-            return
-
-        msg_indices = span_map.get_token_indices_for_span(SPAN_INCOMING_MSG_PREFIX)
-        if not msg_indices:
+        if not self.spec.enabled or self.spec.mode == SteeringMode.NONE:
             return
 
         layers = MechanisticCalibrator.get_decoder_layers(model)
+        num_layers = len(layers)
+        center_layer = max(0, min(num_layers - 1, int(num_layers * self.spec.target_layer_fraction)))
 
-        for layer_idx in self.calibration.target_layer_indices:
-            u_tr = self.calibration.u_trust_by_layer[layer_idx]
-            u_th = self.calibration.u_threat_by_layer[layer_idx]
-            v_proj_mod = layers[layer_idx].self_attn.v_proj
+        if self.calibration is not None:
+            v_target_layers = self.calibration.target_layer_indices
+        else:
+            v_target_layers = sorted(
+                list({max(0, center_layer - 1), center_layer, min(num_layers - 1, center_layer + 1)})
+            )
 
-            def _make_v_hook(
-                u_trust_vec: torch.Tensor, u_threat_vec: torch.Tensor
-            ) -> Callable:
-                def _v_hook(
-                    module: nn.Module, inputs: Any, output: torch.Tensor
-                ) -> torch.Tensor:
-                    # Only apply to prompt prefill pass (where sequence length > 1)
-                    if output.shape[1] <= 1:
-                        return output
-                    v_steered, ratio = self.apply_dual_space_value_projection(
-                        v_tensor=output,
-                        msg_token_indices=msg_indices,
-                        u_hat_trust=u_trust_vec,
-                        u_hat_threat=u_threat_vec,
-                        cynicism_gamma=self.spec.gamma_cynicism_scale * state.cynicism_gamma,
-                        anxiety_eta=self.spec.eta_anxiety_scale * state.anxiety_eta,
-                    )
-                    self._last_v_norm_ratios.append(ratio)
-                    return v_steered
+        # Apply pre-softmax attention key-bias across the semantic middle-upper band
+        band_half_width = max(2, num_layers // 6)
+        attn_target_layers = list(
+            range(
+                max(0, center_layer - band_half_width),
+                min(num_layers, center_layer + band_half_width + 1),
+            )
+        )
+        for idx in v_target_layers:
+            if idx not in attn_target_layers:
+                attn_target_layers.append(idx)
+        attn_target_layers.sort()
 
-                return _v_hook
+        prompt_seq_len = max(1, span_map.total_prompt_tokens)
+        key_bias_cpu = self.build_key_bias_vector(
+            span_map=span_map,
+            state=state,
+            seq_len=prompt_seq_len,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        has_nonzero_key_bias = bool(torch.any(torch.abs(key_bias_cpu) > 1e-6).item())
 
-            handle = v_proj_mod.register_forward_hook(_make_v_hook(u_tr, u_th))
-            self._active_hooks.append(handle)
+        # 1. Register Pre-Softmax Key-Bias Hook on `layers[idx].self_attn`
+        if has_nonzero_key_bias:
+            for layer_idx in attn_target_layers:
+                attn_module = layers[layer_idx].self_attn
+
+                def _make_attn_pre_hook(bias_vec_cpu: torch.Tensor, p_len: int) -> Callable:
+                    def _attn_pre_hook(
+                        module: nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]
+                    ) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+                        hidden_states = kwargs.get(
+                            "hidden_states", args[0] if len(args) > 0 else None
+                        )
+                        if hidden_states is None:
+                            return args, kwargs
+
+                        bsz, q_len, _ = hidden_states.shape
+                        dev = hidden_states.device
+                        dt = hidden_states.dtype
+                        bias_dev = bias_vec_cpu.to(device=dev, dtype=dt)
+
+                        existing_mask = kwargs.get("attention_mask", None)
+
+                        if existing_mask is not None:
+                            # existing_mask shape: [B, 1, q_len, kv_len]
+                            kv_len = existing_mask.shape[-1]
+                            full_bias = torch.zeros(kv_len, device=dev, dtype=dt)
+                            copy_len = min(p_len, kv_len)
+                            full_bias[:copy_len] = bias_dev[:copy_len]
+
+                            bias_4d = full_bias.view(1, 1, 1, kv_len)
+                            valid_pos = existing_mask > -1e3
+                            steered_mask = torch.where(
+                                valid_pos, existing_mask + bias_4d, existing_mask
+                            )
+                            kwargs["attention_mask"] = steered_mask
+                        else:
+                            if q_len > 1:
+                                # Prefill pass without pre-built 4D mask: build causal mask + key bias
+                                kv_len = q_len
+                                full_bias = torch.zeros(kv_len, device=dev, dtype=dt)
+                                copy_len = min(p_len, kv_len)
+                                full_bias[:copy_len] = bias_dev[:copy_len]
+
+                                min_val = torch.finfo(dt).min
+                                causal_bool = torch.tril(
+                                    torch.ones((q_len, kv_len), device=dev, dtype=torch.bool)
+                                ).view(1, 1, q_len, kv_len)
+                                steered_mask = torch.where(
+                                    causal_bool,
+                                    full_bias.view(1, 1, 1, kv_len).expand(bsz, 1, q_len, kv_len),
+                                    torch.full((bsz, 1, q_len, kv_len), min_val, device=dev, dtype=dt),
+                                )
+                                kwargs["attention_mask"] = steered_mask
+                            else:
+                                # Single-token decode (`q_len == 1`): eager_attention_forward slices
+                                # `attention_mask[:, :, :, :key_states.shape[-2]]`.
+                                max_kv_buffer = p_len + 512
+                                full_bias = torch.zeros(max_kv_buffer, device=dev, dtype=dt)
+                                full_bias[:p_len] = bias_dev[:p_len]
+                                kwargs["attention_mask"] = full_bias.view(
+                                    1, 1, 1, max_kv_buffer
+                                ).expand(bsz, 1, 1, max_kv_buffer)
+
+                        return args, kwargs
+
+                    return _attn_pre_hook
+
+                handle = attn_module.register_forward_pre_hook(
+                    _make_attn_pre_hook(key_bias_cpu, prompt_seq_len),
+                    with_kwargs=True,
+                )
+                self._active_hooks.append(handle)
+
+        # 2. Register Dual-Space QK-V Value Rotation Hook on `layers[idx].self_attn.v_proj`
+        msg_indices = span_map.get_token_indices_for_span(SPAN_INCOMING_MSG_PREFIX)
+        if self.calibration is not None and msg_indices:
+            for layer_idx in v_target_layers:
+                u_tr = self.calibration.u_trust_by_layer[layer_idx]
+                u_th = self.calibration.u_threat_by_layer[layer_idx]
+                v_proj_mod = layers[layer_idx].self_attn.v_proj
+
+                def _make_v_hook(
+                    u_trust_vec: torch.Tensor, u_threat_vec: torch.Tensor
+                ) -> Callable:
+                    def _v_hook(
+                        module: nn.Module, inputs: Any, output: torch.Tensor
+                    ) -> torch.Tensor:
+                        if output.shape[1] <= 1:
+                            return output
+                        v_steered, ratio = self.apply_dual_space_value_projection(
+                            v_tensor=output,
+                            msg_token_indices=msg_indices,
+                            u_hat_trust=u_trust_vec,
+                            u_hat_threat=u_threat_vec,
+                            cynicism_gamma=self.spec.gamma_cynicism_scale * state.cynicism_gamma,
+                            anxiety_eta=self.spec.eta_anxiety_scale * state.anxiety_eta,
+                        )
+                        self._last_v_norm_ratios.append(ratio)
+                        return v_steered
+
+                    return _v_hook
+
+                handle = v_proj_mod.register_forward_hook(_make_v_hook(u_tr, u_th))
+                self._active_hooks.append(handle)
+
+    # Alias preserved for backwards compatibility
+    def attach_prefill_value_hooks(
+        self,
+        model: PreTrainedModel,
+        span_map: TokenSpanMap,
+        state: EndogenousStatePacket,
+    ) -> None:
+        self.attach_steering_hooks(model=model, span_map=span_map, state=state)
 
     def remove_hooks(self) -> None:
         for h in self._active_hooks:
@@ -437,6 +519,51 @@ class AttentionSteeringLab:
                 pass
         self._active_hooks.clear()
 
+    def extract_in_model_attention_telemetry(
+        self,
+        in_model_attn_probs: torch.Tensor,
+        span_map: TokenSpanMap,
+        state: EndogenousStatePacket,
+        tick: int,
+    ) -> SteeringTelemetryPacket:
+        """
+        Extracts exact post-softmax attention mass directly from the real `outputs.attentions`
+        tensor emitted inside `Qwen2Attention` during the forward pass.
+        """
+        s_k = in_model_attn_probs.shape[-1]
+        mean_probs = in_model_attn_probs.detach().float().mean(dim=(0, 1, 2))  # [S_k]
+
+        fin_idx = [
+            i for i in span_map.get_token_indices_for_span(SPAN_DRIVES_AND_FINANCE) if i < s_k
+        ]
+        peer_idx = [
+            i for i in span_map.get_token_indices_for_span(SPAN_PEER_MEMORY_PREFIX) if i < s_k
+        ]
+        msg_idx = [
+            i for i in span_map.get_token_indices_for_span(SPAN_INCOMING_MSG_PREFIX) if i < s_k
+        ]
+
+        mass_fin = float(mean_probs[fin_idx].sum().item()) if fin_idx else 0.0
+        mass_peer = float(mean_probs[peer_idx].sum().item()) if peer_idx else 0.0
+        mass_msg = float(mean_probs[msg_idx].sum().item()) if msg_idx else 0.0
+        mass_sink = float(mean_probs[0].item()) if s_k > 0 else 0.0
+        v_ratio = (
+            sum(self._last_v_norm_ratios) / len(self._last_v_norm_ratios)
+            if self._last_v_norm_ratios
+            else 1.0
+        )
+
+        return SteeringTelemetryPacket(
+            agent_id=state.agent_id,
+            tick=tick,
+            steering_mode=self.spec.mode if self.spec.enabled else SteeringMode.NONE,
+            attn_mass_drives_finance=round(mass_fin, 5),
+            attn_mass_peer_memory=round(mass_peer, 5),
+            attn_mass_incoming_msg=round(mass_msg, 5),
+            attn_mass_sink_bos=round(mass_sink, 5),
+            value_projection_norm_ratio=round(v_ratio, 6),
+        )
+
     def compute_steered_attention_telemetry(
         self,
         unsteered_qk_logits: torch.Tensor,
@@ -445,10 +572,7 @@ class AttentionSteeringLab:
         tick: int,
     ) -> Tuple[torch.Tensor, SteeringTelemetryPacket]:
         """
-        Given raw/unsteered last-token query-key attention logits of shape [B, H, 1, S_k]
-        (or post-softmax weights converted via log), applies `build_key_bias_vector` +
-        `apply_variance_preserving_logit_shift` + Softmax to return exact steered
-        attention distribution `A_tilde` and `SteeringTelemetryPacket`.
+        Standalone mathematical verification helper used by synthetic tensor unit tests.
         """
         s_k = unsteered_qk_logits.shape[-1]
         key_bias = self.build_key_bias_vector(
@@ -462,32 +586,12 @@ class AttentionSteeringLab:
             raw_qk_logits=unsteered_qk_logits,
             key_bias_1d=key_bias,
         )
-        attn_probs = torch.softmax(steered_logits, dim=-1)  # [B, H, 1, S_k]
-        mean_probs = attn_probs.mean(dim=(0, 1, 2))         # [S_k]
-
-        fin_idx = [i for i in span_map.get_token_indices_for_span(SPAN_DRIVES_AND_FINANCE) if i < s_k]
-        peer_idx = [i for i in span_map.get_token_indices_for_span(SPAN_PEER_MEMORY_PREFIX) if i < s_k]
-        msg_idx = [i for i in span_map.get_token_indices_for_span(SPAN_INCOMING_MSG_PREFIX) if i < s_k]
-
-        mass_fin = float(mean_probs[fin_idx].sum().item()) if fin_idx else 0.0
-        mass_peer = float(mean_probs[peer_idx].sum().item()) if peer_idx else 0.0
-        mass_msg = float(mean_probs[msg_idx].sum().item()) if msg_idx else 0.0
-        mass_sink = float(mean_probs[0].item()) if s_k > 0 else 0.0
-        v_ratio = (
-            sum(self._last_v_norm_ratios) / len(self._last_v_norm_ratios)
-            if self._last_v_norm_ratios
-            else 1.0
-        )
-
-        telemetry = SteeringTelemetryPacket(
-            agent_id=state.agent_id,
+        attn_probs = torch.softmax(steered_logits, dim=-1)
+        telemetry = self.extract_in_model_attention_telemetry(
+            in_model_attn_probs=attn_probs,
+            span_map=span_map,
+            state=state,
             tick=tick,
-            steering_mode=self.spec.mode if self.spec.enabled else SteeringMode.NONE,
-            attn_mass_drives_finance=round(mass_fin, 5),
-            attn_mass_peer_memory=round(mass_peer, 5),
-            attn_mass_incoming_msg=round(mass_msg, 5),
-            attn_mass_sink_bos=round(mass_sink, 5),
-            value_projection_norm_ratio=round(v_ratio, 6),
         )
         return attn_probs, telemetry
 
@@ -502,10 +606,7 @@ class AttentionSteeringLab:
     ) -> torch.Tensor:
         """
         # TODO(post-mvp): [Master Equation Term 4 - Construal-Level Static Key-Coordinate RoPE Warping]
-        Equation:
-            s_tilde(i, s) = t_0 - (t_0 - s) * exp( -lambda_rope * S_closeness(i, s) )
-            K_tilde_s = R_{Theta, s_tilde(i, s)} * K_s
-        Applied once during prefill so KV-cache reuse remains 100% intact during decoding.
+        Equation: s_tilde(i, s) = t_0 - (t_0 - s) * exp( -lambda_rope * S_closeness(i, s) )
         """
         return key_positions
 
@@ -516,10 +617,6 @@ class AttentionSteeringLab:
     ) -> torch.Tensor:
         """
         # TODO(post-mvp): [Master Equation Term 5 - System 1 vs. System 2 Competitive Head Gating]
-        Equation:
-            g_h(L_t) = 1 + alpha_sys1 * L_t   if h in H_Sys1 (Induction/Heuristic Heads)
-            g_h(L_t) = 1 - beta_sys2 * L_t    if h in H_Sys2 (Deliberative/Reasoning Heads)
-            O_h(t) = g_h(L_t) * (A_tilde_h @ V_tilde)
         """
         return head_outputs
 
@@ -530,10 +627,6 @@ class AttentionSteeringLab:
     ) -> Any:
         """
         # TODO(post-mvp): [Master Equation Term 6 - Subconscious Emotional Contagion KV-Prefix]
-        Equation:
-            k_mirror^{(l*, h)} = W_K^{(l*, h)} ( epsilon_BA * P_affect^{(l*)} * h_bar_A^{(l*)} )
-            v_mirror^{(l*, h)} = W_V^{(l*, h)} ( epsilon_BA * P_affect^{(l*)} * h_bar_A^{(l*)} )
-        Prepends a single virtual affective token to `SPAN_INCOMING_MSG` at middle layer l*.
         """
         return past_key_values
 
@@ -546,8 +639,5 @@ class AttentionSteeringLab:
     ) -> torch.Tensor:
         """
         # TODO(post-mvp): [Master Equation Terms 7 & 9 - Thermodynamic Softmax & Hebbian Fast-Weights]
-        Equations:
-            beta(A_t, F_t) = clip( beta_0 * (1 + zeta_p * max(0, A_t - A_opt)^2) / (1 + zeta_f * F_t), 0.25, 6.0 )
-            h_hebb^{(t)} = (1 - lambda_decay) * h_hebb^{(t-1)} + eta_hebb * Pool(A^{(t-1)})
         """
         return logits
