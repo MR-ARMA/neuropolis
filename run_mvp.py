@@ -1,254 +1,349 @@
-#!/usr/bin/env python3
-"""
-run_mvp.py
-End-to-End Executable Entrypoint for the Modular Mechanistic Social Simulation MVP.
-"""
-
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
-import random
-import time
-from typing import List
-
-import numpy as np
-import torch
+from typing import Any, Dict, List
 import yaml
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
+import torch
 
-from src.brain.inference_brain import (
-    BlackBoxAPIBrain,
-    PromptSpanCompiler,
-    WhiteBoxPyTorchBrain,
-)
+from src.brain.inference_brain import DualBackendInferenceBrain
 from src.brain.model_vault import ModelVaultManager
 from src.core.contracts import (
-    BackendType,
-    MacroEconomyState,
-    SimulationSpec,
-    VerdictStatus,
+    AgentTurnOutput,
+    CompiledPromptPacket,
+    EconomicActionIntent,
+    EndogenousStatePacket,
+    FourDimTickTelemetry,
+    RawGenerationResult,
+    SimulationConfig,
 )
-from src.environment.bilateral_market import BilateralTrustMarket
+from src.environment.bilateral_market import BilateralMarketEngine
 from src.environment.game_master import AccountingAndLawEngine
-from src.evaluation.metrics import BenchmarkEvaluator
-from src.memory.scoped_memory import ScopedMemoryEngine
-from src.orchestration.cognitive_appraisal import CognitiveAppraisalAndToMEngine
-from src.orchestration.scheduler import AIMDConcurrencyController, ConflictFreeBatcher
-from src.orchestration.turn_orchestrator import TurnExecutionRecord, TurnOrchestrator
-from src.run_helpers import synthesize_mvp_population
-from src.steering.attention_lab import AttentionSteeringLab, MechanisticCalibrator
+from src.evaluation.live_monitor import RealTimeLiveMonitor
+from src.evaluation.metrics import FourDimensionalMetricsEngine
+from src.memory.scoped_memory import MultiTierScopedMemory
+from src.orchestration.cognitive_appraisal import CognitiveAppraisalAndToM
+from src.orchestration.turn_orchestrator import TurnOrchestrator
+from src.steering.attention_lab import AttentionSteeringLab
 from src.steering.entropy_tms import EntropyTMSRouter
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Run Mechanistic Social Simulation MVP")
+class FastDeterministicBrain:
+    """
+    Lightweight, deterministic behavioral-economics brain used when `--mock-brain`
+    is passed for instant pre-flight/ablation verification without GPU overhead.
+    """
+
+    def __init__(self, config: SimulationConfig) -> None:
+        self.config = config
+        self.tokenizer = None
+
+    def generate_turn(
+        self,
+        prompt_packet: CompiledPromptPacket,
+        steering_packet: EndogenousStatePacket,
+    ) -> RawGenerationResult:
+        f_it = steering_packet.scarcity_deficit_f
+        t_eff = steering_packet.effective_trust_01
+        d_it = steering_packet.dissonance_d
+        arousal = steering_packet.arousal_a
+        fatigue = steering_packet.fatigue_f
+
+        beta_lc = self.config.steering_spec.beta_base_temp * (
+            (
+                1.0
+                + self.config.steering_spec.zeta_panic
+                * max(0.0, arousal - self.config.steering_spec.optimal_arousal) ** 2
+            )
+            / (1.0 + self.config.steering_spec.zeta_fatigue * fatigue)
+        )
+        attn_fin = min(0.75, 0.22 + 0.45 * f_it)
+        attn_sink = min(0.65, 0.08 + 0.48 * d_it)
+        attn_peer = max(0.08, 0.35 - 0.30 * attn_fin)
+        attn_msg = max(0.08, 1.0 - (attn_fin + attn_sink + attn_peer))
+
+        thought = (
+            f"Evaluating HANK portfolio under Scarcity F={f_it:.2f} and Effective Trust T_eff={t_eff:.2f}."
+        )
+        msg = (
+            "I need an urgent survival trade within fair bounds."
+            if f_it > 0.45
+            else "Proposing a mutually beneficial bilateral exchange."
+        )
+        out = AgentTurnOutput(
+            internal_thought=thought,
+            consent_decision="ACCEPT" if t_eff >= 0.25 else "REJECT",
+            action_category="COMMERCIAL_TRADE",
+            economic_intent=EconomicActionIntent(
+                action_type="BUY",
+                counterparty_id=steering_packet.partner_id or "",
+                item_id="CONSUMABLE_NECESSITY",
+                quantity=1.0,
+                unit_price=12.0,
+            ),
+            verbal_message=msg,
+        )
+        mirror_vec = torch.full(
+            (1, 64), fill_value=-0.45 * f_it + 0.25 * (2.0 * t_eff - 1.0)
+        )
+        return RawGenerationResult(
+            parsed_output=out,
+            tms_halt_triggered=False,
+            mean_shannon_entropy=0.32 + 0.22 * f_it,
+            emitted_mirror_vector=mirror_vec,
+            attention_telemetry={
+                "yerkes_dodson_beta": round(beta_lc, 4),
+                "SPAN_DRIVES_AND_FINANCE": round(attn_fin, 4),
+                "SPAN_PEER_MEMORY": round(attn_peer, 4),
+                "SPAN_INCOMING_MSG": round(attn_msg, 4),
+                "SPAN_SINK": round(attn_sink, 4),
+            },
+            updated_hebbian_trace=[
+                round(0.5 * x + 0.2 * f_it, 4)
+                for x in steering_packet.hebbian_trace_h
+            ],
+        )
+
+
+def _bootstrap_whitebox_brain(
+    config: SimulationConfig, tms_router: EntropyTMSRouter
+) -> Any:
+    """
+    Signature-adaptive bootstrapper that mounts `ModelVaultManager`,
+    `AttentionSteeringLab`, and `DualBackendInferenceBrain` using their exact
+    constructor and method signatures on disk.
+    """
+    # 1. Instantiate ModelVaultManager
+    v_sig = inspect.signature(ModelVaultManager.__init__)
+    v_params = [p for p in v_sig.parameters.keys() if p != "self"]
+    if not v_params:
+        vault = ModelVaultManager()  # type: ignore[call-arg]
+    elif "model_spec" in v_params:
+        vault = ModelVaultManager(config.model_spec)  # type: ignore[call-arg]
+    else:
+        vault = ModelVaultManager(config)  # type: ignore[call-arg]
+
+    # Call mount/bootstrap method on vault
+    mount_fn = (
+        getattr(vault, "mount_model_and_calibrate", None)
+        or getattr(vault, "load_and_calibrate", None)
+        or getattr(vault, "bootstrap", None)
+        or getattr(vault, "initialize", None)
+        or getattr(vault, "load_model", None)
+    )
+    mount_res = mount_fn() if mount_fn is not None else None
+
+    model = getattr(vault, "model", None)
+    tokenizer = getattr(vault, "tokenizer", None)
+    calibration_bundle = getattr(vault, "calibration_bundle", None)
+
+    if isinstance(mount_res, tuple):
+        if len(mount_res) == 3:
+            model, tokenizer, calibration_bundle = mount_res
+        elif len(mount_res) == 2:
+            model, tokenizer = mount_res
+    elif mount_res is not None:
+        model = getattr(mount_res, "model", model)
+        tokenizer = getattr(mount_res, "tokenizer", tokenizer)
+        calibration_bundle = getattr(
+            mount_res, "calibration_bundle", calibration_bundle or mount_res
+        )
+
+    # 2. Instantiate AttentionSteeringLab
+    s_sig = inspect.signature(AttentionSteeringLab.__init__)
+    s_kwargs: Dict[str, Any] = {}
+    for p in s_sig.parameters.keys():
+        if p == "self":
+            continue
+        pl = p.lower()
+        if "calib" in pl or "bundle" in pl:
+            s_kwargs[p] = calibration_bundle
+        elif "steer" in pl or "spec" in pl:
+            s_kwargs[p] = config.steering_spec
+        elif "config" in pl:
+            annot = str(s_sig.parameters[p].annotation)
+            s_kwargs[p] = (
+                config if "SimulationConfig" in annot else config.steering_spec
+            )
+    steering_lab = (
+        AttentionSteeringLab(**s_kwargs)
+        if s_kwargs
+        else AttentionSteeringLab(config.steering_spec, calibration_bundle)  # type: ignore[call-arg]
+    )
+
+    # 3. Instantiate DualBackendInferenceBrain
+    b_sig = inspect.signature(DualBackendInferenceBrain.__init__)
+    b_kwargs: Dict[str, Any] = {}
+    for p in b_sig.parameters.keys():
+        if p == "self":
+            continue
+        pl = p.lower()
+        if "vault" in pl:
+            b_kwargs[p] = vault
+        elif "model_spec" in pl:
+            b_kwargs[p] = config.model_spec
+        elif "config" in pl:
+            b_kwargs[p] = config
+        elif "model" in pl and "spec" not in pl:
+            b_kwargs[p] = model
+        elif "tok" in pl:
+            b_kwargs[p] = tokenizer
+        elif "steer" in pl or "lab" in pl:
+            b_kwargs[p] = steering_lab
+        elif "tms" in pl or "router" in pl:
+            b_kwargs[p] = tms_router
+        elif "calib" in pl:
+            b_kwargs[p] = calibration_bundle
+
+    return DualBackendInferenceBrain(**b_kwargs)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Neuropolis 4-Dimensional HANK & Mechanistic Social Simulation Runner"
+    )
     parser.add_argument(
         "--config",
         type=str,
         default="configs/mvp_config.yaml",
-        help="Path to YAML configuration file",
+        help="Path to YAML experiment configuration",
     )
     parser.add_argument(
         "--ticks",
         type=int,
         default=None,
-        help="Optional override for number of simulation ticks",
+        help="Override total simulation ticks",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--omega",
+        type=str,
+        default=None,
+        help="Comma-separated Orthogonal Clamping Vector Omega in {0,1}^4, e.g. '1,1,1,1' or '1,0,1,0'",
+    )
+    parser.add_argument(
+        "--crisis",
+        type=str,
+        default=None,
+        choices=[
+            "NONE",
+            "STAGFLATION_SUBSISTENCE_SHOCK",
+            "ASYMMETRIC_UNEMPLOYMENT_SHOCK",
+            "ASSET_VALUATION_CRASH",
+            "LIQUIDITY_CREDIT_CRUNCH",
+        ],
+        help="Override active macroeconomic crisis shock scenario",
+    )
+    parser.add_argument(
+        "--db-path",
+        type=str,
+        default="data/mvp_world_state.sqlite",
+        help="Path to SQLite world state database",
+    )
+    parser.add_argument(
+        "--mock-brain",
+        action="store_true",
+        help="Use fast deterministic brain for instant verification without loading LLM weights",
+    )
+    return parser.parse_args()
 
-    console = Console()
+
+def run_simulation() -> List[FourDimTickTelemetry]:
+    args = parse_args()
     with open(args.config, "r", encoding="utf-8") as f:
         raw_cfg = yaml.safe_load(f)
-    spec = SimulationSpec.model_validate(raw_cfg)
+    config = SimulationConfig(**raw_cfg)
+
     if args.ticks is not None:
-        spec.simulation_meta.num_ticks = args.ticks
+        config.total_ticks = int(args.ticks)
+    if args.omega is not None:
+        parts = [int(x.strip()) for x in args.omega.split(",")]
+        if len(parts) != 4:
+            raise ValueError("--omega must specify 4 comma-separated bits: e.g. 1,1,1,1")
+        config.orthogonal_clamping.omega_d1_scarcity_and_hank = bool(parts[0])
+        config.orthogonal_clamping.omega_d2_trust_and_parochialism = bool(parts[1])
+        config.orthogonal_clamping.omega_d3_contagion_and_polarization = bool(parts[2])
+        config.orthogonal_clamping.omega_d4_fiscal_and_legal_state = bool(parts[3])
+    if args.crisis is not None:
+        config.hank_and_crisis_spec.active_crisis = args.crisis  # type: ignore[assignment]
 
-    seed = spec.simulation_meta.random_seed
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    rng = random.Random(seed)
+    os.makedirs(os.path.dirname(args.db_path) or ".", exist_ok=True)
+    if os.path.exists(args.db_path):
+        os.remove(args.db_path)
 
-    console.print(
-        Panel.fit(
-            f"[bold cyan]MODULAR MECHANISTIC SOCIAL SIMULATION & BEHAVIORAL ECONOMICS ENGINE (MVP)[/bold cyan]\n"
-            f"Experiment: [yellow]{spec.simulation_meta.experiment_id}[/yellow] | "
-            f"Model: [green]{spec.hardware_and_backend.model_id}[/green] | "
-            f"Steering: [magenta]{spec.mechanistic_steering.mode.value}[/magenta] | "
-            f"Agents: [bold]{spec.simulation_meta.num_agents}[/bold] | "
-            f"Ticks: [bold]{spec.simulation_meta.num_ticks}[/bold]",
-            border_style="cyan",
-        )
+    # 1. Initialize Deterministic Environment, Memory, Appraisal, and TMS
+    game_master = AccountingAndLawEngine(db_path=args.db_path, config=config)
+    market_engine = BilateralMarketEngine(config=config, game_master=game_master)
+    memory_engine = MultiTierScopedMemory(db_path=args.db_path, config=config)
+    appraisal_engine = CognitiveAppraisalAndToM(
+        config=config, game_master=game_master, memory_engine=memory_engine
     )
+    tms_router = EntropyTMSRouter(db_path=args.db_path, config=config)
 
-    if os.path.exists(spec.simulation_meta.db_path):
-        os.remove(spec.simulation_meta.db_path)
-    memory_engine = ScopedMemoryEngine(
-        db_path=spec.simulation_meta.db_path,
-        spec=spec.memory_and_cognition,
-    )
-    internal_states, external_states, macro_init = synthesize_mvp_population(spec)
-    memory_engine.register_population(internal_states, external_states, macro_init)
-    agent_ids = [a.agent_id for a in internal_states]
-
-    tms_router = EntropyTMSRouter(spec.entropy_tms_router)
-    vault = ModelVaultManager(spec.hardware_and_backend)
-
-    if spec.hardware_and_backend.backend_type == BackendType.WHITE_BOX_PYTORCH:
-        console.print("[cyan]STAGE 1/2:[/cyan] Loading White-Box Model & Running Contrastive SVD Calibration...")
-        t0 = time.time()
-        model, tokenizer, gate = vault.load_whitebox_model_and_tokenizer()
-        calibrator = MechanisticCalibrator(spec.mechanistic_steering)
-        calibration_bundle = calibrator.calibrate_or_load(
-            model=model,
-            tokenizer=tokenizer,
-            cache_path=vault.get_calibration_cache_path(),
-            device=gate.device,
-        )
-        steering_lab = AttentionSteeringLab(
-            spec=spec.mechanistic_steering,
-            calibration=calibration_bundle,
-        )
-        prompt_compiler = PromptSpanCompiler(tokenizer=tokenizer)
-        brain = WhiteBoxPyTorchBrain(
-            model=model,
-            tokenizer=tokenizer,
-            hw_spec=spec.hardware_and_backend,
-            steering_lab=steering_lab,
-            tms_router=tms_router,
-            device=gate.device,
-        )
-        console.print(
-            f"[green]✓ White-Box Brain Ready[/green] on [bold]{gate.device}[/bold] "
-            f"in {time.time() - t0:.2f}s (Calibrated Layers: {calibration_bundle.target_layer_indices})"
-        )
+    # 2. Initialize White-Box Steered Brain (or FastDeterministicBrain if --mock-brain)
+    if args.mock_brain:
+        brain: Any = FastDeterministicBrain(config=config)
     else:
-        prompt_compiler = PromptSpanCompiler(tokenizer=None)
-        brain = BlackBoxAPIBrain(hw_spec=spec.hardware_and_backend, tms_router=tms_router)
-        console.print("[yellow]Running in Black-Box API Mode (NoOpBypassSteerer)[/yellow]")
+        brain = _bootstrap_whitebox_brain(config=config, tms_router=tms_router)
 
-    game_master = AccountingAndLawEngine(
-        memory_engine=memory_engine,
-        spec=spec.economy_and_institutions,
-    )
-    market = BilateralTrustMarket(
-        memory_engine=memory_engine,
-        econ_spec=spec.economy_and_institutions,
-        cog_spec=spec.memory_and_cognition,
-        rng=rng,
-    )
-    appraisal_engine = CognitiveAppraisalAndToMEngine(
-        cog_spec=spec.memory_and_cognition,
-        econ_spec=spec.economy_and_institutions,
-    )
     orchestrator = TurnOrchestrator(
-        spec=spec,
-        memory_engine=memory_engine,
-        brain=brain,
-        prompt_compiler=prompt_compiler,
-        appraisal_engine=appraisal_engine,
+        config=config,
         game_master=game_master,
-        market=market,
-    )
-    aimd_controller = AIMDConcurrencyController(spec.hardware_and_backend)
-    evaluator = BenchmarkEvaluator(
+        market_engine=market_engine,
         memory_engine=memory_engine,
-        jsonl_path=spec.simulation_meta.telemetry_jsonl_path,
+        appraisal_engine=appraisal_engine,
+        tms_router=tms_router,
+        brain=brain,
     )
+    metrics_engine = FourDimensionalMetricsEngine(
+        db_path=args.db_path,
+        config=config,
+        game_master=game_master,
+        memory_engine=memory_engine,
+    )
+    monitor = RealTimeLiveMonitor(config=config)
 
-    tick_history: List[MacroEconomyState] = []
-    total_approved_trades = 0
+    history: List[FourDimTickTelemetry] = []
+    agent_ids = [a.agent_id for a in config.agents]
 
-    for tick in range(1, spec.simulation_meta.num_ticks + 1):
-        tick_start = time.time()
-        hw_stats = aimd_controller.probe_hardware_and_adjust()
+    # 3. Main Tick Loop
+    for tick in range(1, config.total_ticks + 1):
+        macro_state = game_master.step_crisis_regime(tick=tick)
+        monitor.log_tick_header(tick=tick, macro=macro_state)
 
-        if tick == 4:
-            broadcast = (
-                "URGENT MARKET SHOCK: Rumors suggest Agent_2 and Agent_4 are hoarding TECH "
-                "and exploiting scarcity; food supply chains face temporary price pressure!"
-            )
-        else:
-            broadcast = (
-                f"Official Tick {tick} Bulletin: Reference FOOD=${macro_init.market_clearing_price_food:.2f}, "
-                f"TECH=${macro_init.market_clearing_price_tech:.2f}. Mention Agent_3 for macro advice."
-            )
-
-        directed_requests = market.select_interaction_pairs_mnl(agent_ids)
-        matchings = ConflictFreeBatcher.compute_disjoint_matchings(directed_requests)
-
-        tick_records: List[TurnExecutionRecord] = []
-        for matching in matchings:
-            for initiator_id, responder_id in matching:
-                rec = orchestrator.execute_two_wave_dyadic_interaction(
-                    tick=tick,
-                    initiator_id=initiator_id,
-                    responder_id=responder_id,
-                    market_broadcast_msg=broadcast,
-                )
-                tick_records.append(rec)
-                if rec.final_verdict.status == VerdictStatus.APPROVED and rec.final_verdict.quantity_transferred > 0:
-                    total_approved_trades += 1
-
-        game_master.execute_end_of_tick_upkeep(tick=tick)
-        conservation_ok, conservation_err = game_master.verify_global_money_conservation()
-
-        macro_snap = evaluator.compute_and_log_tick_metrics(
+        eff_trust_matrix = memory_engine.get_effective_trust_matrix()
+        pairs = market_engine.match_conflict_free_pairs(
             tick=tick,
             agent_ids=agent_ids,
-            conservation_ok=conservation_ok,
-            conservation_error=conservation_err,
-            hw_stats=hw_stats,
-        )
-        tick_history.append(macro_snap)
-
-        console.print(
-            f"[bold cyan]Tick {tick:02d}/{spec.simulation_meta.num_ticks:02d}[/bold cyan] "
-            f"({time.time() - tick_start:.1f}s) | "
-            f"Pairs: {len(tick_records)} | "
-            f"Trust Index: [bold]{macro_snap.societal_trust_index:+.3f}[/bold] | "
-            f"Gini: [yellow]{macro_snap.wealth_gini:.3f}[/yellow] | "
-            f"Trade Vol: [green]${macro_snap.cumulative_trade_volume:.2f}[/green] | "
-            f"TMS Queries: [magenta]{macro_snap.cumulative_tms_queries}[/magenta] | "
-            f"VRAM: {hw_stats['vram_allocated_gb']:.2f}GB | "
-            f"ACID Drift: {conservation_err:.2e}"
+            effective_trust_matrix=eff_trust_matrix,
         )
 
-    summary_table = Table(title="MVP Simulation Trajectory & Conservation Audit")
-    summary_table.add_column("Tick", justify="right", style="cyan")
-    summary_table.add_column("Trust Index", justify="right", style="green")
-    summary_table.add_column("Wealth Gini", justify="right", style="yellow")
-    summary_table.add_column("Food Price", justify="right")
-    summary_table.add_column("Cumul. Volume", justify="right", style="bold green")
-    summary_table.add_column("TMS Queries", justify="right", style="magenta")
-    summary_table.add_column("Treasury Cash", justify="right")
+        for p_idx, (init_id, resp_id) in enumerate(pairs, start=1):
+            outcome = orchestrator.execute_dyadic_pair_interaction(
+                tick=tick,
+                initiator_id=init_id,
+                responder_id=resp_id,
+            )
+            monitor.log_dyadic_interaction(pair_idx=p_idx, outcome=outcome)
 
-    for snap in tick_history:
-        summary_table.add_row(
-            str(snap.tick),
-            f"{snap.societal_trust_index:+.4f}",
-            f"{snap.wealth_gini:.4f}",
-            f"${snap.market_clearing_price_food:.2f}",
-            f"${snap.cumulative_trade_volume:.2f}",
-            str(snap.cumulative_tms_queries),
-            f"${snap.public_treasury_cash:.2f}",
+        upkeep_report = game_master.execute_end_of_tick_upkeep_and_fiscal_state(
+            tick=tick
         )
-    console.print("\n", summary_table)
+        monitor.log_upkeep_and_sanctions(tick=tick, upkeep_report=upkeep_report)
 
-    final_ok, final_err = game_master.verify_global_money_conservation()
-    status_str = "[bold green]PASS (Exact Conservation)[/bold green]" if final_ok else "[bold red]FAIL[/bold red]"
-    console.print(
-        Panel.fit(
-            f"Global Money Supply Conservation Check: {status_str} (Drift Error = {final_err:.3e})\n"
-            f"Total Approved Bilateral Trades: [bold]{total_approved_trades}[/bold] | "
-            f"Telemetry Saved: [underline]{spec.simulation_meta.telemetry_jsonl_path}[/underline]",
-            border_style="green" if final_ok else "red",
+        tick_telemetry = metrics_engine.compute_and_persist_tick_telemetry(
+            tick=tick,
+            upkeep_report=upkeep_report,
+            cumulative_tms_queries=orchestrator.cumulative_tms_queries,
+            successful_tms_routes=orchestrator.successful_tms_routes,
         )
-    )
+        monitor.log_four_dim_tick_dashboard(tick_telemetry)
+        history.append(tick_telemetry)
+
+    scorecard = metrics_engine.compute_empirical_validation_scorecard(history)
+    monitor.print_final_empirical_scorecard(history=history, scorecard=scorecard)
+    return history
 
 
 if __name__ == "__main__":
-    main()
+    run_simulation()

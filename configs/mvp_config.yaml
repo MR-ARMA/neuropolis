@@ -1,74 +1,257 @@
-# ==============================================================================
-# MVP CONFIGURATION: TUNED FOR ASUS TUF F15 (4GB NVIDIA VRAM, 16GB SYSTEM RAM)
-# ==============================================================================
-simulation_meta:
-  experiment_id: "mvp_bilateral_trust_market_v1"
-  random_seed: 42
-  num_agents: 6
-  num_ticks: 8
-  environment_type: "BILATERAL_TRUST_MARKET"
-  db_path: "data/mvp_world_state.sqlite"
-  telemetry_jsonl_path: "data/mvp_telemetry.jsonl"
+experiment_id: "neuropolis-4d-hank-empirical-v2"
+random_seed: 42
+total_ticks: 8
+footprint_profile: "PROTOTYPE_LAPTOP"
 
-hardware_and_backend:
-  backend_type: "WHITE_BOX_PYTORCH"          # Options: WHITE_BOX_PYTORCH | BLACK_BOX_API
-  model_id: "Qwen/Qwen2.5-1.5B-Instruct"     # Default 1.5B model (or swap to "Qwen/Qwen2.5-7B-Instruct")
-  models_dir: "./models"
-  quantization_mode: "nf4_4bit"              # "nf4_4bit" (~1.25GB VRAM for 1.5B) | "fp16" (~3.05GB VRAM)
-  device: "cuda"                             # Auto-falls back to "cpu" if CUDA is unavailable
-  max_new_tokens: 180
-  temperature: 0.4
-  batch_size: 1                              # Sequential conflict-free execution for 4GB VRAM
-  vram_ceiling_gb: 3.2                       # Enforces GPU memory cap with automatic CPU RAM offload for 7B/8B
-  black_box_api_url: "http://localhost:11434/v1/chat/completions"
-  black_box_api_key: "EMPTY"
+orthogonal_clamping:
+  omega_d1_scarcity_and_hank: true
+  omega_d2_trust_and_parochialism: true
+  omega_d3_contagion_and_polarization: true
+  omega_d4_fiscal_and_legal_state: true
 
-mechanistic_steering:
+model_spec:
+  backend_type: "WHITE_BOX"
+  model_id: "Qwen/Qwen2.5-1.5B-Instruct"
+  local_dir: "./models/Qwen--Qwen2.5-1.5B-Instruct"
+  auto_download: true
+  precision: "float16"
+  max_new_tokens: 160
+  temperature: 0.45
+
+steering_spec:
   enabled: true
-  mode: "MASTER_EQUATION_MVP"                # Options: NONE | PASTA | ITI | MASTER_EQUATION_MVP
-  calibration_pairs_count: 16                # Contrastive SVD calibration on startup
-  target_layer_fraction: 0.55                # Middle-upper layers (e.g. [14, 15, 16] on 28-layer 1.5B)
-  # --- Active MVP High-ROI Master Equation Terms ---
-  omega_fin_stress: 2.4                      # Term 1a: Pre-softmax key bias on SPAN_DRIVES_AND_FINANCE
-  omega_peer_salience: 1.9                   # Term 1b: Pre-softmax key bias on SPAN_PEER_MEMORY
-  gamma_cynicism_scale: 0.85                 # Term 3a: Value-space projection removing u_trust
-  eta_anxiety_scale: 0.65                    # Term 3b: Value-space projection injecting u_threat
-  kappa_dissonance_sink: 3.0                 # Term 8: Pre-softmax logit boost on <bos> sink under dissonance
-  logit_clip_z_max: 4.5                      # Bounded tanh key-bias ceiling
-  # --- Post-MVP Master Equation Parameters (Preserved in Config) ---
-  lambda_rope_construal: 0.35                # Term 4: Construal RoPE phase warping
-  alpha_sys1_gate: 0.40                      # Term 5a: System-1 induction head boost
-  beta_sys2_gate: 0.40                       # Term 5b: System-2 deliberative head suppression
-  epsilon_mirror_contagion: 0.50             # Term 6: Latent KV-prefix affective contagion
-  beta_0_temperature: 1.0                    # Term 7: Yerkes-Dodson baseline inverse temperature
-  zeta_panic: 1.5                            # Term 7a: Panic sharpening coefficient
-  zeta_fatigue: 0.8                          # Term 7b: Fatigue flattening coefficient
-  mu_hebbian_trace: 0.60                     # Term 9: Short-term Hebbian rumination weight
+  mode: "MASTER_EQUATION"
+  omega_1_drives_finance: 2.60
+  omega_2_peer_memory: 1.85
+  mu_hebbian: 0.70
+  kappa_dissonance_sink: 3.40
+  gamma_cynicism_scale: 1.25
+  eta_anxiety_scale: 0.90
+  lambda_rope_construal: 0.45
+  alpha_sys1_gain: 0.45
+  beta_sys2_atten: 0.50
+  beta_base_temp: 1.00
+  zeta_panic: 2.20
+  zeta_fatigue: 0.85
+  optimal_arousal: 0.45
+  logit_clamp_max: 8.00
 
-entropy_tms_router:
+tms_spec:
   enabled: true
-  probe_tokens_k: 5                          # Semantic tokens probed after '{"internal_thought": "'
-  top_p_truncation: 0.90                     # Top-p vocabulary support for Shannon entropy
-  entropy_threshold_tau: 0.68                # Halts & routes ASK_EXPERT if H_bar > tau
+  entropy_threshold_tau: 0.48
+  probe_tokens_k: 5
+  top_p_truncation: 0.90
   communication_cost_xi: 0.05
 
-memory_and_cognition:
-  stm_capacity: 12
-  ebbinghaus_base_half_life_ticks: 4.0
-  consolidation_salience_threshold: 1.85
-  habit_router_arousal_threshold: 0.15
-  habit_router_rpe_threshold: 0.10
-  slovic_pos_trust_rate: 0.12
-  slovic_neg_trust_rate: 0.30
+hank_and_crisis_spec:
+  subsistence_min_c: 1.0
+  safe_cash_buffer_b: 50.0
+  borrowing_limit_ratio_income: -0.42
+  liquid_return_rate_rb: 0.002
+  borrowing_wedge_kappa: 0.0064
+  capital_yield_rate_rk: 0.075
+  reference_consumable_price_pc: 12.00
+  reference_capital_price_qk: 60.00
+  kmv_chi_0: 0.075
+  kmv_chi_1: 0.526
+  kmv_chi_2: 0.736
+  kmv_a_min: 0.50
+  prod_tfp_baseline_ac: 1.00
+  prod_capital_elasticity_eta: 0.25
+  present_bias_beta_min: 0.45
+  present_bias_eta: 1.35
+  long_run_discount_delta: 0.96
+  active_crisis: "NONE"
+  crisis_start_tick: 3
+  crisis_duration_ticks: 4
+  crisis_severity_sigma: 0.35
+  crisis_persistence_rho: 0.85
 
-economy_and_institutions:
-  initial_agent_cash: 100.0
-  initial_treasury_cash: 200.0
-  initial_bank_reserves: 300.0
-  initial_firm_sector_cash: 400.0
-  base_wage_per_tick: 12.0
-  survival_food_consumption_per_tick: 1
-  reference_food_price: 15.0
-  reference_tech_price: 35.0
+trust_and_market_spec:
+  initial_generalized_trust: 0.58
+  initial_institutional_trust: 0.65
+  slovic_eta_pos: 0.14
+  slovic_eta_neg: 0.35
+  kkt_desperation_kappa: 1.20
+  kkt_weight_lambda: 1.50
+  trade_fairness_baseline_gamma: 0.35
+  gini_trust_sensitivity_beta: 0.70
+  theil_trust_sensitivity_beta: 0.35
+  pg_compliance_trust_beta: 0.25
+  scarcity_trust_beta: 0.30
+  inst_trust_spillover_beta: 0.20
+  familiarity_decay_lambda_n: 0.45
+  seller_base_margin_mu: 0.20
+  distrust_risk_premium_phi: 0.35
+  partner_match_trust_beta: 2.50
+  partner_match_surplus_beta: 1.80
+
+contagion_and_opinion_spec:
+  barsade_nonverbal_weight: 0.93
+  barsade_verbal_weight: 0.07
+  negativity_contagion_lambda: 1.65
+  hk_initial_confidence_eps: 0.50
+  hk_trust_inc_gamma: 0.12
+  hk_distrust_dec_gamma: 0.18
+  sharot_desirable_psi: 1.00
+  sharot_undesirable_psi: 0.6875
+  fj_susceptibility_default: 0.45
+  complex_contagion_min_exposures: 2
+  complex_contagion_min_tie_trust: 0.20
+
+fiscal_and_legal_spec:
   sales_tax_rate: 0.05
-  max_action_retries: 2
+  saez_mid_income_tax_rate: 0.18
+  saez_pareto_alpha: 2.00
+  saez_elasticity_uncomp: 0.25
+  saez_elasticity_comp: 0.30
+  saez_top_social_weight_g: 0.15
+  wealth_tax_rate: 0.015
+  wealth_tax_threshold: 220.0
+  universal_vs_targeted_phi: 0.60
+  public_goods_endowment_share: 0.15
+  public_goods_mpcr_a: 0.40
+  base_audit_probability: 0.35
+  ostrom_scarcity_mercy_gamma: 0.50
+  ostrom_sanction_penalty_per_point: 0.10
+  initial_public_treasury_cash: 100.0
+  initial_firm_sector_cash: 2000.0
+
+agents:
+  - agent_id: "Agent_01_Elena"
+    occupation_role: "Agricultural_Producer_Lead"
+    wage_tier: "MID"
+    liquid_wealth_cash: 95.0
+    consumable_necessity_inv: 9.0
+    productive_capital_inv: 1.0
+    base_income_wage: 16.0
+    base_consumable_prod_q: 3.5
+    fehr_schmidt_tier: "MODERATE"
+    alpha_disadvantageous: 0.50
+    beta_advantageous: 0.25
+    loss_aversion_lambda: 2.10
+    risk_tolerance_gamma: 0.88
+    identity_rigidity: 0.45
+    innate_opinion_anchor_s: 0.25
+    tms_specialty: "CONSUMABLE_NECESSITY"
+    big_five:
+      openness: 0.60
+      conscientiousness: 0.85
+      extraversion: 0.55
+      agreeableness: 0.70
+      neuroticism: 0.30
+
+  - agent_id: "Agent_02_Marcus"
+    occupation_role: "Agricultural_Smallholder"
+    wage_tier: "LOW"
+    liquid_wealth_cash: 68.0
+    consumable_necessity_inv: 7.0
+    productive_capital_inv: 0.0
+    base_income_wage: 12.0
+    base_consumable_prod_q: 3.0
+    fehr_schmidt_tier: "STRONG"
+    alpha_disadvantageous: 1.00
+    beta_advantageous: 0.60
+    loss_aversion_lambda: 2.65
+    risk_tolerance_gamma: 0.78
+    identity_rigidity: 0.70
+    innate_opinion_anchor_s: -0.35
+    tms_specialty: "CONSUMABLE_NECESSITY"
+    big_five:
+      openness: 0.40
+      conscientiousness: 0.75
+      extraversion: 0.40
+      agreeableness: 0.50
+      neuroticism: 0.65
+
+  - agent_id: "Agent_03_Viktor"
+    occupation_role: "Capital_Systems_Architect"
+    wage_tier: "HIGH"
+    liquid_wealth_cash: 210.0
+    consumable_necessity_inv: 1.0
+    productive_capital_inv: 5.0
+    base_income_wage: 30.0
+    base_consumable_prod_q: 0.0
+    fehr_schmidt_tier: "SELFISH"
+    alpha_disadvantageous: 0.00
+    beta_advantageous: 0.00
+    loss_aversion_lambda: 1.60
+    risk_tolerance_gamma: 0.95
+    identity_rigidity: 0.80
+    innate_opinion_anchor_s: 0.75
+    tms_specialty: "PRODUCTIVE_CAPITAL_ASSET"
+    big_five:
+      openness: 0.85
+      conscientiousness: 0.80
+      extraversion: 0.65
+      agreeableness: 0.35
+      neuroticism: 0.25
+
+  - agent_id: "Agent_04_Sophia"
+    occupation_role: "Industrial_Quant_Engineer"
+    wage_tier: "HIGH"
+    liquid_wealth_cash: 175.0
+    consumable_necessity_inv: 1.0
+    productive_capital_inv: 4.0
+    base_income_wage: 26.0
+    base_consumable_prod_q: 0.0
+    fehr_schmidt_tier: "MODERATE"
+    alpha_disadvantageous: 0.50
+    beta_advantageous: 0.25
+    loss_aversion_lambda: 1.95
+    risk_tolerance_gamma: 0.90
+    identity_rigidity: 0.50
+    innate_opinion_anchor_s: 0.45
+    tms_specialty: "PRODUCTIVE_CAPITAL_ASSET"
+    big_five:
+      openness: 0.80
+      conscientiousness: 0.70
+      extraversion: 0.60
+      agreeableness: 0.60
+      neuroticism: 0.35
+
+  - agent_id: "Agent_05_Tariq"
+    occupation_role: "Commodity_Clearing_Merchant"
+    wage_tier: "MID"
+    liquid_wealth_cash: 120.0
+    consumable_necessity_inv: 3.0
+    productive_capital_inv: 2.0
+    base_income_wage: 18.0
+    base_consumable_prod_q: 0.5
+    fehr_schmidt_tier: "SELFISH"
+    alpha_disadvantageous: 0.00
+    beta_advantageous: 0.00
+    loss_aversion_lambda: 2.00
+    risk_tolerance_gamma: 0.92
+    identity_rigidity: 0.35
+    innate_opinion_anchor_s: 0.10
+    tms_specialty: "CONSUMABLE_NECESSITY"
+    big_five:
+      openness: 0.75
+      conscientiousness: 0.65
+      extraversion: 0.85
+      agreeableness: 0.55
+      neuroticism: 0.40
+
+  - agent_id: "Agent_06_Maya"
+    occupation_role: "Precarious_Service_Worker"
+    wage_tier: "LOW"
+    liquid_wealth_cash: 32.0
+    consumable_necessity_inv: 1.0
+    productive_capital_inv: 1.0
+    base_income_wage: 10.0
+    base_consumable_prod_q: 0.0
+    fehr_schmidt_tier: "HYPER_EGALITARIAN"
+    alpha_disadvantageous: 4.00
+    beta_advantageous: 0.60
+    loss_aversion_lambda: 3.10
+    risk_tolerance_gamma: 0.70
+    identity_rigidity: 0.75
+    innate_opinion_anchor_s: -0.80
+    tms_specialty: "CONSUMABLE_NECESSITY"
+    big_five:
+      openness: 0.55
+      conscientiousness: 0.60
+      extraversion: 0.50
+      agreeableness: 0.75
+      neuroticism: 0.85

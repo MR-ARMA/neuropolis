@@ -1,496 +1,789 @@
-"""
-src/core/contracts.py
-Complete Pydantic v2 Data Contracts, Enumerations, Tensor Type Aliases,
-and Structural Protocols for all 12 Architectural Modules.
-"""
-
 from __future__ import annotations
 
-from enum import Enum
-from typing import Any, Dict, List, Optional, Protocol, Tuple, Union, runtime_checkable
+from enum import Enum, EnumMeta
+from typing import Any, Dict, List, Literal, Optional, Tuple
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 import torch
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-
-# ==============================================================================
-# 1. TENSOR TYPE ALIASES & CONSTANTS
-# ==============================================================================
-Tensor1D = torch.Tensor  # Shape: [D] or [S]
-Tensor2D = torch.Tensor  # Shape: [S, D] or [B, S]
-Tensor3D = torch.Tensor  # Shape: [B, S, D]
-Tensor4D = torch.Tensor  # Shape: [B, H, S, S] or [B, H, S, D_head]
-
-SPAN_SINK = "SPAN_SINK"
-SPAN_SELF_IDENTITY = "SPAN_SELF_IDENTITY"
-SPAN_DRIVES_AND_FINANCE = "SPAN_DRIVES_AND_FINANCE"
-SPAN_CORE_BELIEF = "SPAN_CORE_BELIEF"
-SPAN_APPRAISAL_AND_TOM = "SPAN_APPRAISAL_AND_TOM"
-SPAN_PEER_MEMORY_PREFIX = "SPAN_PEER_MEMORY"
-SPAN_INCOMING_MSG_PREFIX = "SPAN_INCOMING_MSG"
 
 
-# ==============================================================================
-# 2. ENUMERATIONS
-# ==============================================================================
-class BackendType(str, Enum):
-    WHITE_BOX_PYTORCH = "WHITE_BOX_PYTORCH"
-    BLACK_BOX_API = "BLACK_BOX_API"
+# ============================================================================
+# 0. CANONICAL SPAN CONSTANTS & FLEXIBLE ENUMS
+# ============================================================================
+
+SPAN_SINK: str = "SPAN_SINK"
+SPAN_SELF_IDENTITY: str = "SPAN_SELF_IDENTITY"
+SPAN_DRIVES_AND_FINANCE: str = "SPAN_DRIVES_AND_FINANCE"
+SPAN_CORE_BELIEF: str = "SPAN_CORE_BELIEF"
+SPAN_PEER_MEMORY: str = "SPAN_PEER_MEMORY"
+SPAN_INCOMING_MSG: str = "SPAN_INCOMING_MSG"
+SPAN_APPRAISAL_AND_TOM: str = "SPAN_APPRAISAL_AND_TOM"
+
+ALL_SEMANTIC_SPANS: List[str] = [
+    SPAN_SINK,
+    SPAN_SELF_IDENTITY,
+    SPAN_DRIVES_AND_FINANCE,
+    SPAN_CORE_BELIEF,
+    SPAN_PEER_MEMORY,
+    SPAN_INCOMING_MSG,
+    SPAN_APPRAISAL_AND_TOM,
+]
+CANONICAL_SPAN_NAMES: List[str] = ALL_SEMANTIC_SPANS
+SEMANTIC_SPAN_ORDER: List[str] = ALL_SEMANTIC_SPANS
+TokenSpanMap = Dict[str, Tuple[int, int]]
 
 
-class SteeringMode(str, Enum):
+class _FlexibleEnumMeta(EnumMeta):
+    def __getattr__(cls, name: str) -> Any:
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return name
+
+
+class BackendType(str, Enum, metaclass=_FlexibleEnumMeta):
+    WHITE_BOX = "WHITE_BOX"
+    BLACK_BOX = "BLACK_BOX"
+
+
+class SteeringMode(str, Enum, metaclass=_FlexibleEnumMeta):
     NONE = "NONE"
     PASTA = "PASTA"
     INSTABOOST = "INSTABOOST"
     AUTOPASTA = "AUTOPASTA"
     SPOTLIGHT = "SPOTLIGHT"
     ITI = "ITI"
-    MASTER_EQUATION_MVP = "MASTER_EQUATION_MVP"
-    MASTER_EQUATION_FULL = "MASTER_EQUATION_FULL"
+    MASTER_EQUATION = "MASTER_EQUATION"
 
 
-class LegalStatus(str, Enum):
-    LAW_ABIDING = "LAW_ABIDING"
-    AUDITED = "AUDITED"
-    IMPRISONED = "IMPRISONED"
+class ActionCategory(str, Enum, metaclass=_FlexibleEnumMeta):
+    COMMERCIAL_TRADE = "COMMERCIAL_TRADE"
+    PERSONAL_WORK_CONSUME = "PERSONAL_WORK_CONSUME"
+    TMS_QUERY = "TMS_QUERY"
+    PUBLIC_COMMONS = "PUBLIC_COMMONS"
+    PUBLIC_GOODS_TAX = "PUBLIC_GOODS_TAX"
+    BANK_CREDIT = "BANK_CREDIT"
+    SOCIAL = "SOCIAL"
+    STRATEGIC_PLAN = "STRATEGIC_PLAN"
 
 
-class RelationshipType(str, Enum):
-    STRANGER = "STRANGER"
-    ACQUAINTANCE = "ACQUAINTANCE"
-    COLLEAGUE = "COLLEAGUE"
-    CLOSE_FRIEND = "CLOSE_FRIEND"
-    RIVAL = "RIVAL"
-
-
-class ConsentDecision(str, Enum):
+class ConsentDecision(str, Enum, metaclass=_FlexibleEnumMeta):
     INITIATE = "INITIATE"
     ACCEPT = "ACCEPT"
     REJECT = "REJECT"
+    COUNTER_OFFER = "COUNTER_OFFER"
     IGNORE = "IGNORE"
 
 
-class ActionCategory(str, Enum):
-    BILATERAL_TRADE = "BILATERAL_TRADE"
-    COUNTER_OFFER = "COUNTER_OFFER"
-    WORK_AND_CONSUME = "WORK_AND_CONSUME"
-    TMS_QUERY = "TMS_QUERY"
-    PUBLIC_GOODS_CONTRIB = "PUBLIC_GOODS_CONTRIB"
-    BANK_DEPOSIT_WITHDRAW = "BANK_DEPOSIT_WITHDRAW"
+class ActionType(str, Enum, metaclass=_FlexibleEnumMeta):
+    BUY = "BUY"
+    SELL = "SELL"
+    HOLD_OR_WORK = "HOLD_OR_WORK"
     NO_OP = "NO_OP"
+    ASK_EXPERT = "ASK_EXPERT"
 
 
-class VerdictStatus(str, Enum):
+EconomicActionType = ActionType
+
+
+class LegalStatus(str, Enum, metaclass=_FlexibleEnumMeta):
+    LAW_ABIDING = "LAW_ABIDING"
+    SANCTIONED = "SANCTIONED"
+    OSTRACIZED = "OSTRACIZED"
+    IMPRISONED = "IMPRISONED"
+
+
+class RelationshipType(str, Enum, metaclass=_FlexibleEnumMeta):
+    STRANGER = "STRANGER"
+    ACQUAINTANCE = "ACQUAINTANCE"
+    COLLEAGUE = "COLLEAGUE"
+    COWORKER = "COWORKER"
+    FRIEND = "FRIEND"
+    CLOSE_FAMILY = "CLOSE_FAMILY"
+    RIVAL = "RIVAL"
+
+
+class FootprintProfile(str, Enum, metaclass=_FlexibleEnumMeta):
+    PROTOTYPE_LAPTOP = "PROTOTYPE_LAPTOP"
+    WORKSTATION_RESEARCH = "WORKSTATION_RESEARCH"
+    CLUSTER_PRODUCTION = "CLUSTER_PRODUCTION"
+
+
+class VerdictStatus(str, Enum, metaclass=_FlexibleEnumMeta):
     APPROVED = "APPROVED"
-    ESCROW_LOCKED = "ESCROW_LOCKED"
-    REJECTED_INSUFFICIENT_FUNDS = "REJECTED_INSUFFICIENT_FUNDS"
-    REJECTED_INSUFFICIENT_INVENTORY = "REJECTED_INSUFFICIENT_INVENTORY"
-    REJECTED_COUNTERPARTY_DECLINED = "REJECTED_COUNTERPARTY_DECLINED"
-    REJECTED_ILLEGAL_STATE = "REJECTED_ILLEGAL_STATE"
-    REJECTED_SCHEMA_ERROR = "REJECTED_SCHEMA_ERROR"
+    REJECTED = "REJECTED"
 
 
-class ExpertiseDomain(str, Enum):
-    FOOD_SUPPLY_CHAIN = "FOOD_SUPPLY_CHAIN"
-    TECH_VALUATION = "TECH_VALUATION"
-    MACRO_INFLATION = "MACRO_INFLATION"
-    CREDIT_SOLVENCY = "CREDIT_SOLVENCY"
+class RejectionErrorCode(str, Enum, metaclass=_FlexibleEnumMeta):
+    INSUFFICIENT_FUNDS = "INSUFFICIENT_FUNDS"
+    INSUFFICIENT_INVENTORY = "INSUFFICIENT_INVENTORY"
+    LEGAL_RESTRICTION = "LEGAL_RESTRICTION"
+    COUNTERPARTY_REJECTED = "COUNTERPARTY_REJECTED"
+    INVALID_AMOUNT = "INVALID_AMOUNT"
+    NO_TRADE_REQUESTED = "NO_TRADE_REQUESTED"
 
 
-# ==============================================================================
-# 3. CONFIGURATION CONTRACTS (`SimulationSpec`)
-# ==============================================================================
-class SimulationMetaSpec(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    experiment_id: str = "mvp_bilateral_trust_market_v1"
-    random_seed: int = 42
-    num_agents: int = Field(default=6, ge=2)
-    num_ticks: int = Field(default=8, ge=1)
-    environment_type: str = "BILATERAL_TRUST_MARKET"
-    db_path: str = "data/mvp_world_state.sqlite"
-    telemetry_jsonl_path: str = "data/mvp_telemetry.jsonl"
+ErrorCode = RejectionErrorCode
 
 
-class HardwareBackendSpec(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    backend_type: BackendType = BackendType.WHITE_BOX_PYTORCH
+# ============================================================================
+# 1. CANONICAL ITEM NORMALIZATION & ORTHOGONAL CLAMPING VECTOR (OMEGA in {0,1}^4)
+# ============================================================================
+
+CanonicalItemType = Literal["CONSUMABLE_NECESSITY", "PRODUCTIVE_CAPITAL_ASSET"]
+CrisisScenarioType = Literal[
+    "NONE",
+    "STAGFLATION_SUBSISTENCE_SHOCK",
+    "ASYMMETRIC_UNEMPLOYMENT_SHOCK",
+    "ASSET_VALUATION_CRASH",
+    "LIQUIDITY_CREDIT_CRUNCH",
+]
+
+
+def normalize_item_id(raw_item: str) -> str:
+    """Maps legacy or colloquial item names onto the strict Two-Asset HANK taxonomy."""
+    token = (raw_item or "").strip().upper()
+    if token in ("FOOD", "CONSUMABLE", "CONSUMABLE_NECESSITY", "NECESSITY", "GRAIN"):
+        return "CONSUMABLE_NECESSITY"
+    if token in ("TECH", "CAPITAL", "PRODUCTIVE_CAPITAL_ASSET", "CAPITAL_ASSET", "ASSET"):
+        return "PRODUCTIVE_CAPITAL_ASSET"
+    return "CONSUMABLE_NECESSITY"
+
+
+class FlexibleBaseModel(BaseModel):
+    model_config = ConfigDict(
+        extra="allow",
+        arbitrary_types_allowed=True,
+        populate_by_name=True,
+        protected_namespaces=(),
+    )
+
+
+class OrthogonalClampingSpec(FlexibleBaseModel):
+    """Controls the 4 Socio-Economic Dimensions independently (Omega in {0, 1}^4)."""
+    omega_d1_scarcity_and_hank: bool = True
+    omega_d2_trust_and_parochialism: bool = True
+    omega_d3_contagion_and_polarization: bool = True
+    omega_d4_fiscal_and_legal_state: bool = True
+
+    def as_tuple(self) -> Tuple[int, int, int, int]:
+        return (
+            int(self.omega_d1_scarcity_and_hank),
+            int(self.omega_d2_trust_and_parochialism),
+            int(self.omega_d3_contagion_and_polarization),
+            int(self.omega_d4_fiscal_and_legal_state),
+        )
+
+
+# ============================================================================
+# 2. CONFIGURATION SPECIFICATIONS (Pillar A through E)
+# ============================================================================
+
+class ModelSpec(FlexibleBaseModel):
+    backend_type: str = "WHITE_BOX"
     model_id: str = "Qwen/Qwen2.5-1.5B-Instruct"
-    models_dir: str = "./models"
-    quantization_mode: str = "fp16"
-    device: str = "cuda"
-    max_new_tokens: int = 180
-    temperature: float = 0.4
-    batch_size: int = 1
-    vram_ceiling_gb: float = 3.2
-    black_box_api_url: str = "http://localhost:11434/v1/chat/completions"
-    black_box_api_key: str = "EMPTY"
+    local_dir: str = "./models/Qwen--Qwen2.5-1.5B-Instruct"
+    auto_download: bool = True
+    precision: str = "float16"
+    api_base_url: Optional[str] = "http://localhost:1234/v1"
+    api_key: Optional[str] = "lm-studio"
+    max_new_tokens: int = 160
+    temperature: float = 0.45
+
+    @property
+    def local_model_dir(self) -> str:
+        return self.local_dir
+
+    @property
+    def path(self) -> str:
+        return self.local_dir
+
+    @property
+    def vault_dir(self) -> str:
+        return "./models"
 
 
-class MechanisticSteeringSpec(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+class SteeringLabConfig(FlexibleBaseModel):
     enabled: bool = True
-    mode: SteeringMode = SteeringMode.MASTER_EQUATION_MVP
-    calibration_pairs_count: int = 16
-    target_layer_fraction: float = 0.55
-    omega_fin_stress: float = 2.2
-    omega_peer_salience: float = 1.8
-    gamma_cynicism_scale: float = 0.85
-    eta_anxiety_scale: float = 0.65
-    kappa_dissonance_sink: float = 2.8
-    logit_clip_z_max: float = 4.5
-    # Post-MVP parameters preserved for full Master Equation
-    lambda_rope_construal: float = 0.35
-    alpha_sys1_gate: float = 0.40
-    beta_sys2_gate: float = 0.40
-    epsilon_mirror_contagion: float = 0.50
-    beta_0_temperature: float = 1.0
-    zeta_panic: float = 1.5
-    zeta_fatigue: float = 0.8
-    mu_hebbian_trace: float = 0.60
+    mode: str = "MASTER_EQUATION"
+    omega_1_drives_finance: float = 2.60
+    omega_2_peer_memory: float = 1.85
+    mu_hebbian: float = 0.70
+    kappa_dissonance_sink: float = 3.40
+    gamma_cynicism_scale: float = 1.25
+    eta_anxiety_scale: float = 0.90
+    lambda_rope_construal: float = 0.45
+    alpha_sys1_gain: float = 0.45
+    beta_sys2_atten: float = 0.50
+    beta_base_temp: float = 1.00
+    zeta_panic: float = 2.20
+    zeta_fatigue: float = 0.85
+    optimal_arousal: float = 0.45
+    logit_clamp_max: float = 8.00
+    pasta_alpha: float = 0.25
+    instaboost_beta: float = 3.50
+    spotlight_top_k_ratio: float = 0.35
+    iti_alpha: float = 2.00
+    hebbian_decay_lambda: float = 0.35
+    hebbian_learning_eta: float = 0.40
+    custom_ast_formula: Optional[str] = None
+
+    @property
+    def omega_1(self) -> float:
+        return self.omega_1_drives_finance
+
+    @property
+    def omega_2(self) -> float:
+        return self.omega_2_peer_memory
+
+    @property
+    def mu(self) -> float:
+        return self.mu_hebbian
+
+    @property
+    def kappa_sink(self) -> float:
+        return self.kappa_dissonance_sink
+
+    @property
+    def gamma_cynicism(self) -> float:
+        return self.gamma_cynicism_scale
+
+    @property
+    def eta_anxiety(self) -> float:
+        return self.eta_anxiety_scale
+
+    @property
+    def lambda_rope(self) -> float:
+        return self.lambda_rope_construal
+
+    @property
+    def alpha_sys1(self) -> float:
+        return self.alpha_sys1_gain
+
+    @property
+    def beta_sys2(self) -> float:
+        return self.beta_sys2_atten
+
+    @property
+    def beta_base(self) -> float:
+        return self.beta_base_temp
+
+    @property
+    def a_opt(self) -> float:
+        return self.optimal_arousal
+
+    @property
+    def delta_z_max(self) -> float:
+        return self.logit_clamp_max
 
 
-class EntropyTMSSpec(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+SteeringSpec = SteeringLabConfig
+
+
+class TMSSpec(FlexibleBaseModel):
     enabled: bool = True
+    entropy_threshold_tau: float = 0.48
     probe_tokens_k: int = 5
     top_p_truncation: float = 0.90
-    entropy_threshold_tau: float = 0.68
     communication_cost_xi: float = 0.05
 
 
-class MemoryCognitionSpec(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    stm_capacity: int = 12
-    ebbinghaus_base_half_life_ticks: float = 4.0
-    consolidation_salience_threshold: float = 1.85
-    habit_router_arousal_threshold: float = 0.15
-    habit_router_rpe_threshold: float = 0.10
-    slovic_pos_trust_rate: float = 0.12
-    slovic_neg_trust_rate: float = 0.30
+class HANKAndCrisisSpec(FlexibleBaseModel):
+    subsistence_min_c: float = 1.0
+    safe_cash_buffer_b: float = 50.0
+    borrowing_limit_ratio_income: float = -0.42
+    liquid_return_rate_rb: float = 0.002
+    borrowing_wedge_kappa: float = 0.0064
+    capital_yield_rate_rk: float = 0.075
+    reference_consumable_price_pc: float = 12.00
+    reference_capital_price_qk: float = 60.00
+    kmv_chi_0: float = 0.075
+    kmv_chi_1: float = 0.526
+    kmv_chi_2: float = 0.736
+    kmv_a_min: float = 0.50
+    prod_tfp_baseline_ac: float = 1.00
+    prod_capital_elasticity_eta: float = 0.25
+    present_bias_beta_min: float = 0.45
+    present_bias_eta: float = 1.35
+    long_run_discount_delta: float = 0.96
+    active_crisis: CrisisScenarioType = "NONE"
+    crisis_start_tick: int = 3
+    crisis_duration_ticks: int = 4
+    crisis_severity_sigma: float = 0.35
+    crisis_persistence_rho: float = 0.85
 
 
-class EconomyInstitutionsSpec(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    initial_agent_cash: float = 100.0
-    initial_treasury_cash: float = 200.0
-    initial_bank_reserves: float = 300.0
-    initial_firm_sector_cash: float = 400.0
-    base_wage_per_tick: float = 12.0
-    survival_food_consumption_per_tick: int = 1
-    reference_food_price: float = 15.0
-    reference_tech_price: float = 35.0
+class TrustAndMarketSpec(FlexibleBaseModel):
+    initial_generalized_trust: float = 0.58
+    initial_institutional_trust: float = 0.65
+    slovic_eta_pos: float = 0.14
+    slovic_eta_neg: float = 0.35
+    kkt_desperation_kappa: float = 1.20
+    kkt_weight_lambda: float = 1.50
+    trade_fairness_baseline_gamma: float = 0.35
+    gini_trust_sensitivity_beta: float = 0.70
+    theil_trust_sensitivity_beta: float = 0.35
+    pg_compliance_trust_beta: float = 0.25
+    scarcity_trust_beta: float = 0.30
+    inst_trust_spillover_beta: float = 0.20
+    familiarity_decay_lambda_n: float = 0.45
+    seller_base_margin_mu: float = 0.20
+    distrust_risk_premium_phi: float = 0.35
+    partner_match_trust_beta: float = 2.50
+    partner_match_surplus_beta: float = 1.80
+
+
+class ContagionAndOpinionSpec(FlexibleBaseModel):
+    barsade_nonverbal_weight: float = 0.93
+    barsade_verbal_weight: float = 0.07
+    negativity_contagion_lambda: float = 1.65
+    hk_initial_confidence_eps: float = 0.50
+    hk_trust_inc_gamma: float = 0.12
+    hk_distrust_dec_gamma: float = 0.18
+    sharot_desirable_psi: float = 1.00
+    sharot_undesirable_psi: float = 0.6875
+    fj_susceptibility_default: float = 0.45
+    complex_contagion_min_exposures: int = 2
+    complex_contagion_min_tie_trust: float = 0.20
+
+
+class FiscalAndLegalSpec(FlexibleBaseModel):
     sales_tax_rate: float = 0.05
-    max_action_retries: int = 2
+    saez_mid_income_tax_rate: float = 0.18
+    saez_pareto_alpha: float = 2.00
+    saez_elasticity_uncomp: float = 0.25
+    saez_elasticity_comp: float = 0.30
+    saez_top_social_weight_g: float = 0.15
+    wealth_tax_rate: float = 0.015
+    wealth_tax_threshold: float = 220.0
+    universal_vs_targeted_phi: float = 0.60
+    public_goods_endowment_share: float = 0.15
+    public_goods_mpcr_a: float = 0.40
+    base_audit_probability: float = 0.35
+    ostrom_scarcity_mercy_gamma: float = 0.50
+    ostrom_sanction_penalty_per_point: float = 0.10
+    initial_public_treasury_cash: float = 100.0
+    initial_firm_sector_cash: float = 2000.0
+
+    def compute_saez_optimal_top_rate(self) -> float:
+        num = 1.0 - self.saez_top_social_weight_g
+        denom = (
+            num
+            + self.saez_pareto_alpha * self.saez_elasticity_uncomp
+            + (self.saez_pareto_alpha - 1.0)
+            * max(0.0, self.saez_elasticity_comp - self.saez_elasticity_uncomp)
+        )
+        return float(num / max(denom, 1e-6))
 
 
-class SimulationSpec(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    simulation_meta: SimulationMetaSpec = Field(default_factory=SimulationMetaSpec)
-    hardware_and_backend: HardwareBackendSpec = Field(default_factory=HardwareBackendSpec)
-    mechanistic_steering: MechanisticSteeringSpec = Field(default_factory=MechanisticSteeringSpec)
-    entropy_tms_router: EntropyTMSSpec = Field(default_factory=EntropyTMSSpec)
-    memory_and_cognition: MemoryCognitionSpec = Field(default_factory=MemoryCognitionSpec)
-    economy_and_institutions: EconomyInstitutionsSpec = Field(default_factory=EconomyInstitutionsSpec)
+class BigFiveTraits(FlexibleBaseModel):
+    openness: float = 0.5
+    conscientiousness: float = 0.5
+    extraversion: float = 0.5
+    agreeableness: float = 0.5
+    neuroticism: float = 0.5
 
 
-# ==============================================================================
-# 4. AGENT INTERNAL, EXTERNAL & RELATIONAL STATE SCHEMAS
-# ==============================================================================
-class BigFiveTraits(BaseModel):
-    openness: float = Field(default=0.5, ge=0.0, le=1.0)
-    conscientiousness: float = Field(default=0.5, ge=0.0, le=1.0)
-    extraversion: float = Field(default=0.5, ge=0.0, le=1.0)
-    agreeableness: float = Field(default=0.5, ge=0.0, le=1.0)
-    neuroticism: float = Field(default=0.5, ge=0.0, le=1.0)
-
-
-class ProspectTheoryParams(BaseModel):
-    loss_aversion_lambda: float = Field(default=2.25, ge=0.5, le=6.0)
-    risk_curvature_gamma: float = Field(default=0.88, ge=0.2, le=1.5)
-    discount_factor_delta: float = Field(default=0.95, ge=0.1, le=1.0)
-
-
-class FehrSchmidtParams(BaseModel):
-    disadvantageous_inequity_alpha: float = Field(default=1.2, ge=0.0, le=5.0)
-    advantageous_inequity_beta: float = Field(default=0.4, ge=0.0, le=2.0)
-
-
-class MoodPAD(BaseModel):
-    valence: float = Field(default=0.1, ge=-1.0, le=1.0)
-    arousal: float = Field(default=0.25, ge=0.0, le=1.0)
-    dominance: float = Field(default=0.5, ge=0.0, le=1.0)
-
-
-class MaslowNeeds(BaseModel):
-    survival_satiety: float = Field(default=0.8, ge=0.0, le=1.0)
-    safety_security: float = Field(default=0.75, ge=0.0, le=1.0)
-    social_belonging: float = Field(default=0.65, ge=0.0, le=1.0)
-    esteem_status: float = Field(default=0.5, ge=0.0, le=1.0)
-
-
-class InternalAgentState(BaseModel):
-    """Tier-0 & Dynamic Psychological State (Private to `owner_id`)."""
-    agent_id: str
-    name: str
-    occupation: str
-    specialty_domain: ExpertiseDomain
-    core_belief_statement: str
-    identity_rigidity: float = Field(default=0.5, ge=0.0, le=1.0)
+class AgentSeedConfig(FlexibleBaseModel):
+    agent_id: str = "Agent_01"
+    occupation_role: str = "Worker"
+    wage_tier: Literal["LOW", "MID", "HIGH"] = "MID"
+    liquid_wealth_cash: float = 100.0
+    consumable_necessity_inv: float = 2.0
+    productive_capital_inv: float = 1.0
+    food_inventory: Optional[int] = None
+    tech_inventory: Optional[int] = None
+    base_income_wage: float = 15.0
+    base_consumable_prod_q: float = 0.0
+    fehr_schmidt_tier: Literal[
+        "SELFISH", "MODERATE", "STRONG", "HYPER_EGALITARIAN"
+    ] = "MODERATE"
+    alpha_disadvantageous: float = 0.50
+    beta_advantageous: float = 0.25
+    loss_aversion_lambda: float = 2.25
+    risk_tolerance_gamma: float = 0.88
+    identity_rigidity: float = 0.50
+    innate_opinion_anchor_s: float = 0.0
+    tms_specialty: str = "CONSUMABLE_NECESSITY"
     big_five: BigFiveTraits = Field(default_factory=BigFiveTraits)
-    cpt_params: ProspectTheoryParams = Field(default_factory=ProspectTheoryParams)
-    fehr_schmidt: FehrSchmidtParams = Field(default_factory=FehrSchmidtParams)
-    mood_pad: MoodPAD = Field(default_factory=MoodPAD)
-    maslow_needs: MaslowNeeds = Field(default_factory=MaslowNeeds)
-    fatigue_level: float = Field(default=0.1, ge=0.0, le=1.0)
-    hebbian_rumination_trace: Dict[str, float] = Field(default_factory=dict)
+
+    def get_consumable_inv(self) -> float:
+        if self.food_inventory is not None:
+            return float(self.food_inventory)
+        return float(self.consumable_necessity_inv)
+
+    def get_capital_inv(self) -> float:
+        if self.tech_inventory is not None:
+            return float(self.tech_inventory)
+        return float(self.productive_capital_inv)
 
 
-class ExternalAgentState(BaseModel):
-    """Objective Material & Legal State (Write-locked exclusively to M8: GameMaster)."""
-    agent_id: str
-    liquid_wealth_cash: float = Field(default=100.0, ge=0.0)
-    bank_deposit: float = Field(default=0.0, ge=0.0)
-    outstanding_debt: float = Field(default=0.0, ge=0.0)
-    credit_score: float = Field(default=700.0, ge=300.0, le=850.0)
-    inventory: Dict[str, int] = Field(default_factory=lambda: {"FOOD": 3, "TECH": 1})
-    base_wage: float = Field(default=12.0, ge=0.0)
-    social_status: float = Field(default=0.5, ge=0.0, le=1.0)
-    legal_status: LegalStatus = LegalStatus.LAW_ABIDING
-    spatial_node_id: str = "MARKET_SQUARE"
+AgentProfileConfig = AgentSeedConfig
 
 
-class RelationalEdge(BaseModel):
-    """Directed Dyadic Edge R(owner_id -> target_id)."""
-    owner_id: str
-    target_id: str
-    rel_type: RelationshipType = RelationshipType.ACQUAINTANCE
-    trust_tau: float = Field(default=0.1, ge=-1.0, le=1.0)
-    intimacy_alpha: float = Field(default=0.1, ge=-1.0, le=1.0)
-    credibility_kappa: float = Field(default=0.5, ge=0.0, le=1.0)
-    tie_strength_w: float = Field(default=0.2, ge=0.0, le=1.0)
-    total_interactions: int = 0
-    successful_trades: int = 0
-    betrayals_experienced: int = 0
+class SimulationConfig(FlexibleBaseModel):
+    experiment_id: str = "neuropolis-4d-hank-empirical-v2"
+    random_seed: int = 42
+    total_ticks: int = 8
+    footprint_profile: str = "PROTOTYPE_LAPTOP"
+    orthogonal_clamping: OrthogonalClampingSpec = Field(
+        default_factory=OrthogonalClampingSpec
+    )
+    model_spec: ModelSpec = Field(default_factory=ModelSpec)
+    steering_spec: SteeringLabConfig = Field(default_factory=SteeringLabConfig)
+    tms_spec: TMSSpec = Field(default_factory=TMSSpec)
+    hank_and_crisis_spec: HANKAndCrisisSpec = Field(
+        default_factory=HANKAndCrisisSpec
+    )
+    trust_and_market_spec: TrustAndMarketSpec = Field(
+        default_factory=TrustAndMarketSpec
+    )
+    contagion_and_opinion_spec: ContagionAndOpinionSpec = Field(
+        default_factory=ContagionAndOpinionSpec
+    )
+    fiscal_and_legal_spec: FiscalAndLegalSpec = Field(
+        default_factory=FiscalAndLegalSpec
+    )
+    agents: List[AgentSeedConfig] = Field(default_factory=list)
 
 
-class PeerPerceivedModel(BaseModel):
-    """Subjective Theory-of-Mind Model M(owner_id -> target_id)."""
-    owner_id: str
-    target_id: str
-    est_honesty: float = Field(default=0.55, ge=0.0, le=1.0)
-    est_greed: float = Field(default=0.45, ge=0.0, le=1.0)
-    est_fehr_alpha: float = Field(default=1.2, ge=0.0, le=5.0)
-    narrative_summary: str = "A local market participant with standard bargaining habits."
+MVPConfig = SimulationConfig
 
 
-class TMSPeerCompetenceRecord(BaseModel):
-    """Bayesian Beta-Bernoulli Transactive Memory Directory Entry."""
-    owner_id: str
-    target_id: str
-    domain: ExpertiseDomain
-    alpha_success: float = Field(default=2.0, gt=0.0)
-    beta_failure: float = Field(default=2.0, gt=0.0)
-    last_queried_tick: int = 0
+# ============================================================================
+# 3. MECHANISTIC CALIBRATION & STEERING PACKETS
+# ============================================================================
+
+class MechanisticCalibrationBundle(FlexibleBaseModel):
+    model_id: str = "Qwen/Qwen2.5-1.5B-Instruct"
+    num_layers: int = 28
+    num_heads: int = 12
+    head_dim: int = 128
+    hidden_size: int = 1536
+    u_trust: Optional[torch.Tensor] = None
+    u_threat: Optional[torch.Tensor] = None
+    p_affect: Optional[torch.Tensor] = None
+    sys1_heads: List[Tuple[int, int]] = Field(default_factory=list)
+    sys2_heads: List[Tuple[int, int]] = Field(default_factory=list)
+    sink_token_ids: List[int] = Field(default_factory=lambda: [0])
 
     @property
-    def expected_competence(self) -> float:
-        return self.alpha_success / (self.alpha_success + self.beta_failure)
+    def P_affect(self) -> Optional[torch.Tensor]:
+        return self.p_affect
 
 
-class EpisodicMemoryRecord(BaseModel):
-    """STM / LTM Scoped Episodic Memory Entry with Ebbinghaus-McGaugh Metadata."""
-    mem_id: str
-    owner_id: str
-    tick_created: int
-    encoding_salience: float = Field(default=1.0, ge=0.1)
-    rpe_magnitude: float = Field(default=0.0, ge=0.0)
-    rehearsal_count: int = 0
-    valence_at_encoding: float = 0.0
-    arousal_at_encoding: float = 0.2
-    involved_peers: List[str] = Field(default_factory=list)
-    narrative_text: str
-    is_consolidated_ltm: bool = False
+class BootstrapBundle(FlexibleBaseModel):
+    brain_handle: Any = None
+    calibration_bundle: Optional[MechanisticCalibrationBundle] = None
+    db_engine: Any = None
 
 
-# ==============================================================================
-# 5. COGNITIVE APPRAISAL, PROMPT COMPILATION & MECHANISTIC STEERING PACKETS
-# ==============================================================================
-class EndogenousStatePacket(BaseModel):
+class EndogenousStatePacket(FlexibleBaseModel):
     """
-    Exact continuous psychological scalars computed by M6 (Appraisal & ToM)
-    and consumed by M3 (AttentionSteeringLab) during the LLM forward pass.
+    Bridges the 4-Dimensional Socio-Economic Environment directly into
+    the White-Box Unified Cognitive Attention Master Equation (M3).
     """
-    agent_id: str
-    counterparty_id: Optional[str] = None
-    financial_stress: float = Field(default=0.1, ge=0.0, le=1.0)
-    peer_distrust_salience: float = Field(default=0.1, ge=0.0, le=1.0)
-    cynicism_gamma: float = Field(default=0.1, ge=0.0, le=1.0)
-    anxiety_eta: float = Field(default=0.1, ge=0.0, le=1.0)
-    dissonance_score_d: float = Field(default=0.0, ge=0.0, le=1.0)
-    arousal_a: float = Field(default=0.25, ge=0.0, le=1.0)
-    fatigue_f: float = Field(default=0.1, ge=0.0, le=1.0)
-    cognitive_load_l: float = Field(default=0.2, ge=0.0, le=1.0)
-    construal_closeness_map: Dict[str, float] = Field(default_factory=dict)
-    rpe_delta: float = 0.0
-    tom_acceptance_forecast: float = Field(default=0.5, ge=0.0, le=1.0)
-    route_to_fast_habit: bool = False
+    agent_id: str = ""
+    partner_id: Optional[str] = None
+    financial_stress: float = 0.0
+    survival_deficit: float = 0.0
+    scarcity_deficit_f: float = 0.0
+    present_bias_beta: float = 1.0
+    effective_discount_delta: float = 0.96
+    cognitive_load_l: float = 0.0
+    arousal_a: float = 0.3
+    fatigue_f: float = 0.1
+    valence_v: float = 0.0
+    dissonance_d: float = 0.0
+    peer_trust_tau: float = 0.0
+    effective_trust_01: float = 0.50
+    peer_intimacy_s: float = 0.0
+    empathy_eps: float = 0.5
+    hebbian_trace_h: List[float] = Field(default_factory=lambda: [0.0] * 7)
+    incoming_mirror_h: Optional[torch.Tensor] = None
+    span_map: Dict[str, Tuple[int, int]] = Field(default_factory=dict)
+
+    @property
+    def cognitive_load(self) -> float:
+        return self.cognitive_load_l
+
+    @property
+    def arousal(self) -> float:
+        return self.arousal_a
+
+    @property
+    def fatigue(self) -> float:
+        return self.fatigue_f
+
+    @property
+    def dissonance(self) -> float:
+        return self.dissonance_d
+
+    @property
+    def dissonance_score(self) -> float:
+        return self.dissonance_d
+
+    @property
+    def peer_trust(self) -> float:
+        return self.peer_trust_tau
+
+    @property
+    def peer_intimacy(self) -> float:
+        return self.peer_intimacy_s
+
+    @property
+    def construal_closeness(self) -> float:
+        return self.peer_intimacy_s
+
+    @property
+    def hebbian_trace(self) -> List[float]:
+        return self.hebbian_trace_h
+
+    @property
+    def incoming_mirror_vector(self) -> Optional[torch.Tensor]:
+        return self.incoming_mirror_h
 
 
-class TokenSpanMap(BaseModel):
-    """Maps named semantic prompt spans to exact token index intervals [start_idx, end_idx)."""
-    total_prompt_tokens: int
-    semantic_probe_Start_idx: int = 0
-    spans: Dict[str, List[Tuple[int, int]]] = Field(default_factory=dict)
-
-    def get_token_indices_for_span(self, span_prefix: str) -> List[int]:
-        indices: List[int] = []
-        for key, intervals in self.spans.items():
-            if key == span_prefix or key.startswith(span_prefix):
-                for start_idx, end_idx in intervals:
-                    indices.extend(range(max(0, start_idx), min(self.total_prompt_tokens, end_idx)))
-        return sorted(set(indices))
+SteeringContextPacket = EndogenousStatePacket
 
 
-class CompiledPromptPacket(BaseModel):
-    """Output of M7 PromptSpanCompiler ready for White-Box or Black-Box inference."""
-    agent_id: str
-    tick: int
-    raw_prompt_text: str
-    input_ids: List[int] = Field(default_factory=list)
-    token_span_map: TokenSpanMap
-    endogenous_state: EndogenousStatePacket
-    incoming_speaker_latent_vec: Optional[List[float]] = None
+class SteeredForwardTelemetry(FlexibleBaseModel):
+    updated_hebbian_trace: List[float] = Field(default_factory=lambda: [0.0] * 7)
+    span_attention_distribution: Dict[str, float] = Field(default_factory=dict)
+    yerkes_dodson_beta: float = 1.0
 
 
-# ==============================================================================
-# 6. STRUCTURED AGENT OUTPUT, TMS ROUTING & GAME MASTER VERDICT CONTRACTS
-# ==============================================================================
-class EconomicActionIntent(BaseModel):
-    """Proposed material action submitted to M8: GameMasterAndHardRuleLedger."""
-    action_category: ActionCategory = ActionCategory.BILATERAL_TRADE
-    target_peer_id: Optional[str] = None
-    item_id: str = "FOOD"
-    quantity: int = Field(default=1, ge=0)
-    total_price_cash: float = Field(default=15.0, ge=0.0)
-    is_buying: bool = True
-    public_contribution_cash: float = Field(default=0.0, ge=0.0)
+SteeringTelemetryPacket = SteeredForwardTelemetry
 
-    @field_validator("item_id")
+
+class CompiledPromptPacket(FlexibleBaseModel):
+    agent_id: str = ""
+    raw_prompt: str = ""
+    input_ids: Optional[torch.Tensor] = None
+    attention_mask: Optional[torch.Tensor] = None
+    span_map: Dict[str, Tuple[int, int]] = Field(default_factory=dict)
+    semantic_probe_offset: int = 0
+
+    @property
+    def raw_text(self) -> str:
+        return self.raw_prompt
+
+    @property
+    def prompt_text(self) -> str:
+        return self.raw_prompt
+
+    @property
+    def token_span_map(self) -> Dict[str, Tuple[int, int]]:
+        return self.span_map
+
+
+# ============================================================================
+# 4. AGENT TURN SCHEMAS, HANK PORTFOLIO & GAME MASTER VERDICTS
+# ============================================================================
+
+class EconomicActionIntent(FlexibleBaseModel):
+    action_type: str = "HOLD_OR_WORK"
+    counterparty_id: str = ""
+    item_id: str = "CONSUMABLE_NECESSITY"
+    quantity: float = 1.0
+    unit_price: float = 12.0
+    public_goods_contribution: float = 0.0
+    tax_evasion_fraction: float = 0.0
+    is_distress_fire_sale: bool = False
+
+    @field_validator("item_id", mode="before")
     @classmethod
-    def normalize_item(cls, v: str) -> str:
-        v_up = v.strip().upper()
-        return v_up if v_up in {"FOOD", "TECH", "NONE"} else "FOOD"
+    def _validate_item(cls, v: Any) -> str:
+        return normalize_item_id(str(v))
 
 
-class TMSQueryIntent(BaseModel):
-    """Triggered automatically when Semantic-Offset Entropy Probe exceeds tau_TMS."""
-    queried_expert_id: str
-    domain: ExpertiseDomain = ExpertiseDomain.FOOD_SUPPLY_CHAIN
-    question_text: str = "What is the fair clearing price and supply outlook right now?"
-    measured_entropy_bar: float = 0.0
+EconomicIntent = EconomicActionIntent
 
 
-class AgentTurnOutput(BaseModel):
-    """
-    Strict JSON Schema emitted by the Agent LLM (or Habit Automaton / TMS Router).
-    Note: `internal_thought` is always placed FIRST so the Semantic-Offset Entropy
-    Probe evaluates unconstrained reasoning tokens right after `{"internal_thought": "`.
-    """
+class SocialMessageIntent(FlexibleBaseModel):
+    recipient_id: str = ""
+    channel: str = "DIRECT"
+    content: str = ""
+
+
+class RelationalDeltaIntent(FlexibleBaseModel):
+    target_id: str = ""
+    trust_delta: float = 0.0
+    affinity_delta: float = 0.0
+    perceived_honesty_delta: float = 0.0
+
+
+class AgentTurnOutput(FlexibleBaseModel):
     internal_thought: str = Field(
-        default="Evaluating my budget constraints and my trust in the counterparty."
+        default="Evaluating market conditions and survival portfolio.",
+        description="Private economic, fairness, and strategic reasoning.",
     )
-    epistemic_confidence: float = Field(default=0.8, ge=0.0, le=1.0)
-    consent_decision: ConsentDecision = ConsentDecision.INITIATE
-    verbal_message: str = Field(default="Let us make a mutually beneficial trade.")
-    perceived_honesty_delta: float = Field(default=0.0, ge=-1.0, le=1.0)
-    economic_intent: EconomicActionIntent = Field(default_factory=EconomicActionIntent)
-    tms_query: Optional[TMSQueryIntent] = None
+    consent_decision: str = "INITIATE"
+    predicted_peer_reaction: str = Field(
+        default="Expect peer to evaluate offer against fair market reference."
+    )
+    action_category: str = "COMMERCIAL_TRADE"
+    economic_intent: EconomicActionIntent = Field(
+        default_factory=EconomicActionIntent
+    )
+    verbal_message: str = Field(
+        default="Let us reach a mutually beneficial trade."
+    )
+    trust_delta_appraisal: float = Field(default=0.0, ge=-0.5, le=0.5)
+    expressed_opinion_z: Optional[float] = Field(default=None, ge=-1.0, le=1.0)
+    epistemic_confidence: float = Field(default=0.80, ge=0.0, le=1.0)
 
 
-class TMSRoutingDecision(BaseModel):
-    halted_generation: bool = False
-    normalized_entropy: float = 0.0
+class RawGenerationResult(FlexibleBaseModel):
+    parsed_output: AgentTurnOutput = Field(default_factory=AgentTurnOutput)
+    raw_text: str = ""
+    tms_halt_triggered: bool = False
+    mean_shannon_entropy: float = 0.25
+    emitted_mirror_vector: Optional[torch.Tensor] = None
+    attention_telemetry: Dict[str, float] = Field(default_factory=dict)
+    updated_hebbian_trace: List[float] = Field(default_factory=lambda: [0.0] * 7)
+
+
+class TMSRoutingDecision(FlexibleBaseModel):
+    halt_generation: bool = False
+    halt_and_route: bool = False
+    mean_entropy: float = 0.0
     selected_expert_id: Optional[str] = None
-    domain: ExpertiseDomain = ExpertiseDomain.FOOD_SUPPLY_CHAIN
-    expert_advice_injected: Optional[str] = None
+    query_topic_id: str = "CONSUMABLE_NECESSITY"
+    expected_competence: float = 0.0
 
 
-class GameMasterVerdict(BaseModel):
-    """Immutable Settlement Receipt returned by M8: AccountingAndLawEngine."""
-    tx_id: str
-    tick: int
-    status: VerdictStatus
-    initiator_id: str
-    responder_id: Optional[str] = None
-    cash_delta_initiator: float = 0.0
-    cash_delta_responder: float = 0.0
-    tax_collected: float = 0.0
-    item_id: str = "NONE"
-    quantity_transferred: int = 0
-    diagnostic_feedback: str = "Transaction settled atomically."
-    global_money_conservation_error: float = 0.0
+class TMSDirectoryRecord(FlexibleBaseModel):
+    owner_id: str = ""
+    peer_id: str = ""
+    domain_id: str = "CONSUMABLE_NECESSITY"
+    alpha_prior: float = 2.0
+    beta_prior: float = 2.0
+    trust_score: float = 0.5
+    comm_cost: float = 0.05
 
 
-class SteeringTelemetryPacket(BaseModel):
-    """Captures exact mechanistic attention mass shifts for observability & pre-flight tests."""
-    agent_id: str
-    tick: int
-    steering_mode: SteeringMode
-    attn_mass_drives_finance: float = 0.0
-    attn_mass_peer_memory: float = 0.0
-    attn_mass_incoming_msg: float = 0.0
-    attn_mass_sink_bos: float = 0.0
-    value_projection_norm_ratio: float = 1.0
-    probed_shannon_entropy: float = 0.0
-    tms_triggered: bool = False
+class TMSUpdateDelta(FlexibleBaseModel):
+    owner_id: str = ""
+    peer_id: str = ""
+    domain_id: str = "CONSUMABLE_NECESSITY"
+    new_alpha: float = 2.0
+    new_beta: float = 2.0
 
 
-class MacroEconomyState(BaseModel):
-    """Godley-Lavoie Stock-Flow Consistent Macroeconomic & Institutional Snapshot."""
+class LedgerTransactionReceipt(FlexibleBaseModel):
+    tx_id: str = ""
     tick: int = 0
-    central_bank_base_money_m0: float = 1500.0
-    commercial_bank_reserves: float = 300.0
-    public_treasury_cash: float = 200.0
-    firm_sector_cash: float = 400.0
-    market_clearing_price_food: float = 15.0
-    market_clearing_price_tech: float = 35.0
-    inflation_rate: float = 0.0
-    societal_trust_index: float = 0.1
-    wealth_gini: float = 0.0
-    cumulative_trade_volume: float = 0.0
-    cumulative_tms_queries: int = 0
+    initiator_id: str = ""
+    responder_id: str = ""
+    buyer_id: str = ""
+    seller_id: str = ""
+    action_type: str = "BUY"
+    item_id: str = "CONSUMABLE_NECESSITY"
+    quantity: float = 1.0
+    unit_price: float = 12.0
+    gross_amount: float = 12.0
+    tax_withheld: float = 0.60
+    kmv_adjustment_cost: float = 0.0
+    seller_net_received: float = 11.40
+    kkt_gouging_index: float = 0.0
+    is_fire_sale: bool = False
+    global_money_supply_error: float = 0.0
 
 
-# ==============================================================================
-# 7. MODULE PROTOCOLS (STRUCTURAL INTERFACES)
-# ==============================================================================
-@runtime_checkable
-class InferenceBrainProtocol(Protocol):
-    def generate_turn(
-        self,
-        prompt_packet: CompiledPromptPacket,
-        domain_hint: ExpertiseDomain,
-    ) -> Tuple[AgentTurnOutput, SteeringTelemetryPacket, Optional[List[float]]]:
-        ...
+class GameMasterVerdict(FlexibleBaseModel):
+    status: str = "APPROVED"
+    error_code: Optional[str] = None
+    diagnostic_message: str = ""
+    ledger_receipt: Optional[LedgerTransactionReceipt] = None
 
 
-@runtime_checkable
-class GameMasterProtocol(Protocol):
-    def pre_validate_and_escrow(
-        self,
-        tick: int,
-        initiator_id: str,
-        turn_output: AgentTurnOutput,
-    ) -> GameMasterVerdict:
-        ...
+# ============================================================================
+# 5. MACRO REGIME STATE & 4-DIMENSIONAL TELEMETRY PACKETS
+# ============================================================================
 
-    def settle_dyadic_transaction(
-        self,
-        tick: int,
-        escrow_verdict: GameMasterVerdict,
-         initiator_output: AgentTurnOutput,
-        responder_id: str,
-        responder_output: AgentTurnOutput,
-    ) -> GameMasterVerdict:
-        ...
+class MacroRegimeState(FlexibleBaseModel):
+    tick: int = 0
+    active_crisis: CrisisScenarioType = "NONE"
+    crisis_intensity_s: float = 0.0
+    consumable_tfp_ac: float = 1.0
+    reference_consumable_price_pc: float = 12.00
+    reference_capital_price_qk: float = 60.00
+    capital_yield_rk: float = 0.075
+    liquid_rate_rb: float = 0.002
+    borrowing_wedge_kappa: float = 0.0064
+    borrowing_limit_scale: float = 1.0
+    kmv_chi_1_current: float = 0.526
+    generalized_social_trust: float = 0.58
+    institutional_trust: float = 0.65
+    public_treasury_cash: float = 100.0
+    firm_sector_cash: float = 2000.0
 
-    def verify_global_money_conservation(self) -> Tuple[bool, float]:
-        ...
+
+MacroTickState = MacroRegimeState
+
+
+class FourDimTickTelemetry(FlexibleBaseModel):
+    tick: int
+    active_crisis: str
+    # Dimension 1: Scarcity & Two-Asset HANK
+    wealth_gini: float
+    disposable_income_gini: float
+    htm_total_share: float
+    poor_htm_share: float
+    wealthy_htm_share: float
+    realized_mpc: float
+    distress_sale_ratio_dsr: float
+    scarcity_bandwidth_cohen_d: float
+    avg_consumable_price: float
+    avg_capital_price: float
+    mean_scarcity_f: float
+    # Dimension 2: Trust & Market Fragmentation
+    generalized_trust_tsoc: float
+    mean_relational_trust_tau: float
+    institutional_trust_tinst: float
+    mean_effective_trust_teff: float
+    trade_network_modularity_q: float
+    price_dispersion_ratio_r: float
+    unfairness_rejection_rate: float
+    cumulative_trade_volume: float
+    # Dimension 3: Contagion, Opinions & TMS
+    affective_sync_index_asi: float
+    opinion_bimodality_bc: float
+    complex_contagion_cascade_share: float
+    cumulative_tms_queries: int
+    tms_routing_accuracy: float
+    # Dimension 4: Fiscal, Commons, Ostrom Sanctions & SFC Conservation
+    public_goods_provision_rate_pgpr: float
+    free_rider_share_fr: float
+    public_treasury_balance: float
+    total_sanction_points_p: int
+    saez_top_marginal_rate: float
+    godley_lavoie_error: float
+
+
+TickMacroTelemetry = FourDimTickTelemetry
+
+# ============================================================================
+# 6. LEGACY SPEC ALIASES & WARNING-FREE MODULE FALLBACK
+# ============================================================================
+
+EntropyTMSSpec = TMSSpec
+
+_DYNAMIC_SYMBOL_CACHE: Dict[str, Any] = {}
+
+
+def __getattr__(name: str) -> Any:
+    if name.startswith("__"):
+        raise AttributeError(name)
+    if name in _DYNAMIC_SYMBOL_CACHE:
+        return _DYNAMIC_SYMBOL_CACHE[name]
+    if name.isupper():
+        _DYNAMIC_SYMBOL_CACHE[name] = name
+        return name
+    dyn_cls = type(
+        name,
+        (FlexibleBaseModel,),
+        {"__module__": __name__},
+    )
+    _DYNAMIC_SYMBOL_CACHE[name] = dyn_cls
+    return dyn_cls

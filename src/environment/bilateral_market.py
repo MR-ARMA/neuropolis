@@ -1,262 +1,332 @@
-"""
-src/environment/bilateral_market.py
-MODULE 9 (M9): Environment Institutions:
-  1. FULLY IMPLEMENTED FOR MVP:
-     - `BilateralTrustMarket`: Relationship-modulated reservation prices,
-       Multinomial Logit (MNL) partner selection over trust/complementarity,
-       and Slovic Asymmetric Trust Updating (eta_- = 2.5 * eta_+).
-  2. PRESERVED POST-MVP ARCHITECTURAL STUBS:
-     - `CentralAndCommercialBankModule` (Diamond-Dybvig fractional reserves & bank runs).
-     - `PublicGoodsAndLawCommonsModule` (Ostrom public goods multiplier & costly punishment).
-"""
-
 from __future__ import annotations
 
 import math
-import random
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from src.core.contracts import (
-    AgentTurnOutput,
-    ConsentDecision,
-    EconomyInstitutionsSpec,
-    ExternalAgentState,
-    GameMasterVerdict,
-    InternalAgentState,
-    MemoryCognitionSpec,
-    RelationalEdge,
-    RelationshipType,
-    VerdictStatus,
+    CanonicalItemType,
+    SimulationConfig,
+    normalize_item_id,
 )
-from src.memory.scoped_memory import ScopedMemoryEngine
+from src.environment.game_master import AccountingAndLawEngine
 
 
-class BilateralTrustMarket:
+class BilateralMarketEngine:
     """
-    Governs partner matching, relationship-modulated reservation prices,
-    and post-interaction Slovic asymmetric trust & ToM updating.
+    Implements Dimension 1 & 2 Market Physics:
+    1. Stone-Geary Marginal Survival Valuation for CONSUMABLE_NECESSITY.
+    2. Carvalho et al. Present-Biased Valuation & Distress Fire-Sale Liquidation
+       for PRODUCTIVE_CAPITAL_ASSET when Scarcity F_{i,t} > 0.50.
+    3. Kahneman, Knetsch, & Thaler (1986) Dual-Entitlement Price Gouging Index Phi^{KKT}_{ij,t}.
+    4. Effective-Trust (T^{eff}_{ij,t}) & Economic Surplus Partner Matching (Vizing Disjoint Pairs).
     """
 
     def __init__(
-        self,
-        memory_engine: ScopedMemoryEngine,
-        econ_spec: EconomyInstitutionsSpec,
-        cog_spec: MemoryCognitionSpec,
-        rng: random.Random,
+        self, config: SimulationConfig, game_master: AccountingAndLawEngine
     ) -> None:
-        self.memory_engine = memory_engine
-        self.econ_spec = econ_spec
-        self.cog_spec = cog_spec
-        self.rng = rng
+        self.config = config
+        self.omega = config.orthogonal_clamping
+        self.hank_spec = config.hank_and_crisis_spec
+        self.trust_spec = config.trust_and_market_spec
+        self.game_master = game_master
 
-    def compute_reservation_price(
+    def compute_kkt_gouging_index(
         self,
+        buyer_scarcity_f: float,
+        offered_unit_price: float,
         item_id: str,
-        edge: RelationalEdge,
-        is_seller: bool,
+        seller_cost_shift: float = 0.0,
     ) -> float:
         """
-        Relationship-Modulated Reservation Price:
-          - Friends (intimacy_alpha > 0, trust_tau > 0) grant a relational discount.
-          - Distrusted peers (trust_tau < 0) incur a default/lemons risk premium.
+        Kahneman, Knetsch, & Thaler (1986) Dual-Entitlement Price Gouging Index:
+        Phi^{KKT}_{ij,t} = (1 + kappa_desp * F_{i,t}) * max(0, (p_{ij,t} - (p_{ref,t} + Delta_c)) / p_{ref,t})
+        Clamped to 0.0 when Omega_D2 == False.
         """
-        base = (
-            self.econ_spec.reference_food_price
-            if item_id == "FOOD"
-            else self.econ_spec.reference_tech_price
+        if not self.omega.omega_d2_trust_and_parochialism:
+            return 0.0
+
+        norm_item = normalize_item_id(item_id)
+        p_ref = (
+            self.game_master.macro_state.reference_consumable_price_pc
+            if norm_item == "CONSUMABLE_NECESSITY"
+            else self.game_master.macro_state.reference_capital_price_qk
         )
-        trust_term = edge.trust_tau
-        affinity_term = edge.intimacy_alpha
+        fair_entitlement_price = p_ref + seller_cost_shift
+        excess_markup = max(
+            0.0, (offered_unit_price - fair_entitlement_price) / max(p_ref, 1e-6)
+        )
+        desperation_mult = (
+            1.0 + self.trust_spec.kkt_desperation_kappa * buyer_scarcity_f
+            if self.omega.omega_d1_scarcity_and_hank
+            else 1.0
+        )
+        return round(float(desperation_mult * excess_markup), 4)
 
-        if is_seller:
-            # Seller demands higher price from distrusted buyer, offers small discount to friends
-            multiplier = 1.0 - 0.12 * affinity_term - 0.20 * min(0.0, trust_term)
-        else:
-            # Buyer is willing to pay less when distrusting seller's quality
-            multiplier = 1.0 + 0.10 * affinity_term + 0.25 * min(0.0, trust_term)
-
-        return round(max(2.0, base * multiplier), 2)
-
-    def select_interaction_pairs_mnl(
+    def compute_reservation_prices(
         self,
-        agent_ids: List[str],
-    ) -> List[Tuple[str, str]]:
+        seller_id: str,
+        buyer_id: str,
+        item_id: str,
+        effective_trust_sb: float,
+        effective_trust_bs: float,
+        intimacy_sb: float = 0.0,
+    ) -> Dict[str, float]:
         """
-        Multinomial Logit (MNL) Partner Selection based on:
-          U_attract(i -> j) = 1.6 * tau_ij + 0.9 * alpha_ij + 1.2 * Surplus_complementarity(i, j)
-        Produces a list of directed (initiator_id, responder_id) requests for the tick.
+        Computes Seller Minimum Reservation Price P^{seller}_{min} and
+        Buyer Maximum Willingness to Pay P^{buyer}_{max} for either
+        CONSUMABLE_NECESSITY or PRODUCTIVE_CAPITAL_ASSET.
         """
-        external_map = self.memory_engine.get_all_external_states()
-        requests: List[Tuple[str, str]] = []
+        norm_item = normalize_item_id(item_id)
+        seller_ledger = self.game_master.get_agent_ledger(seller_id)
+        buyer_ledger = self.game_master.get_agent_ledger(buyer_id)
 
-        shuffled = list(agent_ids)
-        self.rng.shuffle(shuffled)
+        f_seller, _, delta_seller = (
+            self.game_master.compute_agent_scarcity_and_present_bias(seller_id)
+        )
+        f_buyer, _, delta_buyer = (
+            self.game_master.compute_agent_scarcity_and_present_bias(buyer_id)
+        )
 
-        for aid in shuffled:
-            scoped = self.memory_engine.get_scoped_view(aid)
-            edges = scoped.get_all_outgoing_edges()
-            my_ext = external_map[aid]
+        # Convert Effective Trust in [0, 1] to distrust penalty in [0, 1]
+        if self.omega.omega_d2_trust_and_parochialism:
+            distrust_sb = max(0.0, 0.55 - effective_trust_sb) * 1.6
+            distrust_bs = max(0.0, 0.55 - effective_trust_bs) * 1.6
+            friend_discount = max(0.0, intimacy_sb) * 0.35
+        else:
+            distrust_sb = 0.0
+            distrust_bs = 0.0
+            friend_discount = 0.0
 
-            candidates: List[str] = [pid for pid in agent_ids if pid != aid]
-            if not candidates:
-                continue
+        mu_margin = self.trust_spec.seller_base_margin_mu
+        phi_risk = self.trust_spec.distrust_risk_premium_phi
 
-            logits: List[float] = []
-            for pid in candidates:
-                edge = edges.get(pid, RelationalEdge(owner_id=aid, target_id=pid))
-                peer_ext = external_map[pid]
-
-                # Economic resource complementarity: high if one has FOOD surplus and the other has TECH/cash
-                my_food = my_ext.inventory.get("FOOD", 0)
-                peer_food = peer_ext.inventory.get("FOOD", 0)
-                complementarity = 0.45 if abs(my_food - peer_food) >= 1 else 0.10
-
-                u_ij = (
-                    1.6 * edge.trust_tau
-                    + 0.9 * edge.intimacy_alpha
-                    + 1.2 * complementarity
+        if norm_item == "CONSUMABLE_NECESSITY":
+            p_ref = self.game_master.macro_state.reference_consumable_price_pc
+            base_cost = 0.78 * p_ref
+            p_min_seller = base_cost * (
+                1.0 + mu_margin * (1.0 - friend_discount) + phi_risk * distrust_sb
+            )
+            # Stone-Geary urgency boosts buyer willingness to pay when c_{i,t} <= c_min
+            buyer_c = float(buyer_ledger["inventory"]["CONSUMABLE_NECESSITY"])
+            urgency_boost = 1.0 + 0.45 * f_buyer + (0.20 if buyer_c <= 1.0 else 0.0)
+            base_val = p_ref * 1.15 * urgency_boost
+            p_max_buyer = base_val * max(0.65, 1.0 - 0.50 * phi_risk * distrust_bs)
+            is_fire_sale = False
+        else:
+            # PRODUCTIVE_CAPITAL_ASSET valuation via discounted stream of yields r_{K,t}
+            q_ref = self.game_master.macro_state.reference_capital_price_qk
+            # If Seller is in high scarcity F_{seller} > 0.45, present bias tilde{delta}_seller
+            # triggers a Distress Fire-Sale discount to raise immediate survival cash!
+            if self.omega.omega_d1_scarcity_and_hank and f_seller > 0.45:
+                fire_sale_factor = max(0.52, delta_seller * (1.0 - 0.38 * f_seller))
+                p_min_seller = q_ref * fire_sale_factor * (1.0 + 0.25 * distrust_sb)
+                is_fire_sale = True
+            else:
+                p_min_seller = q_ref * (
+                    0.92 + 0.50 * mu_margin * (1.0 - friend_discount) + 0.50 * phi_risk * distrust_sb
                 )
-                logits.append(u_ij)
+                is_fire_sale = False
 
-            max_l = max(logits)
-            exps = [math.exp(l - max_l) for l in logits]
-            total_exp = sum(exps)
-            probs = [e / total_exp for e in exps]
+            # Liquid-wealthy buyer valuation of productive capital
+            buyer_cash = float(buyer_ledger["liquid_wealth_cash"])
+            liquidity_premium = 1.12 if buyer_cash >= 110.0 else 0.75
+            p_max_buyer = (
+                q_ref
+                * liquidity_premium
+                * delta_buyer
+                * max(0.65, 1.0 - 0.50 * phi_risk * distrust_bs)
+            )
 
-            chosen_peer = self.rng.choices(candidates, weights=probs, k=1)[0]
-            requests.append((aid, chosen_peer))
+        mid_clearing_price = round(0.50 * (p_min_seller + p_max_buyer), 2)
+        return {
+            "item_id": norm_item,
+            "p_min_seller": round(float(p_min_seller), 2),
+            "p_max_buyer": round(float(p_max_buyer), 2),
+            "zopa_width": round(float(p_max_buyer - p_min_seller), 2),
+            "suggested_clearing_price": mid_clearing_price,
+            "is_fire_sale": float(is_fire_sale),
+        }
 
-        return requests
+    def recommend_dyadic_trade_direction(
+        self, initiator_id: str, partner_id: str, effective_trust_ij: float
+    ) -> Dict[str, Any]:
+        """
+        Determines the highest-surplus trade opportunity between Initiator and Partner:
+        - Priority 1: If Initiator has high Scarcity (F_{i,t} > 0.45) and owns PRODUCTIVE_CAPITAL_ASSET
+          while Partner has abundant cash, recommend a Distress Fire-Sale of PRODUCTIVE_CAPITAL_ASSET!
+        - Priority 2: If Initiator needs CONSUMABLE_NECESSITY (c <= 2) and Partner has surplus (c >= 3),
+          Initiator BUYs CONSUMABLE_NECESSITY.
+        - Priority 3: If Initiator has surplus CONSUMABLE_NECESSITY (c >= 3) and Partner needs it,
+          Initiator SELLs CONSUMABLE_NECESSITY.
+        """
+        init_ledger = self.game_master.get_agent_ledger(initiator_id)
+        part_ledger = self.game_master.get_agent_ledger(partner_id)
 
-    def update_dyadic_trust_and_memories(
+        f_init, _, _ = self.game_master.compute_agent_scarcity_and_present_bias(
+            initiator_id
+        )
+        f_part, _, _ = self.game_master.compute_agent_scarcity_and_present_bias(
+            partner_id
+        )
+
+        init_c = float(init_ledger["inventory"]["CONSUMABLE_NECESSITY"])
+        init_k = float(init_ledger["inventory"]["PRODUCTIVE_CAPITAL_ASSET"])
+        init_cash = float(init_ledger["liquid_wealth_cash"])
+
+        part_c = float(part_ledger["inventory"]["CONSUMABLE_NECESSITY"])
+        part_k = float(part_ledger["inventory"]["PRODUCTIVE_CAPITAL_ASSET"])
+        part_cash = float(part_ledger["liquid_wealth_cash"])
+
+        # Case 1: Initiator Distress Fire-Sale of PRODUCTIVE_CAPITAL_ASSET
+        if (
+            self.omega.omega_d1_scarcity_and_hank
+            and f_init > 0.42
+            and init_k >= 1.0
+            and part_cash >= 65.0
+        ):
+            bounds = self.compute_reservation_prices(
+                seller_id=initiator_id,
+                buyer_id=partner_id,
+                item_id="PRODUCTIVE_CAPITAL_ASSET",
+                effective_trust_sb=effective_trust_ij,
+                effective_trust_bs=effective_trust_ij,
+            )
+            return {
+                "recommended_action": "SELL",
+                "item_id": "PRODUCTIVE_CAPITAL_ASSET",
+                "recommended_qty": 1.0,
+                "is_distress_fire_sale": True,
+                **bounds,
+            }
+
+        # Case 2: Partner Distress Fire-Sale of PRODUCTIVE_CAPITAL_ASSET (Initiator BUYs)
+        if (
+            self.omega.omega_d1_scarcity_and_hank
+            and f_part > 0.42
+            and part_k >= 1.0
+            and init_cash >= 65.0
+        ):
+            bounds = self.compute_reservation_prices(
+                seller_id=partner_id,
+                buyer_id=initiator_id,
+                item_id="PRODUCTIVE_CAPITAL_ASSET",
+                effective_trust_sb=effective_trust_ij,
+                effective_trust_bs=effective_trust_ij,
+            )
+            return {
+                "recommended_action": "BUY",
+                "item_id": "PRODUCTIVE_CAPITAL_ASSET",
+                "recommended_qty": 1.0,
+                "is_distress_fire_sale": True,
+                **bounds,
+            }
+
+        # Case 3: Initiator BUYs CONSUMABLE_NECESSITY from surplus Partner
+        if init_c <= 2.5 and part_c >= 2.0:
+            bounds = self.compute_reservation_prices(
+                seller_id=partner_id,
+                buyer_id=initiator_id,
+                item_id="CONSUMABLE_NECESSITY",
+                effective_trust_sb=effective_trust_ij,
+                effective_trust_bs=effective_trust_ij,
+            )
+            return {
+                "recommended_action": "BUY",
+                "item_id": "CONSUMABLE_NECESSITY",
+                "recommended_qty": 1.0,
+                "is_distress_fire_sale": False,
+                **bounds,
+            }
+
+        # Case 4: Initiator SELLs surplus CONSUMABLE_NECESSITY to Partner
+        if init_c >= 2.0:
+            bounds = self.compute_reservation_prices(
+                seller_id=initiator_id,
+                buyer_id=partner_id,
+                item_id="CONSUMABLE_NECESSITY",
+                effective_trust_sb=effective_trust_ij,
+                effective_trust_bs=effective_trust_ij,
+            )
+            return {
+                "recommended_action": "SELL",
+                "item_id": "CONSUMABLE_NECESSITY",
+                "recommended_qty": 1.0,
+                "is_distress_fire_sale": False,
+                **bounds,
+            }
+
+        # Default fallback
+        bounds = self.compute_reservation_prices(
+            seller_id=partner_id,
+            buyer_id=initiator_id,
+            item_id="CONSUMABLE_NECESSITY",
+            effective_trust_sb=effective_trust_ij,
+            effective_trust_bs=effective_trust_ij,
+        )
+        return {
+            "recommended_action": "BUY",
+            "item_id": "CONSUMABLE_NECESSITY",
+            "recommended_qty": 1.0,
+            "is_distress_fire_sale": False,
+            **bounds,
+        }
+
+    def match_conflict_free_pairs(
         self,
         tick: int,
-        initiator_id: str,
-        responder_id: str,
-        initiator_output: AgentTurnOutput,
-        responder_output: AgentTurnOutput,
-        verdict: GameMasterVerdict,
-    ) -> None:
+        agent_ids: List[str],
+        effective_trust_matrix: Dict[Tuple[str, str], float],
+    ) -> List[Tuple[str, str]]:
         """
-        Applies Slovic's Asymmetric Trust Principle:
-          - Cooperative settlement: tau_ij(t+1) = tau_ij(t) + eta_+ * (1 - tau_ij(t)) * coop_signal
-          - Betrayal / unfair rejection: tau_ij(t+1) = tau_ij(t) - eta_- * (1 + tau_ij(t)) * betrayal_signal
-            where eta_- = 2.5 * eta_+ (trust is slow to build and rapid to collapse).
-        Also writes scoped episodic memories into both agents' SQLite partitions.
+        Matches the N agents into N/2 conflict-free disjoint pairs (Initiator, Responder)
+        maximizing P(i selects j) ~ exp(beta_trust * T^{eff}_{ij,t} + beta_surplus * Surplus_{ij,t}).
         """
-        eta_pos = self.cog_spec.slovic_pos_trust_rate
-        eta_neg = self.cog_spec.slovic_neg_trust_rate
+        ledgers = {
+            aid: self.game_master.get_agent_ledger(aid) for aid in agent_ids
+        }
+        scarcities = {
+            aid: self.game_master.compute_agent_scarcity_and_present_bias(aid)[0]
+            for aid in agent_ids
+        }
 
-        approved = verdict.status == VerdictStatus.APPROVED
-        fair_ref = (
-            self.econ_spec.reference_food_price
-            if verdict.item_id == "FOOD"
-            else self.econ_spec.reference_tech_price
-        ) * max(1, verdict.quantity_transferred)
+        candidate_edges: List[Tuple[float, str, str]] = []
+        for i_idx, aid_i in enumerate(agent_ids):
+            for j_idx, aid_j in enumerate(agent_ids):
+                if i_idx == j_idx:
+                    continue
+                t_eff = effective_trust_matrix.get((aid_i, aid_j), 0.50)
+                if not self.omega.omega_d2_trust_and_parochialism:
+                    t_eff = 0.50
 
-        offered_price = initiator_output.economic_intent.total_price_cash
-        price_gouge_ratio = (offered_price - fair_ref) / max(1.0, fair_ref)
+                c_i = float(ledgers[aid_i]["inventory"]["CONSUMABLE_NECESSITY"])
+                c_j = float(ledgers[aid_j]["inventory"]["CONSUMABLE_NECESSITY"])
+                k_i = float(ledgers[aid_i]["inventory"]["PRODUCTIVE_CAPITAL_ASSET"])
+                cash_j = float(ledgers[aid_j]["liquid_wealth_cash"])
 
-        for owner_id, peer_id, my_out, peer_out in [
-            (initiator_id, responder_id, initiator_output, responder_output),
-            (responder_id, initiator_id, responder_output, initiator_output),
-        ]:
-            scoped = self.memory_engine.get_scoped_view(owner_id)
-            ist = scoped.get_internal_state()
-            edge = scoped.get_relational_edge(peer_id)
-            pmodel = scoped.get_peer_perceived_model(peer_id)
-
-            edge.total_interactions += 1
-
-            if approved:
-                edge.successful_trades += 1
-                coop_signal = max(0.25, min(1.0, 0.65 + 0.35 * my_out.perceived_honesty_delta))
-                edge.trust_tau = min(
-                    1.0,
-                    round(edge.trust_tau + eta_pos * (1.0 - edge.trust_tau) * coop_signal, 4),
+                # Economic complementarity surplus
+                food_comp = 1.0 if (c_i <= 2.0 and c_j >= 2.5) or (c_i >= 2.5 and c_j <= 2.0) else 0.1
+                fire_sale_comp = (
+                    1.2
+                    if (scarcities[aid_i] > 0.42 and k_i >= 1.0 and cash_j >= 70.0)
+                    else 0.0
                 )
-                edge.intimacy_alpha = min(1.0, round(edge.intimacy_alpha + 0.05, 4))
-                edge.tie_strength_w = min(1.0, round(edge.tie_strength_w + 0.06, 4))
-                if edge.trust_tau > 0.55:
-                    edge.rel_type = RelationshipType.CLOSE_FRIEND
-                rpe = 0.35
-                ist.mood_pad.valence = min(1.0, round(ist.mood_pad.valence + 0.12, 4))
-            else:
-                # Determine whether rejection or exploitative offer constitutes betrayal
-                betrayal_signal = max(
-                    0.15,
-                    min(1.0, abs(min(0.0, my_out.perceived_honesty_delta)) + max(0.0, price_gouge_ratio)),
+                surplus_score = food_comp + fire_sale_comp
+                # Deterministic tie-breaking rotation across ticks
+                rot_bonus = 0.15 * math.sin(0.9 * tick + 1.7 * i_idx - 1.1 * j_idx)
+
+                total_score = (
+                    self.trust_spec.partner_match_trust_beta * t_eff
+                    + self.trust_spec.partner_match_surplus_beta * surplus_score
+                    + rot_bonus
                 )
-                if peer_out.consent_decision == ConsentDecision.REJECT or price_gouge_ratio > 0.35:
-                    edge.betrayals_experienced += 1
-                    edge.trust_tau = max(
-                        -1.0,
-                        round(edge.trust_tau - eta_neg * (1.0 + edge.trust_tau) * betrayal_signal, 4),
-                    )
-                    if edge.trust_tau < -0.25:
-                        edge.rel_type = RelationshipType.RIVAL
-                rpe = 0.55 if betrayal_signal > 0.3 else 0.20
-                ist.mood_pad.valence = max(-1.0, round(ist.mood_pad.valence - 0.15, 4))
-                ist.mood_pad.arousal = min(1.0, round(ist.mood_pad.arousal + 0.12, 4))
+                candidate_edges.append((total_score, aid_i, aid_j))
 
-            # Update subjective ToM model of counterparty
-            pmodel.est_honesty = max(
-                0.0, min(1.0, round(0.8 * pmodel.est_honesty + 0.2 * (0.5 + 0.5 * edge.trust_tau), 4))
-            )
-            pmodel.narrative_summary = (
-                f"At Tick {tick}, {peer_id} said: '{peer_out.verbal_message[:80]}' "
-                f"-> Outcome: {verdict.status.value} (Trust={edge.trust_tau:+.2f})."
-            )
-
-            scoped.save_relational_edge(edge)
-            scoped.save_peer_perceived_model(pmodel)
-            scoped.save_internal_state(ist)
-
-            narrative = (
-                f"Tick {tick} interaction with {peer_id}: Proposal was "
-                f"{initiator_output.economic_intent.quantity} {initiator_output.economic_intent.item_id} "
-                f"at ${offered_price:.2f}. {peer_id} said '{peer_out.verbal_message}'. "
-                f"Verdict: {verdict.diagnostic_feedback}"
-            )
-            scoped.record_episodic_memory(
-                tick=tick,
-                narrative_text=narrative,
-                involved_peers=[peer_id],
-                arousal=ist.mood_pad.arousal,
-                valence=ist.mood_pad.valence,
-                rpe_magnitude=rpe,
-            )
-
-
-# ==============================================================================
-# POST-MVP INSTITUTIONAL STUBS (Preserved in Architecture with Exact Equations)
-# ==============================================================================
-class CentralAndCommercialBankModule:
-    """
-    # TODO(post-mvp): [Institutions - Diamond-Dybvig Fractional Reserve & Minsky Credit Engine]
-    Implements:
-      1. Risk-adjusted loan interest rate:
-         r_loan(t, CS_i) = r_base(t) + delta_spread * exp( - (CS_i - 300) / 250 )
-      2. Fractional reserve liquidity tracking:
-         R_bank(t) = rho_reserve * sum_i B_i(t) - PanicWithdrawals(t)
-         Triggering `ILLIQUID_FREEZE` when R_bank(t) <= 0.
-    """
-
-    def step_monetary_cycle(self, tick: int) -> None:
-        # TODO(post-mvp): Accrue deposit/loan interest and evaluate Diamond-Dybvig run threshold.
-        pass
-
-
-class PublicGoodsAndLawCommonsModule:
-    """
-    # TODO(post-mvp): [Institutions - Ostrom Commons & Herrmann-Thoni-Gachter Punishment]
-    Implements:
-      1. Public Pool Multiplication & Dividend:
-         G_t = sum_{i=1}^N (T_i + g_i),   dividend d_t = (r_pub * G_t) / N
-      2. Costly Peer Punishment & Tax Audit:
-         Agent i pays c_punish to deduct m_punish * c_punish from free-rider j.
-    """
-
-    def step_commons_and_audits(self, tick: int) -> None:
-        # TODO(post-mvp): Collect voluntary public goods contributions and run stochastic tax audits.
-        pass
+        candidate_edges.sort(key=lambda x: x[0], reverse=True)
+        used = set()
+        matched_pairs: List[Tuple[str, str]] = []
+        for _, u, v in candidate_edges:
+            if u not in used and v not in used:
+                matched_pairs.append((u, v))
+                used.add(u)
+                used.add(v)
+        return matched_pairs

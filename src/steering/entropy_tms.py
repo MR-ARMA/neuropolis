@@ -1,197 +1,190 @@
-"""
-src/steering/entropy_tms.py
-MODULE 4 (M4): Semantic-Offset Entropy Probe & Bayesian Transactive Memory System (TMS) Router.
-Implements Audit Flaw 4 Resolution:
-  1. Probes unconstrained vocabulary logits strictly AFTER the deterministic JSON prefix
-     `{"internal_thought": "` for K_probe = 5 semantic tokens.
-  2. Computes top-p truncated Normalized Shannon Entropy H_bar_i(c) in [0, 1].
-  3. If H_bar_i(c) > tau_TMS, halts generation (rewinding KV-cache) and routes an
-     `ASK_EXPERT` query to peer j* maximizing expected Bayesian competence weighted by trust.
-"""
-
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
-
+import sqlite3
+from typing import Any, Dict, List, Optional, Tuple
 import torch
+import torch.nn.functional as F
 
-from src.core.contracts import (
-    AgentTurnOutput,
-    ActionCategory,
-    ConsentDecision,
-    EconomicActionIntent,
-    EntropyTMSSpec,
-    ExpertiseDomain,
-    RelationalEdge,
-    TMSPeerCompetenceRecord,
-    TMSQueryIntent,
-    TMSRoutingDecision,
-)
-from src.memory.scoped_memory import ScopedAgentMemoryView
+from src.core.contracts import SimulationConfig, TMSSpec, normalize_item_id
 
 
 class EntropyTMSRouter:
     """
-    Monitors epistemic uncertainty on semantic reasoning tokens and routes queries
-    across the Bayesian Beta-Bernoulli Transactive Memory directory.
+    M4: Semantic-Offset Entropy-Triggered Transactive Memory System (TMS)
+    & Bayesian Conjugate Social Routing Engine.
     """
 
-    def __init__(self, spec: EntropyTMSSpec) -> None:
-        self.spec = spec
-
-    def compute_top_p_normalized_shannon_entropy(
+    def __init__(
         self,
-        vocab_logits_list: List[torch.Tensor],
+        config: Any = None,
+        db_path: str = "data/mvp_world_state.sqlite",
+        **kwargs: Any,
+    ) -> None:
+        if isinstance(config, str) and isinstance(db_path, (SimulationConfig, TMSSpec)):
+            config, db_path = db_path, config
+        elif isinstance(config, str):
+            db_path = config
+            config = kwargs.get("config", SimulationConfig())
+
+        if config is None:
+            config = SimulationConfig()
+
+        self.db_path = str(db_path)
+        if isinstance(config, SimulationConfig):
+            self.config = config
+            self.tms_spec = config.tms_spec
+        elif isinstance(config, TMSSpec):
+            self.config = SimulationConfig(tms_spec=config)
+            self.tms_spec = config
+        else:
+            self.config = SimulationConfig()
+            self.tms_spec = self.config.tms_spec
+
+    def compute_normalized_top_p_entropy(
+        self,
+        logits: torch.Tensor,
+        semantic_start_idx: int = 0,
     ) -> float:
-        """
-        Given K_probe raw vocabulary logit tensors `z_m in R^{|V|}`:
-          1. Computes full softmax distribution p_m(v).
-          2. Truncates to the top-p cumulative probability support V_p (or top-64 tokens)
-             and renormalizes p_tilde_m(v).
-          3. Computes normalized Shannon entropy:
-               H_bar = (1 / K_probe) * sum_{m=1}^{K_probe} [ - sum_{v in V_p} p_tilde_m(v) ln p_tilde_m(v) / ln |V_p| ]
-        """
-        if not vocab_logits_list:
+        if logits is None or logits.numel() == 0:
             return 0.0
 
-        entropies: List[float] = []
-        top_p = max(0.50, min(0.999, self.spec.top_p_truncation))
+        if logits.dim() == 3:
+            logits_2d = logits[0]
+        elif logits.dim() == 2:
+            logits_2d = logits
+        else:
+            logits_2d = logits.unsqueeze(0)
 
-        for logits in vocab_logits_list[: self.spec.probe_tokens_k]:
-            flat = logits.detach().float().view(-1)
-            probs = torch.softmax(flat, dim=-1)
+        seq_len = logits_2d.size(0)
+        start = min(max(0, semantic_start_idx), max(0, seq_len - 1))
+        end = min(seq_len, start + self.tms_spec.probe_tokens_k)
+        probe_slice = logits_2d[start:end].detach().float()
 
-            # Sort descending for top-p nucleus support
-            sorted_probs, _ = torch.sort(probs, descending=True)
-            # Cap support window at 128 tokens for numerical stability across large vocabularies
-            k_cap = min(128, sorted_probs.numel())
-            sorted_probs = sorted_probs[:k_cap]
+        probs = F.softmax(probe_slice, dim=-1)
+        sorted_probs, _ = torch.sort(probs, dim=-1, descending=True)
+        cum_probs = torch.cumsum(sorted_probs, dim=-1)
 
-            cum_probs = torch.cumsum(sorted_probs, dim=-1)
-            keep_mask = cum_probs <= top_p
-            # Always keep at least the top 8 tokens so ln(|V_p|) is well-defined
-            keep_mask[: min(8, k_cap)] = True
+        top_p = self.tms_spec.top_p_truncation
+        token_entropies: List[float] = []
 
-            support_probs = sorted_probs[keep_mask]
-            support_size = int(support_probs.numel())
-            if support_size <= 1:
-                entropies.append(0.0)
-                continue
+        for row_idx in range(sorted_probs.size(0)):
+            row_p = sorted_probs[row_idx]
+            row_cum = cum_probs[row_idx]
+            keep_mask = row_cum <= top_p
+            cutoff_idx = int(keep_mask.sum().item())
+            cutoff_idx = max(8, min(row_p.size(0), cutoff_idx + 1))
 
-            p_tilde = support_probs / torch.clamp(support_probs.sum(), min=1e-9)
-            p_safe = torch.clamp(p_tilde, min=1e-12)
-            shannon_h = -torch.sum(p_safe * torch.log(p_safe)).item()
-            norm_h = shannon_h / math.log(float(support_size))
-            entropies.append(max(0.0, min(1.0, norm_h)))
+            active_p = row_p[:cutoff_idx]
+            active_p = active_p / active_p.sum().clamp(min=1e-9)
+            ent = -torch.sum(active_p * torch.log(active_p.clamp(min=1e-12))).item()
+            max_ent = math.log(float(cutoff_idx))
+            norm_ent = ent / max(max_ent, 1e-6)
+            token_entropies.append(max(0.0, min(1.0, norm_ent)))
 
-        return round(float(sum(entropies) / len(entropies)), 4)
+        if not token_entropies:
+            return 0.0
+        return round(float(sum(token_entropies) / len(token_entropies)), 4)
 
-    def select_optimal_expert(
-        self,
-        scoped_memory: ScopedAgentMemoryView,
-        domain: ExpertiseDomain,
-    ) -> Tuple[Optional[str], float]:
-        """
-        Selects peer j* maximizing:
-            Score(i -> j, c) = D_i(j, c) * ((1 + tau_ij(t)) / 2) - xi_comm
-        where D_i(j, c) = alpha_{ij,c} / (alpha_{ij,c} + beta_{ij,c}).
-        """
-        records: List[TMSPeerCompetenceRecord] = scoped_memory.get_tms_competence_directory(domain)
-        edges: Dict[str, RelationalEdge] = scoped_memory.get_all_outgoing_edges()
-
-        best_peer: Optional[str] = None
-        best_score = -1e9
-
-        for rec in records:
-            if rec.target_id == scoped_memory.owner_id:
-                continue
-            edge = edges.get(
-                rec.target_id,
-                RelationalEdge(owner_id=scoped_memory.owner_id, target_id=rec.target_id),
-            )
-            trust_weight = 0.5 * (1.0 + edge.trust_tau)
-            score = rec.expected_competence * trust_weight - self.spec.communication_cost_xi
-            if score > best_score:
-                best_score = score
-                best_peer = rec.target_id
-
-        return best_peer, round(best_score, 4)
+    @staticmethod
+    def find_semantic_value_start_index(
+        generated_token_strings: List[str],
+    ) -> int:
+        joined = ""
+        for idx, tok in enumerate(generated_token_strings):
+            joined += tok
+            if "internal_thought" in joined and ":" in joined.split("internal_thought")[-1]:
+                return min(len(generated_token_strings) - 1, idx + 2)
+        return 0
 
     def evaluate_and_route(
         self,
-        vocab_logits_list: List[torch.Tensor],
-        scoped_memory: ScopedAgentMemoryView,
-        domain: ExpertiseDomain,
-    ) -> TMSRoutingDecision:
-        """
-        Evaluates semantic-offset token entropy and triggers `ASK_EXPERT` if H_bar > tau_TMS.
-        """
-        if not self.spec.enabled:
-            return TMSRoutingDecision(halted_generation=False, normalized_entropy=0.0)
+        owner_id: str,
+        domain_id: str,
+        mean_entropy: float,
+        effective_trust_map: Dict[str, float],
+    ) -> Dict[str, Any]:
+        norm_domain = normalize_item_id(domain_id)
+        if not self.tms_spec.enabled or mean_entropy <= self.tms_spec.entropy_threshold_tau:
+            return {
+                "halt_and_route": False,
+                "mean_entropy": mean_entropy,
+                "selected_expert_id": None,
+                "domain_id": norm_domain,
+                "expected_competence": 0.0,
+            }
 
-        h_bar = self.compute_top_p_normalized_shannon_entropy(vocab_logits_list)
-        if h_bar <= self.spec.entropy_threshold_tau:
-            return TMSRoutingDecision(
-                halted_generation=False,
-                normalized_entropy=h_bar,
-                domain=domain,
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT target_id, alpha_prior, beta_prior
+                FROM tms_directory
+                WHERE owner_id = ? AND domain_id = ?;
+                """,
+                (owner_id, norm_domain),
+            ).fetchall()
+
+        best_expert: Optional[str] = None
+        best_score = -1e9
+        best_comp = 0.0
+
+        for r in rows:
+            tid = r["target_id"]
+            if tid == owner_id:
+                continue
+            alpha_p = float(r["alpha_prior"])
+            beta_p = float(r["beta_prior"])
+            expected_d = alpha_p / max(alpha_p + beta_p, 1e-6)
+            t_eff = float(effective_trust_map.get(tid, 0.50))
+            score = expected_d * t_eff - self.tms_spec.communication_cost_xi
+            if score > best_score:
+                best_score = score
+                best_expert = tid
+                best_comp = expected_d
+
+        return {
+            "halt_and_route": best_expert is not None,
+            "mean_entropy": round(mean_entropy, 4),
+            "selected_expert_id": best_expert,
+            "domain_id": norm_domain,
+            "expected_competence": round(best_comp, 4),
+        }
+
+    def bayesian_conjugate_update(
+        self,
+        owner_id: str,
+        expert_id: str,
+        domain_id: str,
+        accuracy_realization_y: float,
+        tick: int = 0,
+    ) -> Tuple[float, float, float]:
+        norm_domain = normalize_item_id(domain_id)
+        y = max(0.0, min(1.0, float(accuracy_realization_y)))
+
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT alpha_prior, beta_prior
+                FROM tms_directory
+                WHERE owner_id = ? AND target_id = ? AND domain_id = ?;
+                """,
+                (owner_id, expert_id, norm_domain),
+            ).fetchone()
+            if not row:
+                new_alpha = 2.0 + y
+                new_beta = 2.0 + (1.0 - y)
+            else:
+                new_alpha = round(float(row[0]) + y, 4)
+                new_beta = round(float(row[1]) + (1.0 - y), 4)
+
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO tms_directory VALUES (?, ?, ?, ?, ?, ?);
+                """,
+                (owner_id, expert_id, norm_domain, new_alpha, new_beta, tick),
             )
+            conn.commit()
 
-        expert_id, _ = self.select_optimal_expert(scoped_memory, domain)
-        if expert_id is None:
-            return TMSRoutingDecision(
-                halted_generation=False,
-                normalized_entropy=h_bar,
-                domain=domain,
-            )
-
-        advice = (
-            f"[Expert {expert_id} Advisory on {domain.value}]: Current fair clearing price is "
-            f"stable near reference levels; avoid overpaying above 1.2x reference."
-        )
-        return TMSRoutingDecision(
-            halted_generation=True,
-            normalized_entropy=h_bar,
-            selected_expert_id=expert_id,
-            domain=domain,
-            expert_advice_injected=advice,
-        )
-
-    @staticmethod
-    def build_tms_query_turn_output(
-        decision: TMSRoutingDecision,
-        counterparty_id: Optional[str],
-    ) -> AgentTurnOutput:
-        """
-        Constructs the deterministic `AgentTurnOutput` emitted when the KV-cache is
-        rewound at semantic offset `m_0` due to high epistemic entropy.
-        """
-        expert_id = decision.selected_expert_id or (counterparty_id or "Agent_1")
-        return AgentTurnOutput(
-            internal_thought=(
-                f"Epistemic uncertainty high (H_bar={decision.normalized_entropy:.3f} > tau); "
-                f"halting speculative guess and routing TMS query to domain expert {expert_id}."
-            ),
-            epistemic_confidence=round(max(0.05, 1.0 - decision.normalized_entropy), 3),
-            consent_decision=ConsentDecision.INITIATE,
-            verbal_message=(
-                f"@{expert_id}, I need your domain expertise on {decision.domain.value} "
-                f"before locking in a trade price."
-            ),
-            perceived_honesty_delta=0.05,
-            economic_intent=EconomicActionIntent(
-                action_category=ActionCategory.TMS_QUERY,
-                target_peer_id=expert_id,
-                item_id="NONE",
-                quantity=0,
-                total_price_cash=0.0,
-                is_buying=True,
-            ),
-            tms_query=TMSQueryIntent(
-                queried_expert_id=expert_id,
-                domain=decision.domain,
-                question_text=f"What is your assessment of {decision.domain.value} supply and fair price?",
-                measured_entropy_bar=decision.normalized_entropy,
-            ),
-        )
+        expected_d = new_alpha / max(new_alpha + new_beta, 1e-6)
+        return (new_alpha, new_beta, round(expected_d, 4))

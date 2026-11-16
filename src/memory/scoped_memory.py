@@ -1,685 +1,800 @@
-"""
-src/memory/scoped_memory.py
-MODULE 5 (M5): Multi-Tier Scoped Memory Architecture with:
-  1. Embedded SQLite WAL relational persistence across all agent & macro tables.
-  2. Strict Epistemic Isolation (`ScopedAgentMemoryView(owner_id)`) raising
-     `EpistemicIsolationViolationError` (`PermissionError`) on cross-agent access.
-  3. Two-Pass Scoped Relational Retrieval:
-     - Pass 1: Self state + Direct Counterparty B.
-     - Pass 2: Fast Aho-Corasick / Multi-Entity Mention Scanner over incoming text
-       to dynamically inject R(A -> C) ONLY when third party C is mentioned.
-  4. Ebbinghaus-McGaugh emotional retention decay & STM -> LTM consolidation.
-"""
-
 from __future__ import annotations
 
 import json
 import math
-import os
-import re
 import sqlite3
 import uuid
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.core.contracts import (
-    BigFiveTraits,
-    EpisodicMemoryRecord,
-    ExpertiseDomain,
-    ExternalAgentState,
-    FehrSchmidtParams,
-    InternalAgentState,
-    LegalStatus,
-    MacroEconomyState,
-    MaslowNeeds,
-    MemoryCognitionSpec,
-    MoodPAD,
-    PeerPerceivedModel,
-    ProspectTheoryParams,
-    RelationalEdge,
-    RelationshipType,
-    TMSPeerCompetenceRecord,
+    AgentSeedConfig,
+    SimulationConfig,
+    normalize_item_id,
 )
 
 
 class EpistemicIsolationViolationError(PermissionError):
-    """Raised whenever an agent attempts to read or mutate another agent's private memory."""
+    """Raised when an agent attempts to read or mutate another agent's private memory."""
 
 
 class AhoCorasickEntityScanner:
     """
-    Fast single-pass entity mention automaton scanning incoming verbal messages or
-    gossip for third-party agent IDs or names in O(len(text)) time.
+    Deterministic O(len(text)) Aho-Corasick trie automaton for scanning incoming
+    messages and proposals to identify mentioned third-party agents.
     """
 
-    def __init__(self, entity_directory: Dict[str, str]) -> None:
-        """
-        Args:
-            entity_directory: mapping of surface strings (e.g., "Agent_3", "Elena")
-                              to canonical `agent_id` (e.g., "Agent_3").
-        """
-        self.surface_to_id: Dict[str, str] = {
-            k.lower(): v for k, v in entity_directory.items() if k.strip()
-        }
-        if self.surface_to_id:
-            escaped = sorted((re.escape(k) for k in self.surface_to_id.keys()), key=len, reverse=True)
-            self._regex = re.compile(r"\b(" + "|".join(escaped) + r")\b", re.IGNORECASE)
-        else:
-            self._regex = None
+    def __init__(self, agent_ids: List[str]) -> None:
+        self.trie: List[Dict[str, int]] = [{}]
+        self.output: List[Set[str]] = [set()]
+        self.fail: List[int] = [0]
+        self._build_automaton(agent_ids)
 
-    def scan_mentioned_agent_ids(
-        self,
-        text: str,
-        exclude_ids: Optional[Set[str]] = None,
-    ) -> List[str]:
-        if not text or self._regex is None:
+    def _add_keyword(self, keyword: str, canonical_id: str) -> None:
+        node = 0
+        for ch in keyword.lower():
+            if ch not in self.trie[node]:
+                self.trie[node][ch] = len(self.trie)
+                self.trie.append({})
+                self.output.append(set())
+                self.fail.append(0)
+            node = self.trie[node][ch]
+        self.output[node].add(canonical_id)
+
+    def _build_automaton(self, agent_ids: List[str]) -> None:
+        for aid in agent_ids:
+            self._add_keyword(aid, aid)
+            parts = aid.split("_")
+            if len(parts) >= 3:
+                # Also index given name alias (e.g., "Elena", "Viktor")
+                self._add_keyword(parts[-1], aid)
+
+        queue: List[int] = []
+        for ch, next_node in self.trie[0].items():
+            self.fail[next_node] = 0
+            queue.append(next_node)
+
+        while queue:
+            curr = queue.pop(0)
+            for ch, nxt in self.trie[curr].items():
+                queue.append(nxt)
+                f = self.fail[curr]
+                while f > 0 and ch not in self.trie[f]:
+                    f = self.fail[f]
+                self.fail[nxt] = self.trie[f].get(ch, 0)
+                self.output[nxt].update(self.output[self.fail[nxt]])
+
+    def scan(self, text: str, exclude_ids: Optional[Set[str]] = None) -> List[str]:
+        if not text:
             return []
         exclude = exclude_ids or set()
-        found_ids: List[str] = []
-        for match in self._regex.finditer(text):
-            token = match.group(0).lower()
-            canonical_id = self.surface_to_id.get(token)
-            if canonical_id and canonical_id not in exclude and canonical_id not in found_ids:
-                found_ids.append(canonical_id)
-        return found_ids
-
-
-class ScopedMemoryEngine:
-    """
-    Manages the SQLite WAL database and issues `ScopedAgentMemoryView` objects
-    bound strictly to a single `owner_id`.
-    """
-
-    def __init__(self, db_path: str, spec: MemoryCognitionSpec) -> None:
-        self.db_path = db_path
-        self.spec = spec
-        db_dir = os.path.dirname(os.path.abspath(db_path))
-        if db_dir:
-            os.makedirs(db_dir, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self._init_wal_and_schema()
-        self._entity_directory: Dict[str, str] = {}
-        self._scanner = AhoCorasickEntityScanner({})
-
-    def _init_wal_and_schema(self) -> None:
-        cur = self.conn.cursor()
-        cur.execute("PRAGMA journal_mode=WAL;")
-        cur.execute("PRAGMA synchronous=NORMAL;")
-
-        cur.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS agents_internal (
-                agent_id TEXT PRIMARY KEY,
-                state_json TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS agents_external_ledger (
-                agent_id TEXT PRIMARY KEY,
-                liquid_wealth_cash REAL NOT NULL,
-                bank_deposit REAL NOT NULL,
-                outstanding_debt REAL NOT NULL,
-                credit_score REAL NOT NULL,
-                inventory_json TEXT NOT NULL,
-                base_wage REAL NOT NULL,
-                social_status REAL NOT NULL,
-                legal_status TEXT NOT NULL,
-                spatial_node_id TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS relational_edges (
-                owner_id TEXT NOT NULL,
-                target_id TEXT NOT NULL,
-                edge_json TEXT NOT NULL,
-                PRIMARY KEY (owner_id, target_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS peer_perceived_models (
-                owner_id TEXT NOT NULL,
-                target_id TEXT NOT NULL,
-                model_json TEXT NOT NULL,
-                PRIMARY KEY (owner_id, target_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS tms_directory (
-                owner_id TEXT NOT NULL,
-                target_id TEXT NOT NULL,
-                domain TEXT NOT NULL,
-                alpha_success REAL NOT NULL,
-                beta_failure REAL NOT NULL,
-                last_queried_tick INTEGER NOT NULL,
-                PRIMARY KEY (owner_id, target_id, domain)
-            );
-
-            CREATE TABLE IF NOT EXISTS episodic_memories (
-                mem_id TEXT PRIMARY KEY,
-                owner_id TEXT NOT NULL,
-                tick_created INTEGER NOT NULL,
-                encoding_salience REAL NOT NULL,
-                rpe_magnitude REAL NOT NULL,
-                rehearsal_count INTEGER NOT NULL,
-                valence_at_encoding REAL NOT NULL,
-                arousal_at_encoding REAL NOT NULL,
-                involved_peers_json TEXT NOT NULL,
-                narrative_text TEXT NOT NULL,
-                is_consolidated_ltm INTEGER NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_episodic_owner
-                ON episodic_memories(owner_id, tick_created DESC);
-
-            CREATE TABLE IF NOT EXISTS macro_institutions (
-                singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
-                state_json TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS acid_transaction_ledger (
-                tx_id TEXT PRIMARY KEY,
-                tick INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                initiator_id TEXT NOT NULL,
-                responder_id TEXT,
-                cash_delta_initiator REAL NOT NULL,
-                cash_delta_responder REAL NOT NULL,
-                tax_collected REAL NOT NULL,
-                item_id TEXT NOT NULL,
-                quantity_transferred INTEGER NOT NULL,
-                diagnostic_feedback TEXT NOT NULL,
-                conservation_error REAL NOT NULL
-            );
-            """
-        )
-        self.conn.commit()
-
-    def register_population(
-        self,
-        internal_states: List[InternalAgentState],
-        external_states: List[ExternalAgentState],
-        macro_state: MacroEconomyState,
-    ) -> None:
-        """Initializes all agents, pairwise relationships, TMS priors, and macro accounts."""
-        cur = self.conn.cursor()
-        self._entity_directory.clear()
-
-        for istate in internal_states:
-            cur.execute(
-                "INSERT OR REPLACE INTO agents_internal (agent_id, state_json) VALUES (?, ?)",
-                (istate.agent_id, istate.model_dump_json()),
-            )
-            self._entity_directory[istate.agent_id] = istate.agent_id
-            self._entity_directory[istate.name] = istate.agent_id
-
-        for estate in external_states:
-            cur.execute(
-                """
-                INSERT OR REPLACE INTO agents_external_ledger (
-                    agent_id, liquid_wealth_cash, bank_deposit, outstanding_debt,
-                    credit_score, inventory_json, base_wage, social_status,
-                    legal_status, spatial_node_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    estate.agent_id,
-                    estate.liquid_wealth_cash,
-                    estate.bank_deposit,
-                    estate.outstanding_debt,
-                    estate.credit_score,
-                    json.dumps(estate.inventory),
-                    estate.base_wage,
-                    estate.social_status,
-                    estate.legal_status.value,
-                    estate.spatial_node_id,
-                ),
-            )
-
-        # Initialize directed pairwise edges, perceived ToM models, and TMS directory
-        for a in internal_states:
-            for b in internal_states:
-                if a.agent_id == b.agent_id:
-                    continue
-                edge = RelationalEdge(
-                    owner_id=a.agent_id,
-                    target_id=b.agent_id,
-                    rel_type=RelationshipType.ACQUAINTANCE,
-                    trust_tau=0.15 if a.specialty_domain == b.specialty_domain else 0.05,
-                    intimacy_alpha=0.10,
-                    credibility_kappa=0.55,
-                    tie_strength_w=0.25,
-                )
-                cur.execute(
-                    "INSERT OR REPLACE INTO relational_edges (owner_id, target_id, edge_json) VALUES (?, ?, ?)",
-                    (a.agent_id, b.agent_id, edge.model_dump_json()),
-                )
-
-                pmodel = PeerPerceivedModel(
-                    owner_id=a.agent_id,
-                    target_id=b.agent_id,
-                    est_honesty=0.55,
-                    est_greed=0.45,
-                    est_fehr_alpha=b.fehr_schmidt.disadvantageous_inequity_alpha,
-                    narrative_summary=f"{b.name} ({b.agent_id}) works as {b.occupation} specializing in {b.specialty_domain.value}.",
-                )
-                cur.execute(
-                    "INSERT OR REPLACE INTO peer_perceived_models (owner_id, target_id, model_json) VALUES (?, ?, ?)",
-                    (a.agent_id, b.agent_id, pmodel.model_dump_json()),
-                )
-
-                for domain in ExpertiseDomain:
-                    # Slightly higher prior for a peer's actual specialty domain
-                    is_spec = b.specialty_domain == domain
-                    alpha_init = 3.5 if is_spec else 2.0
-                    beta_init = 1.5 if is_spec else 2.0
-                    cur.execute(
-                        """
-                        INSERT OR REPLACE INTO tms_directory
-                        (owner_id, target_id, domain, alpha_success, beta_failure, last_queried_tick)
-                        VALUES (?, ?, ?, ?, ?, 0)
-                        """,
-                        (a.agent_id, b.agent_id, domain.value, alpha_init, beta_init),
-                    )
-
-        cur.execute(
-            "INSERT OR REPLACE INTO macro_institutions (singleton_id, state_json) VALUES (1, ?)",
-            (macro_state.model_dump_json(),),
-        )
-        self.conn.commit()
-        self._scanner = AhoCorasickEntityScanner(self._entity_directory)
-
-    def get_scoped_view(self, owner_id: str) -> "ScopedAgentMemoryView":
-        """Returns an epistemically isolated memory view bound strictly to `owner_id`."""
-        return ScopedAgentMemoryView(
-            conn=self.conn,
-            owner_id=owner_id,
-            spec=self.spec,
-            scanner=self._scanner,
-        )
-
-    def get_external_state(self, agent_id: str) -> ExternalAgentState:
-        cur = self.conn.cursor()
-        row = cur.execute(
-            "SELECT * FROM agents_external_ledger WHERE agent_id = ?", (agent_id,)
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"Unknown agent_id in external ledger: {agent_id}")
-        return ExternalAgentState(
-            agent_id=row["agent_id"],
-            liquid_wealth_cash=float(row["liquid_wealth_cash"]),
-            bank_deposit=float(row["bank_deposit"]),
-            outstanding_debt=float(row["outstanding_debt"]),
-            credit_score=float(row["credit_score"]),
-            inventory=json.loads(row["inventory_json"]),
-            base_wage=float(row["base_wage"]),
-            social_status=float(row["social_status"]),
-            legal_status=LegalStatus(row["legal_status"]),
-            spatial_node_id=row["spatial_node_id"],
-        )
-
-    def get_all_external_states(self) -> Dict[str, ExternalAgentState]:
-        cur = self.conn.cursor()
-        rows = cur.execute("SELECT agent_id FROM agents_external_ledger").fetchall()
-        return {r["agent_id"]: self.get_external_state(r["agent_id"]) for r in rows}
-
-    def get_macro_state(self) -> MacroEconomyState:
-        cur = self.conn.cursor()
-        row = cur.execute(
-            "SELECT state_json FROM macro_institutions WHERE singleton_id = 1"
-        ).fetchone()
-        return MacroEconomyState.model_validate_json(row["state_json"])
-
-    def update_macro_state(self, macro_state: MacroEconomyState) -> None:
-        cur = self.conn.cursor()
-        cur.execute(
-            "UPDATE macro_institutions SET state_json = ? WHERE singleton_id = 1",
-            (macro_state.model_dump_json(),),
-        )
-        self.conn.commit()
+        node = 0
+        found: Set[str] = set()
+        for ch in text.lower():
+            while node > 0 and ch not in self.trie[node]:
+                node = self.fail[node]
+            node = self.trie[node].get(ch, 0)
+            if self.output[node]:
+                for cid in self.output[node]:
+                    if cid not in exclude:
+                        found.add(cid)
+        return sorted(found)
 
 
 class ScopedAgentMemoryView:
-    """
-    Enforces strict partition-key isolation (`owner_id == self.owner_id`).
-    Any attempt to read or write another agent's private state or relational edges
-    raises `EpistemicIsolationViolationError` (a subclass of `PermissionError`).
-    """
+    """Cryptographically/logically bound memory handle enforcing WHERE owner_id = self.owner_id."""
 
-    def __init__(
-        self,
-        conn: sqlite3.Connection,
-        owner_id: str,
-        spec: MemoryCognitionSpec,
-        scanner: AhoCorasickEntityScanner,
-    ) -> None:
-        self._conn = conn
+    def __init__(self, memory_engine: "MultiTierScopedMemory", owner_id: str) -> None:
+        self._engine = memory_engine
         self.owner_id = owner_id
-        self.spec = spec
-        self._scanner = scanner
 
-    def _assert_ownership(self, requested_owner_id: str) -> None:
+    def assert_access(self, requested_owner_id: str) -> None:
         if requested_owner_id != self.owner_id:
             raise EpistemicIsolationViolationError(
-                f"EPISTEMIC ISOLATION VIOLATION: ScopedView(owner='{self.owner_id}') "
-                f"attempted illegal access to private partition of '{requested_owner_id}'."
+                f"Epistemic Isolation Breach: Agent '{self.owner_id}' cannot access private state of '{requested_owner_id}'."
             )
 
-    def get_internal_state(self, requested_owner_id: Optional[str] = None) -> InternalAgentState:
-        target = requested_owner_id or self.owner_id
-        self._assert_ownership(target)
-        cur = self._conn.cursor()
-        row = cur.execute(
-            "SELECT state_json FROM agents_internal WHERE agent_id = ?",
-            (self.owner_id,),
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"Internal state not found for {self.owner_id}")
-        return InternalAgentState.model_validate_json(row["state_json"])
-
-    def save_internal_state(self, state: InternalAgentState) -> None:
-        self._assert_ownership(state.agent_id)
-        cur = self._conn.cursor()
-        cur.execute(
-            "UPDATE agents_internal SET state_json = ? WHERE agent_id = ?",
-            (state.model_dump_json(), self.owner_id),
+    def retrieve_context(
+        self,
+        requested_owner_id: str,
+        partner_id: Optional[str],
+        incoming_texts: List[str],
+        current_tick: int,
+    ) -> Dict[str, Any]:
+        self.assert_access(requested_owner_id)
+        return self._engine._retrieve_scoped_context_internal(
+            owner_id=self.owner_id,
+            partner_id=partner_id,
+            incoming_texts=incoming_texts,
+            current_tick=current_tick,
         )
-        self._conn.commit()
 
-    def get_relational_edge(
-        self, target_id: str, requested_owner_id: Optional[str] = None
-    ) -> RelationalEdge:
-        owner = requested_owner_id or self.owner_id
-        self._assert_ownership(owner)
-        cur = self._conn.cursor()
-        row = cur.execute(
-            "SELECT edge_json FROM relational_edges WHERE owner_id = ? AND target_id = ?",
-            (self.owner_id, target_id),
-        ).fetchone()
-        if row is None:
-            return RelationalEdge(owner_id=self.owner_id, target_id=target_id)
-        return RelationalEdge.model_validate_json(row["edge_json"])
 
-    def save_relational_edge(self, edge: RelationalEdge) -> None:
-        self._assert_ownership(edge.owner_id)
-        cur = self._conn.cursor()
-        cur.execute(
-            "INSERT OR REPLACE INTO relational_edges (owner_id, target_id, edge_json) VALUES (?, ?, ?)",
-            (self.owner_id, edge.target_id, edge.model_dump_json()),
+class MultiTierScopedMemory:
+    """
+    M5: Multi-Tier Psychological, Relational & Opinion Memory Engine.
+    Implements:
+    - Tier 0: Baseline Personality, Fehr-Schmidt Table III (alpha_i, beta_i), Innate Anchor s_i.
+    - Tier 1 & 2: STM / LTM Episodic Buffers with Ebbinghaus-McGaugh Read-Time Retention R_m(Delta_t).
+    - 3-Tier Social Trust Architecture:
+        Level 1: Relational Trust tau_{ij,t} in [0, 1] (with Slovic negativity bias eta_- > eta_+)
+        Level 2: Generalized Social Trust T_bar_{soc,t} in [0, 1] (5-driver macro feedback)
+        Level 3: Institutional Trust T_{inst,t} in [0, 1]
+        Composite Effective Trust: T^{eff}_{ij,t} = omega_{ij,t} * tau_{ij,t} + (1 - omega_{ij,t}) * T_bar_{soc,t}
+    - Unified Opinion State: Innate anchor s_i, Expressed belief z_i(t), Adaptive HK confidence eps_{ij}(t),
+      and Centola-Macy complex contagion adoption state Y_{i,t}.
+    """
+
+    def __init__(self, db_path: str, config: SimulationConfig) -> None:
+        self.db_path = db_path
+        self.config = config
+        self.omega = config.orthogonal_clamping
+        self.trust_spec = config.trust_and_market_spec
+        self.contagion_spec = config.contagion_and_opinion_spec
+        self.agent_ids = [a.agent_id for a in config.agents]
+        self.scanner = AhoCorasickEntityScanner(self.agent_ids)
+
+        self.generalized_social_trust: float = (
+            self.trust_spec.initial_generalized_trust
+            if self.omega.omega_d2_trust_and_parochialism
+            else 0.50
         )
-        self._conn.commit()
+        self.institutional_trust: float = (
+            self.trust_spec.initial_institutional_trust
+            if self.omega.omega_d2_trust_and_parochialism
+            else 0.50
+        )
+        self._init_memory_tables()
 
-    def get_all_outgoing_edges(self) -> Dict[str, RelationalEdge]:
-        cur = self._conn.cursor()
-        rows = cur.execute(
-            "SELECT target_id, edge_json FROM relational_edges WHERE owner_id = ?",
-            (self.owner_id,),
-        ).fetchall()
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        return conn
+
+    def get_scoped_view(self, owner_id: str) -> ScopedAgentMemoryView:
+        return ScopedAgentMemoryView(self, owner_id)
+
+    def _init_memory_tables(self) -> None:
+        with self._connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS agents_internal (
+                    agent_id TEXT PRIMARY KEY,
+                    big_five_json TEXT NOT NULL,
+                    fehr_schmidt_json TEXT NOT NULL,
+                    cpt_params_json TEXT NOT NULL,
+                    pad_mood_json TEXT NOT NULL,
+                    maslow_json TEXT NOT NULL,
+                    fatigue_f REAL NOT NULL DEFAULT 0.10,
+                    identity_rigidity REAL NOT NULL DEFAULT 0.50,
+                    innate_anchor_s REAL NOT NULL DEFAULT 0.0,
+                    expressed_opinion_z REAL NOT NULL DEFAULT 0.0,
+                    contagion_adopted_y INTEGER NOT NULL DEFAULT 0,
+                    contagion_exposures_count INTEGER NOT NULL DEFAULT 0,
+                    hebbian_vec_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS relational_edges (
+                    owner_id TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    rel_type TEXT NOT NULL,
+                    trust_tau_01 REAL NOT NULL DEFAULT 0.55,
+                    trust_tau REAL NOT NULL DEFAULT 0.10,
+                    intimacy_alpha REAL NOT NULL DEFAULT 0.10,
+                    credibility_kappa REAL NOT NULL DEFAULT 0.50,
+                    interaction_count_n INTEGER NOT NULL DEFAULT 0,
+                    hk_confidence_eps REAL NOT NULL DEFAULT 0.50,
+                    coop_stats_json TEXT NOT NULL,
+                    PRIMARY KEY (owner_id, target_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS peer_perceived_models (
+                    owner_id TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    perceived_traits_json TEXT NOT NULL,
+                    summary_text TEXT NOT NULL,
+                    PRIMARY KEY (owner_id, target_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS tms_directory (
+                    owner_id TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    domain_id TEXT NOT NULL,
+                    alpha_prior REAL NOT NULL,
+                    beta_prior REAL NOT NULL,
+                    last_updated_tick INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (owner_id, target_id, domain_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS stm_episodic (
+                    mem_id TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    tick INTEGER NOT NULL,
+                    partner_id TEXT,
+                    consent_decision TEXT NOT NULL,
+                    action_category TEXT NOT NULL,
+                    internal_thought TEXT NOT NULL,
+                    verbal_message TEXT NOT NULL,
+                    encoding_salience REAL NOT NULL,
+                    rpe_magnitude REAL NOT NULL DEFAULT 0.0,
+                    rehearsal_count INTEGER NOT NULL DEFAULT 0,
+                    affect_pad_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ltm_episodic (
+                    mem_id TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    tick INTEGER NOT NULL,
+                    partner_id TEXT,
+                    narrative_summary TEXT NOT NULL,
+                    encoding_salience REAL NOT NULL,
+                    rehearsal_count INTEGER NOT NULL DEFAULT 1
+                );
+
+                CREATE TABLE IF NOT EXISTS inference_telemetry (
+                    tick INTEGER NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    partner_id TEXT,
+                    wave INTEGER NOT NULL DEFAULT 1,
+                    financial_stress REAL NOT NULL,
+                    dissonance_score REAL NOT NULL,
+                    yerkes_dodson_beta REAL NOT NULL,
+                    mean_shannon_entropy REAL NOT NULL,
+                    tms_triggered INTEGER NOT NULL DEFAULT 0,
+                    attn_mass_drives_finance REAL NOT NULL,
+                    attn_mass_peer_memory REAL NOT NULL,
+                    attn_mass_incoming_msg REAL NOT NULL,
+                    attn_mass_sink REAL NOT NULL
+                );
+                """
+            )
+
+            cur = conn.execute("SELECT COUNT(*) AS cnt FROM agents_internal;")
+            if cur.fetchone()["cnt"] == 0:
+                for ag in self.config.agents:
+                    alpha_fs = (
+                        ag.alpha_disadvantageous
+                        if self.omega.omega_d2_trust_and_parochialism
+                        else 0.0
+                    )
+                    beta_fs = (
+                        ag.beta_advantageous
+                        if self.omega.omega_d2_trust_and_parochialism
+                        else 0.0
+                    )
+                    fs_json = json.dumps(
+                        {
+                            "tier": ag.fehr_schmidt_tier,
+                            "alpha": alpha_fs,
+                            "beta": beta_fs,
+                        }
+                    )
+                    cpt_json = json.dumps(
+                        {
+                            "lambda": ag.loss_aversion_lambda,
+                            "gamma": ag.risk_tolerance_gamma,
+                            "delta": self.config.hank_and_crisis_spec.long_run_discount_delta,
+                        }
+                    )
+                    pad_json = json.dumps(
+                        {"valence": 0.10, "arousal": 0.30, "dominance": 0.50}
+                    )
+                    maslow_json = json.dumps(
+                        {
+                            "survival_satiety": 0.85,
+                            "financial_safety": 0.70,
+                            "belonging": 0.60,
+                            "esteem_status": 0.60,
+                        }
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO agents_internal VALUES (
+                            ?, ?, ?, ?, ?, ?, 0.10, ?, ?, ?, 0, 0, ?
+                        );
+                        """,
+                        (
+                            ag.agent_id,
+                            ag.big_five.model_dump_json(),
+                            fs_json,
+                            cpt_json,
+                            pad_json,
+                            maslow_json,
+                            float(ag.identity_rigidity),
+                            float(ag.innate_opinion_anchor_s),
+                            float(ag.innate_opinion_anchor_s),
+                            json.dumps([0.0] * 6),
+                        ),
+                    )
+
+                # Initialize directed relational edges & Bayesian TMS priors
+                for ag_i in self.config.agents:
+                    for ag_j in self.config.agents:
+                        if ag_i.agent_id == ag_j.agent_id:
+                            continue
+                        same_group = ag_i.tms_specialty == ag_j.tms_specialty
+                        init_tau_01 = (
+                            0.64
+                            if same_group
+                            else 0.52
+                            if self.omega.omega_d2_trust_and_parochialism
+                            else 0.50
+                        )
+                        init_tau_signed = round(2.0 * init_tau_01 - 1.0, 4)
+                        init_aff = 0.25 if same_group else 0.05
+                        init_eps = (
+                            self.contagion_spec.hk_initial_confidence_eps
+                            if self.omega.omega_d3_contagion_and_polarization
+                            else 2.0
+                        )
+                        coop_stats = json.dumps(
+                            {
+                                "total_trades": 0,
+                                "successful_coops": 0,
+                                "defections_suffered": 0,
+                            }
+                        )
+                        conn.execute(
+                            """
+                            INSERT INTO relational_edges VALUES (
+                                ?, ?, ?, ?, ?, ?, 0.60, 1, ?, ?
+                            );
+                            """,
+                            (
+                                ag_i.agent_id,
+                                ag_j.agent_id,
+                                "COLLEAGUE" if same_group else "ACQUAINTANCE",
+                                init_tau_01,
+                                init_tau_signed,
+                                init_aff,
+                                init_eps,
+                                coop_stats,
+                            ),
+                        )
+                        conn.execute(
+                            """
+                            INSERT INTO peer_perceived_models VALUES (?, ?, ?, ?);
+                            """,
+                            (
+                                ag_i.agent_id,
+                                ag_j.agent_id,
+                                json.dumps(
+                                    {
+                                        "perceived_honesty": init_tau_01,
+                                        "estimated_alpha_fs": ag_j.alpha_disadvantageous,
+                                    }
+                                ),
+                                f"{ag_j.agent_id} ({ag_j.occupation_role}): specialty in {ag_j.tms_specialty}.",
+                            ),
+                        )
+                        # Initialize Beta-Bernoulli TMS expertise priors across both domains
+                        for dom in ("CONSUMABLE_NECESSITY", "PRODUCTIVE_CAPITAL_ASSET"):
+                            is_spec = ag_j.tms_specialty == dom
+                            alpha_p = 6.0 if is_spec else 2.0
+                            beta_p = 1.5 if is_spec else 4.0
+                            conn.execute(
+                                """
+                                INSERT INTO tms_directory VALUES (?, ?, ?, ?, ?, 0);
+                                """,
+                                (ag_i.agent_id, ag_j.agent_id, dom, alpha_p, beta_p),
+                            )
+            conn.commit()
+
+    # ========================================================================
+    # COMPOSITE EFFECTIVE TRUST (T^{eff}_{ij,t}) & DUAL-PASS RETRIEVAL
+    # ========================================================================
+
+    def compute_effective_trust(self, owner_id: str, target_id: str) -> float:
+        """
+        T^{eff}_{ij,t} = omega_{ij,t} * tau_{ij,t} + (1 - omega_{ij,t}) * T_bar_{soc,t}
+        where omega_{ij,t} = 1 - exp(-lambda_n * n_{ij,t}).
+        Clamped to 0.50 when Omega_D2 == False.
+        """
+        if not self.omega.omega_d2_trust_and_parochialism:
+            return 0.50
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT trust_tau_01, interaction_count_n
+                FROM relational_edges
+                WHERE owner_id = ? AND target_id = ?;
+                """,
+                (owner_id, target_id),
+            ).fetchone()
+            if not row:
+                return self.generalized_social_trust
+            tau_01 = float(row["trust_tau_01"])
+            n_ijt = int(row["interaction_count_n"])
+            omega_ijt = 1.0 - math.exp(
+                -self.trust_spec.familiarity_decay_lambda_n * n_ijt
+            )
+            t_eff = (
+                omega_ijt * tau_01
+                + (1.0 - omega_ijt) * self.generalized_social_trust
+            )
+            return round(max(0.0, min(1.0, t_eff)), 4)
+
+    def get_effective_trust_matrix(self) -> Dict[Tuple[str, str], float]:
+        matrix: Dict[Tuple[str, str], float] = {}
+        for u in self.agent_ids:
+            for v in self.agent_ids:
+                if u != v:
+                    matrix[(u, v)] = self.compute_effective_trust(u, v)
+        return matrix
+
+    def _retrieve_scoped_context_internal(
+        self,
+        owner_id: str,
+        partner_id: Optional[str],
+        incoming_texts: List[str],
+        current_tick: int,
+    ) -> Dict[str, Any]:
+        """
+        Executes Dual-Pass Scoped Memory Retrieval:
+        - Pass 1: Continuous self internal state + Direct Counterparty B relational row.
+        - Pass 2: Aho-Corasick scan over incoming_texts for mentioned third-party IDs C.
+        - Episodic Retrieval: Ranks STM memories by dynamic Ebbinghaus-McGaugh retention R_m(Delta_t) * S_enc(m).
+        """
+        exclude = {owner_id}
+        if partner_id:
+            exclude.add(partner_id)
+        combined_text = " ".join(incoming_texts)
+        mentioned_ids = self.scanner.scan(combined_text, exclude_ids=exclude)
+
+        scoped_targets: List[str] = []
+        if partner_id and partner_id != owner_id:
+            scoped_targets.append(partner_id)
+        for mid in mentioned_ids:
+            if mid not in scoped_targets:
+                scoped_targets.append(mid)
+
+        with self._connect() as conn:
+            internal_row = dict(
+                conn.execute(
+                    "SELECT * FROM agents_internal WHERE agent_id = ?;", (owner_id,)
+                ).fetchone()
+            )
+            internal_row["big_five"] = json.loads(internal_row["big_five_json"])
+            internal_row["fehr_schmidt"] = json.loads(
+                internal_row["fehr_schmidt_json"]
+            )
+            internal_row["cpt_params"] = json.loads(internal_row["cpt_params_json"])
+            internal_row["pad_mood"] = json.loads(internal_row["pad_mood_json"])
+            internal_row["maslow"] = json.loads(internal_row["maslow_json"])
+            internal_row["hebbian_vec"] = json.loads(internal_row["hebbian_vec_json"])
+
+            scoped_relations: Dict[str, Dict[str, Any]] = {}
+            scoped_peer_models: Dict[str, Dict[str, Any]] = {}
+
+            if scoped_targets:
+                placeholders = ",".join("?" for _ in scoped_targets)
+                rel_rows = conn.execute(
+                    f"""
+                    SELECT * FROM relational_edges
+                    WHERE owner_id = ? AND target_id IN ({placeholders});
+                    """,
+                    [owner_id] + scoped_targets,
+                ).fetchall()
+                for r in rel_rows:
+                    d = dict(r)
+                    d["coop_stats"] = json.loads(d["coop_stats_json"])
+                    d["effective_trust_01"] = self.compute_effective_trust(
+                        owner_id, d["target_id"]
+                    )
+                    scoped_relations[d["target_id"]] = d
+
+                pm_rows = conn.execute(
+                    f"""
+                    SELECT * FROM peer_perceived_models
+                    WHERE owner_id = ? AND target_id IN ({placeholders});
+                    """,
+                    [owner_id] + scoped_targets,
+                ).fetchall()
+                for pm in pm_rows:
+                    pmd = dict(pm)
+                    pmd["perceived_traits"] = json.loads(pmd["perceived_traits_json"])
+                    scoped_peer_models[pmd["target_id"]] = pmd
+
+            # Ebbinghaus-McGaugh Dynamic Read-Time Retention R_m(Delta_t)
+            stm_rows = conn.execute(
+                "SELECT * FROM stm_episodic WHERE owner_id = ?;", (owner_id,)
+            ).fetchall()
+            tau_stm = 4.5
+            scored_memories: List[Tuple[float, Dict[str, Any]]] = []
+            for m in stm_rows:
+                md = dict(m)
+                delta_t = max(0, current_tick - int(md["tick"]))
+                s_enc = max(0.5, float(md["encoding_salience"]))
+                retention_r = math.exp(-delta_t / (tau_stm * s_enc))
+                partner_bonus = (
+                    1.35 if (partner_id and md["partner_id"] == partner_id) else 1.0
+                )
+                effective_salience = retention_r * s_enc * partner_bonus
+                md["retention_r"] = round(retention_r, 4)
+                md["effective_read_salience"] = round(effective_salience, 4)
+                scored_memories.append((effective_salience, md))
+
+            scored_memories.sort(key=lambda x: x[0], reverse=True)
+            top_episodes = [item[1] for item in scored_memories[:4]]
+
+            # Rehearsal update on retrieved memories
+            for ep in top_episodes:
+                conn.execute(
+                    """
+                    UPDATE stm_episodic
+                    SET rehearsal_count = rehearsal_count + 1,
+                        encoding_salience = ROUND(encoding_salience + 0.12, 4)
+                    WHERE mem_id = ?;
+                    """,
+                    (ep["mem_id"],),
+                )
+            conn.commit()
+
         return {
-            r["target_id"]: RelationalEdge.model_validate_json(r["edge_json"])
-            for r in rows
+            "owner_id": owner_id,
+            "internal_state": internal_row,
+            "scoped_relations": scoped_relations,
+            "scoped_peer_models": scoped_peer_models,
+            "mentioned_third_parties": mentioned_ids,
+            "retrieved_episodes": top_episodes,
+            "generalized_social_trust": self.generalized_social_trust,
+            "institutional_trust": self.institutional_trust,
         }
 
-    def get_peer_perceived_model(
-        self, target_id: str, requested_owner_id: Optional[str] = None
-    ) -> PeerPerceivedModel:
-        owner = requested_owner_id or self.owner_id
-        self._assert_ownership(owner)
-        cur = self._conn.cursor()
-        row = cur.execute(
-            "SELECT model_json FROM peer_perceived_models WHERE owner_id = ? AND target_id = ?",
-            (self.owner_id, target_id),
-        ).fetchone()
-        if row is None:
-            return PeerPerceivedModel(owner_id=self.owner_id, target_id=target_id)
-        return PeerPerceivedModel.model_validate_json(row["model_json"])
+    # ========================================================================
+    # PILLAR C: 3-TIER TRUST UPDATES (DYADIC, GENERALIZED & INSTITUTIONAL)
+    # ========================================================================
 
-    def save_peer_perceived_model(self, model: PeerPerceivedModel) -> None:
-        self._assert_ownership(model.owner_id)
-        cur = self._conn.cursor()
-        cur.execute(
-            "INSERT OR REPLACE INTO peer_perceived_models (owner_id, target_id, model_json) VALUES (?, ?, ?)",
-            (self.owner_id, model.target_id, model.model_dump_json()),
-        )
-        self._conn.commit()
-
-    def dual_pass_scoped_retrieval(
-        self,
-        direct_partner_id: Optional[str],
-        incoming_message_text: str,
-        current_tick: int,
-    ) -> Tuple[
-        Dict[str, RelationalEdge],
-        Dict[str, PeerPerceivedModel],
-        List[EpisodicMemoryRecord],
-    ]:
-        """
-        Executes the Two-Pass Scoped Relational Retrieval Architecture:
-          - Pass 1: Loads R(owner -> direct_partner_id) and ToM model M(owner -> direct_partner_id).
-          - Pass 2: Runs the Aho-Corasick Entity Scanner over `incoming_message_text`.
-            If third-party Agent C is mentioned, dynamically loads R(owner -> C) and M(owner -> C).
-            All uninvolved peers consume ZERO prompt tokens.
-        """
-        relevant_peers: List[str] = []
-        if direct_partner_id and direct_partner_id != self.owner_id:
-            relevant_peers.append(direct_partner_id)
-
-        # Pass 2: Scan incoming text for third-party entity mentions
-        mentioned_third_parties = self._scanner.scan_mentioned_agent_ids(
-            text=incoming_message_text,
-            exclude_ids={self.owner_id} | set(relevant_peers),
-        )
-        relevant_peers.extend(mentioned_third_parties)
-
-        scoped_edges: Dict[str, RelationalEdge] = {}
-        scoped_models: Dict[str, PeerPerceivedModel] = {}
-        for peer_id in relevant_peers:
-            scoped_edges[peer_id] = self.get_relational_edge(peer_id)
-            scoped_models[peer_id] = self.get_peer_perceived_model(peer_id)
-
-        # Retrieve top episodic memories involving relevant peers (or high salience)
-        memories = self.retrieve_active_memories(
-            current_tick=current_tick,
-            relevant_peers=set(relevant_peers),
-            top_k=5,
-        )
-        return scoped_edges, scoped_models, memories
-
-    def record_episodic_memory(
+    def update_dyadic_trust_and_memory(
         self,
         tick: int,
-        narrative_text: str,
-        involved_peers: List[str],
-        arousal: float,
-        valence: float,
+        owner_id: str,
+        partner_id: str,
+        trade_approved: bool,
+        own_surplus_x: float,
+        partner_surplus_x: float,
+        kkt_gouging_index: float,
+        consent_decision: str,
+        action_category: str,
+        internal_thought: str,
+        verbal_message: str,
         rpe_magnitude: float,
-        goal_relevance: float = 0.5,
-    ) -> EpisodicMemoryRecord:
+        updated_hebbian: List[float],
+    ) -> float:
         """
-        Computes McGaugh amygdalar encoding salience:
-            S_enc(m) = 1 + w_a * A(t) + w_rpe * |delta_RPE| + w_goal * GoalRel
-        and stores the episodic trace in `episodic_memories`.
+        Computes Dyadic Net Fairness Signal S_{ij,t} and updates Level-1 Relational Trust tau_{ij,t+1}
+        via Slovic's Asymmetric Negativity-Biased rule, plus persists STM/LTM episodic records.
         """
-        encoding_salience = (
-            1.0
-            + 0.85 * float(arousal)
-            + 1.10 * min(2.0, float(rpe_magnitude))
-            + 0.50 * float(goal_relevance)
-        )
-        is_ltm = encoding_salience >= self.spec.consolidation_salience_threshold
-        rec = EpisodicMemoryRecord(
-            mem_id=f"mem_{uuid.uuid4().hex[:10]}",
-            owner_id=self.owner_id,
-            tick_created=tick,
-            encoding_salience=round(encoding_salience, 4),
-            rpe_magnitude=round(rpe_magnitude, 4),
-            rehearsal_count=0,
-            valence_at_encoding=round(valence, 4),
-            arousal_at_encoding=round(arousal, 4),
-            involved_peers=involved_peers,
-            narrative_text=narrative_text,
-            is_consolidated_ltm=is_ltm,
-        )
-        cur = self._conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO episodic_memories (
-                mem_id, owner_id, tick_created, encoding_salience, rpe_magnitude,
-                rehearsal_count, valence_at_encoding, arousal_at_encoding,
-                involved_peers_json, narrative_text, is_consolidated_ltm
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                rec.mem_id,
-                self.owner_id,
-                rec.tick_created,
-                rec.encoding_salience,
-                rec.rpe_magnitude,
-                rec.rehearsal_count,
-                rec.valence_at_encoding,
-                rec.arousal_at_encoding,
-                json.dumps(rec.involved_peers),
-                rec.narrative_text,
-                1 if rec.is_consolidated_ltm else 0,
-            ),
-        )
-        self._conn.commit()
-        return rec
-
-    def retrieve_active_memories(
-        self,
-        current_tick: int,
-        relevant_peers: Optional[Set[str]] = None,
-        top_k: int = 5,
-    ) -> List[EpisodicMemoryRecord]:
-        """
-        Applies Ebbinghaus-McGaugh retention curve:
-            R_m(Delta_t) = exp( - Delta_t / (tau_0 * S_enc(m) * (1 + ln(1 + n_reh))) )
-        Prunes decayed STM records (R_m < 0.15) and returns top-k memories.
-        """
-        cur = self._conn.cursor()
-        rows = cur.execute(
-            "SELECT * FROM episodic_memories WHERE owner_id = ? ORDER BY tick_created DESC",
-            (self.owner_id,),
-        ).fetchall()
-
-        scored: List[Tuple[float, EpisodicMemoryRecord]] = []
-        expired_ids: List[str] = []
-        tau_0 = max(0.5, self.spec.ebbinghaus_base_half_life_ticks)
-
-        for r in rows:
-            peers = json.loads(r["involved_peers_json"])
-            rec = EpisodicMemoryRecord(
-                mem_id=r["mem_id"],
-                owner_id=r["owner_id"],
-                tick_created=int(r["tick_created"]),
-                encoding_salience=float(r["encoding_salience"]),
-                rpe_magnitude=float(r["rpe_magnitude"]),
-                rehearsal_count=int(r["rehearsal_count"]),
-                valence_at_encoding=float(r["valence_at_encoding"]),
-                arousal_at_encoding=float(r["arousal_at_encoding"]),
-                involved_peers=peers,
-                narrative_text=r["narrative_text"],
-                is_consolidated_ltm=bool(r["is_consolidated_ltm"]),
+        with self._connect() as conn:
+            int_row = conn.execute(
+                "SELECT fehr_schmidt_json, pad_mood_json FROM agents_internal WHERE agent_id = ?;",
+                (owner_id,),
+            ).fetchone()
+            fs = json.loads(int_row["fehr_schmidt_json"])
+            pad = json.loads(int_row["pad_mood_json"])
+            alpha_i = (
+                float(fs.get("alpha", 0.5))
+                if self.omega.omega_d2_trust_and_parochialism
+                else 0.0
             )
-            delta_t = max(0, current_tick - rec.tick_created)
-            effective_stability = tau_0 * rec.encoding_salience * (
-                1.0 + math.log(1.0 + rec.rehearsal_count)
-            )
-            retention = math.exp(-float(delta_t) / max(1e-4, effective_stability))
 
-            if not rec.is_consolidated_ltm and retention < 0.15:
-                expired_ids.append(rec.mem_id)
-                continue
-
-            peer_bonus = 1.5 if (relevant_peers and any(p in relevant_peers for p in peers)) else 1.0
-            retrieval_score = retention * rec.encoding_salience * peer_bonus
-            scored.append((retrieval_score, rec))
-
-        if expired_ids:
-            cur.executemany(
-                "DELETE FROM episodic_memories WHERE mem_id = ?",
-                [(mid,) for mid in expired_ids],
-            )
-            self._conn.commit()
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        selected = [item[1] for item in scored[:top_k]]
-
-        # Increment rehearsal count and consolidate if threshold reached
-        for rec in selected:
-            new_reh = rec.rehearsal_count + 1
-            new_sal = rec.encoding_salience + 0.15 * math.log(1.0 + new_reh)
-            consolidate = 1 if (rec.is_consolidated_ltm or new_sal >= self.spec.consolidation_salience_threshold) else 0
-            cur.execute(
+            rel_row = conn.execute(
                 """
-                UPDATE episodic_memories
-                SET rehearsal_count = ?, encoding_salience = ?, is_consolidated_ltm = ?
-                WHERE mem_id = ?
+                SELECT trust_tau_01, intimacy_alpha, interaction_count_n,
+                       hk_confidence_eps, coop_stats_json
+                FROM relational_edges
+                WHERE owner_id = ? AND target_id = ?;
                 """,
-                (new_reh, round(new_sal, 4), consolidate, rec.mem_id),
+                (owner_id, partner_id),
+            ).fetchone()
+
+            tau_01 = float(rel_row["trust_tau_01"])
+            intimacy = float(rel_row["intimacy_alpha"])
+            n_count = int(rel_row["interaction_count_n"]) + 1
+            hk_eps = float(rel_row["hk_confidence_eps"])
+            stats = json.loads(rel_row["coop_stats_json"])
+            stats["total_trades"] = int(stats.get("total_trades", 0)) + 1
+
+            if not self.omega.omega_d2_trust_and_parochialism:
+                new_tau_01 = 0.50
+                s_ijt = 0.0
+            else:
+                if not trade_approved:
+                    # Contract rejection or breach penalty
+                    s_ijt = -0.65 if consent_decision == "REJECT" else -0.35
+                    stats["defections_suffered"] = (
+                        int(stats.get("defections_suffered", 0)) + 1
+                    )
+                else:
+                    stats["successful_coops"] = (
+                        int(stats.get("successful_coops", 0)) + 1
+                    )
+                    ineq_ratio = max(0.0, partner_surplus_x - own_surplus_x) / (
+                        abs(own_surplus_x) + abs(partner_surplus_x) + 1.0
+                    )
+                    raw_fairness = (
+                        self.trust_spec.trade_fairness_baseline_gamma
+                        - alpha_i * ineq_ratio
+                        - self.trust_spec.kkt_weight_lambda * kkt_gouging_index
+                    )
+                    s_ijt = math.tanh(raw_fairness)
+
+                if s_ijt >= 0.0:
+                    new_tau_01 = tau_01 + self.trust_spec.slovic_eta_pos * s_ijt * (
+                        1.0 - tau_01
+                    )
+                    intimacy = min(1.0, intimacy + 0.06 * s_ijt)
+                    if self.omega.omega_d3_contagion_and_polarization:
+                        hk_eps = min(
+                            1.0,
+                            hk_eps + self.contagion_spec.hk_trust_inc_gamma * s_ijt,
+                        )
+                else:
+                    new_tau_01 = (
+                        tau_01 + self.trust_spec.slovic_eta_neg * s_ijt * tau_01
+                    )
+                    intimacy = max(-1.0, intimacy + 0.10 * s_ijt)
+                    if self.omega.omega_d3_contagion_and_polarization:
+                        hk_eps = max(
+                            0.12,
+                            hk_eps
+                            - self.contagion_spec.hk_distrust_dec_gamma * abs(s_ijt),
+                        )
+
+                new_tau_01 = round(max(0.02, min(0.98, new_tau_01)), 4)
+
+            new_tau_signed = round(2.0 * new_tau_01 - 1.0, 4)
+            conn.execute(
+                """
+                UPDATE relational_edges
+                SET trust_tau_01 = ?,
+                    trust_tau = ?,
+                    intimacy_alpha = ?,
+                    interaction_count_n = ?,
+                    hk_confidence_eps = ?,
+                    coop_stats_json = ?
+                WHERE owner_id = ? AND target_id = ?;
+                """,
+                (
+                    new_tau_01,
+                    new_tau_signed,
+                    round(intimacy, 4),
+                    n_count,
+                    round(hk_eps, 4),
+                    json.dumps(stats),
+                    owner_id,
+                    partner_id,
+                ),
             )
-        if selected:
-            self._conn.commit()
 
-        return selected
-
-    def get_tms_competence_directory(
-        self, domain: ExpertiseDomain
-    ) -> List[TMSPeerCompetenceRecord]:
-        cur = self._conn.cursor()
-        rows = cur.execute(
-            """
-            SELECT owner_id, target_id, domain, alpha_success, beta_failure, last_queried_tick
-            FROM tms_directory
-            WHERE owner_id = ? AND domain = ?
-            """,
-            (self.owner_id, domain.value),
-        ).fetchall()
-        return [
-            TMSPeerCompetenceRecord(
-                owner_id=r["owner_id"],
-                target_id=r["target_id"],
-                domain=ExpertiseDomain(r["domain"]),
-                alpha_success=float(r["alpha_success"]),
-                beta_failure=float(r["beta_failure"]),
-                last_queried_tick=int(r["last_queried_tick"]),
+            # Update Hebbian trace
+            conn.execute(
+                "UPDATE agents_internal SET hebbian_vec_json = ? WHERE agent_id = ?;",
+                (json.dumps([round(float(x), 4) for x in updated_hebbian[:6]]), owner_id),
             )
-            for r in rows
-        ]
 
-    def update_tms_peer_belief(
+            # Ebbinghaus-McGaugh Encoding Salience S_enc(m)
+            arousal_a = float(pad.get("arousal", 0.3))
+            s_enc = round(
+                1.0 + 1.2 * arousal_a + 0.8 * abs(rpe_magnitude) + 0.6 * abs(s_ijt), 4
+            )
+            mem_id = f"mem_{tick:03d}_{uuid.uuid4().hex[:8]}"
+            conn.execute(
+                """
+                INSERT INTO stm_episodic VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?);
+                """,
+                (
+                    mem_id,
+                    owner_id,
+                    tick,
+                    partner_id,
+                    consent_decision,
+                    action_category,
+                    internal_thought,
+                    verbal_message,
+                    s_enc,
+                    round(abs(rpe_magnitude), 4),
+                    json.dumps(pad),
+                ),
+            )
+
+            # LTM Consolidation Gate (S_enc >= 2.1)
+            if s_enc >= 2.10:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO ltm_episodic VALUES (?, ?, ?, ?, ?, ?, 1);
+                    """,
+                    (
+                        f"ltm_{mem_id}",
+                        owner_id,
+                        tick,
+                        partner_id,
+                        f"Tick {tick} w/ {partner_id} ({consent_decision}): {verbal_message[:80]}",
+                        s_enc,
+                    ),
+                )
+            conn.commit()
+            return new_tau_01
+
+    def step_macro_trust_tiers(
         self,
-        target_id: str,
-        domain: ExpertiseDomain,
-        outcome_quality_y: float,
+        delta_gini: float,
+        delta_theil_b: float,
+        pg_compliance_rate: float,
+        delta_mean_scarcity_f: float,
+        universal_transfer_share_phi: float,
+        fair_audit_rate: float = 1.0,
+    ) -> Tuple[float, float]:
+        """
+        Updates Level-2 Generalized Social Trust T_bar_{soc,t+1} (5-driver Alesina & La Ferrara law)
+        and Level-3 Institutional Trust T_{inst,t+1} (Rothstein & Uslaner universalism law).
+        """
+        if not self.omega.omega_d2_trust_and_parochialism:
+            self.generalized_social_trust = 0.50
+            self.institutional_trust = 0.50
+            return (0.50, 0.50)
+
+        prev_inst = self.institutional_trust
+        # Universalism (phi >= 0.5) builds institutional trust; heavy means-testing stigma erodes it
+        univ_signal = 0.04 * (universal_transfer_share_phi - 0.45) + 0.02 * (
+            fair_audit_rate - 0.50
+        )
+        new_inst = max(0.05, min(0.95, prev_inst + univ_signal - 0.15 * max(0.0, delta_mean_scarcity_f)))
+        delta_inst = new_inst - prev_inst
+        self.institutional_trust = round(new_inst, 4)
+
+        cr_ref = 0.77
+        # Anchor gently toward baseline (0.58) while rising inequality & scarcity erode trust
+        mean_rev = 0.15 * (
+            self.trust_spec.initial_generalized_trust - self.generalized_social_trust
+        )
+        delta_tsoc = (
+            mean_rev
+            - self.trust_spec.gini_trust_sensitivity_beta * max(0.0, delta_gini)
+            - self.trust_spec.theil_trust_sensitivity_beta * max(0.0, delta_theil_b)
+            + self.trust_spec.pg_compliance_trust_beta * (pg_compliance_rate - cr_ref)
+            - self.trust_spec.scarcity_trust_beta * max(0.0, delta_mean_scarcity_f)
+            + self.trust_spec.inst_trust_spillover_beta * delta_inst
+        )
+        self.generalized_social_trust = round(
+            max(0.05, min(0.95, self.generalized_social_trust + delta_tsoc)), 4
+        )
+        return (self.generalized_social_trust, self.institutional_trust)
+
+    def record_inference_telemetry(
+        self,
         tick: int,
-    ) -> TMSPeerCompetenceRecord:
-        """
-        Bayesian Beta-Bernoulli conjugate update:
-            alpha^{(t+1)} = alpha^{(t)} + y
-            beta^{(t+1)}  = beta^{(t)} + (1 - y)
-        """
-        y = max(0.0, min(1.0, float(outcome_quality_y)))
-        cur = self._conn.cursor()
-        row = cur.execute(
-            """
-            SELECT alpha_success, beta_failure FROM tms_directory
-            WHERE owner_id = ? AND target_id = ? AND domain = ?
-            """,
-            (self.owner_id, target_id, domain.value),
-        ).fetchone()
-        alpha_new = (float(row["alpha_success"]) if row else 2.0) + y
-        beta_new = (float(row["beta_failure"]) if row else 2.0) + (1.0 - y)
-        cur.execute(
-            """
-            INSERT OR REPLACE INTO tms_directory
-            (owner_id, target_id, domain, alpha_success, beta_failure, last_queried_tick)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (self.owner_id, target_id, domain.value, alpha_new, beta_new, tick),
-        )
-        self._conn.commit()
-        return TMSPeerCompetenceRecord(
-            owner_id=self.owner_id,
-            target_id=target_id,
-            domain=domain,
-            alpha_success=alpha_new,
-            beta_failure=beta_new,
-            last_queried_tick=tick,
-        )
+        agent_id: str,
+        partner_id: Optional[str],
+        wave: int,
+        financial_stress: float,
+        dissonance_score: float,
+        yerkes_dodson_beta: float,
+        mean_shannon_entropy: float,
+        tms_triggered: bool,
+        attn_telemetry: Dict[str, float],
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO inference_telemetry VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                );
+                """,
+                (
+                    tick,
+                    agent_id,
+                    partner_id,
+                    wave,
+                    round(financial_stress, 4),
+                    round(dissonance_score, 4),
+                    round(yerkes_dodson_beta, 4),
+                    round(mean_shannon_entropy, 4),
+                    int(tms_triggered),
+                    round(float(attn_telemetry.get("SPAN_DRIVES_AND_FINANCE", 0.0)), 4),
+                    round(float(attn_telemetry.get("SPAN_PEER_MEMORY", 0.0)), 4),
+                    round(float(attn_telemetry.get("SPAN_INCOMING_MSG", 0.0)), 4),
+                    round(float(attn_telemetry.get("SPAN_SINK", 0.0)), 4),
+                ),
+            )
+            conn.commit()
