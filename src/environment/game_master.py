@@ -19,9 +19,16 @@ from src.core.contracts import (
 
 class AccountingAndLawEngine:
     """
-    M8 & M9: 100% Deterministic Stock-Flow Consistent (SFC) Game Master,
-    Two-Asset HANK Balance Sheet Manager, 4-Crisis Shock Generator,
-    and Saez / Fehr-Gächter / Ostrom Fiscal & Legal State Engine.
+    M8 & M9: Remediated Stock-Flow Consistent (SFC) Game Master.
+    Implements Reviewer #2 Required Mechanics M1 through M13:
+      - M1: Explicit CRRA Period Utility u_{i,t} & Cumulative Discounted Payoff U_i.
+      - M2: Idiosyncratic shock exposure e_i in [0, 1] per agent.
+      - M3: Contractual periodic obligations R_{i,t} & default penalty phi(default).
+      - M4: Two-Asset HANK budget constraint with borrowing limit b_bar and wedge kappa.
+      - M5: Endogenous market-clearing price adjustment p_{t+1} = p_t * [1 + phi*(D_t - S_t)/(D_t + S_t)].
+      - M7: Latent macro state theta_t in {-1, +1} & agent-specific noisy private signals
+            theta_tilde_{i,t} = theta_t + N(0, sigma_i^2) so TMS expert advice carries real value of information.
+      - M13: Optional seed-based permutation of agent identities across endowments.
     """
 
     def __init__(self, db_path: str, config: SimulationConfig) -> None:
@@ -34,10 +41,17 @@ class AccountingAndLawEngine:
         self.rng = random.Random(config.random_seed)
 
         self.initial_money_supply_m0: float = 0.0
+        self.private_signals_theta_tilde: Dict[str, float] = {}
+        self.tick_order_flow: Dict[str, Dict[str, float]] = {
+            "CONSUMABLE_NECESSITY": {"buy": 0.0, "sell": 0.0},
+            "PRODUCTIVE_CAPITAL_ASSET": {"buy": 0.0, "sell": 0.0},
+        }
+
         self.macro_state = MacroRegimeState(
             tick=0,
             active_crisis=self.hank_spec.active_crisis,
             crisis_intensity_s=0.0,
+            latent_macro_state_theta=1.0,
             consumable_tfp_ac=self.hank_spec.prod_tfp_baseline_ac,
             reference_consumable_price_pc=self.hank_spec.reference_consumable_price_pc,
             reference_capital_price_qk=self.hank_spec.reference_capital_price_qk,
@@ -85,9 +99,13 @@ class AccountingAndLawEngine:
                     credit_score REAL NOT NULL DEFAULT 720.0,
                     inventory_json TEXT NOT NULL,
                     base_wage REAL NOT NULL,
+                    periodic_obligation_r REAL NOT NULL DEFAULT 6.0,
+                    shock_exposure_e REAL NOT NULL DEFAULT 0.50,
                     base_consumable_prod_q REAL NOT NULL DEFAULT 0.0,
                     last_disposable_income REAL NOT NULL DEFAULT 0.0,
                     last_consumption_exp REAL NOT NULL DEFAULT 0.0,
+                    last_period_utility_u REAL NOT NULL DEFAULT 0.0,
+                    cumulative_utility_u REAL NOT NULL DEFAULT 0.0,
                     prior_violations_count INTEGER NOT NULL DEFAULT 0,
                     last_sanction_points INTEGER NOT NULL DEFAULT 0,
                     legal_status TEXT NOT NULL DEFAULT 'LAW_ABIDING'
@@ -126,6 +144,7 @@ class AccountingAndLawEngine:
                     tick INTEGER NOT NULL,
                     agent_id TEXT NOT NULL,
                     gross_income REAL NOT NULL,
+                    obligation_paid_r REAL NOT NULL,
                     saez_income_tax REAL NOT NULL,
                     wealth_tax REAL NOT NULL,
                     ubi_and_targeted_transfer REAL NOT NULL,
@@ -134,12 +153,19 @@ class AccountingAndLawEngine:
                     audited INTEGER NOT NULL,
                     ostrom_sanction_points INTEGER NOT NULL,
                     sanction_penalty_cash REAL NOT NULL,
+                    period_utility_u REAL NOT NULL,
                     PRIMARY KEY (tick, agent_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS macro_timeseries_log (
                     tick INTEGER PRIMARY KEY,
                     active_crisis TEXT NOT NULL,
+                    decision_mode TEXT NOT NULL,
+                    state_channel TEXT NOT NULL,
+                    steering_method TEXT NOT NULL,
+                    llm_valid_rate REAL NOT NULL,
+                    action_diversity_entropy REAL NOT NULL,
+                    mean_realized_utility_u REAL NOT NULL,
                     trust_index REAL NOT NULL,
                     generalized_trust REAL NOT NULL,
                     institutional_trust REAL NOT NULL,
@@ -147,22 +173,23 @@ class AccountingAndLawEngine:
                     income_gini REAL NOT NULL,
                     htm_share REAL NOT NULL,
                     realized_mpc REAL NOT NULL,
+                    mpc_low_liq REAL NOT NULL,
+                    mpc_high_liq REAL NOT NULL,
                     distress_sale_ratio REAL NOT NULL,
-                    scarcity_cohen_d REAL NOT NULL,
                     avg_food_price REAL NOT NULL,
                     avg_capital_price REAL NOT NULL,
                     trade_modularity_q REAL NOT NULL,
                     price_dispersion_r REAL NOT NULL,
                     unfairness_rejection_rate REAL NOT NULL,
                     cumul_volume REAL NOT NULL,
-                    affective_sync_asi REAL NOT NULL,
-                    opinion_bimodality_bc REAL NOT NULL,
+                    opinion_dispersion_std REAL NOT NULL,
                     cascade_share REAL NOT NULL,
                     pg_provision_rate REAL NOT NULL,
                     free_rider_share REAL NOT NULL,
                     public_treasury REAL NOT NULL,
                     total_sanction_points INTEGER NOT NULL,
                     tms_queries INTEGER NOT NULL,
+                    tms_auroc REAL NOT NULL,
                     conservation_error REAL NOT NULL
                 );
                 """
@@ -183,10 +210,12 @@ class AccountingAndLawEngine:
                         INSERT INTO agents_external_ledger (
                             agent_id, occupation_role, wage_tier, liquid_wealth_cash,
                             credit_limit_b_bar, credit_score, inventory_json,
-                            base_wage, base_consumable_prod_q, last_disposable_income,
-                            last_consumption_exp, prior_violations_count,
+                            base_wage, periodic_obligation_r, shock_exposure_e,
+                            base_consumable_prod_q, last_disposable_income,
+                            last_consumption_exp, last_period_utility_u,
+                            cumulative_utility_u, prior_violations_count,
                             last_sanction_points, legal_status
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'LAW_ABIDING');
+                        ) VALUES (?, ?, ?, ?, ?, 720.0, ?, ?, ?, ?, ?, ?, ?, 0.0, 0.0, 0, 0, 'LAW_ABIDING');
                         """,
                         (
                             ag.agent_id,
@@ -194,11 +223,12 @@ class AccountingAndLawEngine:
                             ag.wage_tier,
                             float(ag.liquid_wealth_cash),
                             float(b_bar),
-                            720.0,
                             json.dumps(inv_map),
                             float(ag.base_income_wage),
+                            float(ag.periodic_obligation_r),
+                            float(ag.shock_exposure_e),
                             float(ag.base_consumable_prod_q),
-                            float(ag.base_income_wage),
+                            float(ag.base_income_wage - ag.periodic_obligation_r),
                             float(self.hank_spec.reference_consumable_price_pc),
                         ),
                     )
@@ -216,15 +246,16 @@ class AccountingAndLawEngine:
                     "INSERT INTO macro_institutions VALUES ('AggregateFirmSector', ?, ?);",
                     (
                         float(self.fiscal_spec.initial_firm_sector_cash),
-                        json.dumps({"role": "Production_Wages_and_Capital_Book"}),
+                        json.dumps({"role": "Production_Wages_Obligations_and_Capital_Book"}),
                     ),
                 )
             conn.commit()
 
         self.initial_money_supply_m0 = self._compute_current_total_money()
+        self._generate_latent_signals_for_tick(tick=0)
 
     # ========================================================================
-    # STOCK-FLOW CONSISTENT (SFC) CONSERVATION VERIFICATION
+    # STOCK-FLOW CONSISTENT (SFC) CONSERVATION & LEDGER QUERIES
     # ========================================================================
 
     def _compute_current_total_money(self, conn: Optional[sqlite3.Connection] = None) -> float:
@@ -245,8 +276,7 @@ class AccountingAndLawEngine:
                 conn.close()
 
     def get_conservation_error(self, conn: Optional[sqlite3.Connection] = None) -> float:
-        total_now = self._compute_current_total_money(conn)
-        return abs(total_now - self.initial_money_supply_m0)
+        return abs(self._compute_current_total_money(conn) - self.initial_money_supply_m0)
 
     def get_public_treasury_balance(self) -> float:
         with self._connect() as conn:
@@ -283,7 +313,52 @@ class AccountingAndLawEngine:
         return [self.get_agent_ledger(r["agent_id"]) for r in rows]
 
     # ========================================================================
-    # PILLAR B: KAPLAN-MOLL-VIOLANTE (2018) CONVEX ADJUSTMENT COST & SCARCITY
+    # M7: LATENT MACRO STATE (theta_t) & AGENT-SPECIFIC NOISY SIGNALS
+    # ========================================================================
+
+    def _generate_latent_signals_for_tick(self, tick: int) -> None:
+        """
+        Generates true latent state theta_t in {-1.0, +1.0} (representing whether
+        upcoming capital returns/supply conditions are favorable or adverse) and
+        draws each agent's private noisy observation theta_tilde_{i,t} = theta_t + N(0, sigma_i^2).
+        """
+        in_crisis = (
+            self.hank_spec.active_crisis != "NONE"
+            and self.hank_spec.crisis_start_tick
+            <= tick
+            < self.hank_spec.crisis_start_tick + self.hank_spec.crisis_duration_ticks
+        )
+        theta_true = -1.0 if in_crisis else 1.0
+        self.macro_state.latent_macro_state_theta = theta_true
+
+        self.private_signals_theta_tilde.clear()
+        for ag in self.config.agents:
+            is_cap_specialist = ag.tms_specialty == "PRODUCTIVE_CAPITAL_ASSET"
+            sigma_i = (
+                self.hank_spec.latent_signal_specialist_sigma
+                if is_cap_specialist
+                else self.hank_spec.latent_signal_novice_sigma
+            )
+            noisy_obs = theta_true + self.rng.gauss(0.0, sigma_i)
+            self.private_signals_theta_tilde[ag.agent_id] = round(noisy_obs, 3)
+
+    def get_agent_private_signal(self, agent_id: str) -> Tuple[float, bool]:
+        """
+        Returns `(theta_tilde_{i,t}, is_high_noise_novice)`.
+        """
+        sig = float(self.private_signals_theta_tilde.get(agent_id, 0.0))
+        ag_cfg = next(
+            (a for a in self.config.agents if a.agent_id == agent_id), None
+        )
+        is_novice = (
+            ag_cfg.tms_specialty != "PRODUCTIVE_CAPITAL_ASSET"
+            if ag_cfg is not None
+            else True
+        )
+        return (sig, is_novice)
+
+    # ========================================================================
+    # KAPLAN-MOLL-VIOLANTE (2018) CONVEX ADJUSTMENT COST & SCARCITY
     # ========================================================================
 
     def compute_kmv_adjustment_cost(
@@ -314,17 +389,20 @@ class AccountingAndLawEngine:
 
         ledger = self.get_agent_ledger(agent_id)
         b_it = float(ledger["liquid_wealth_cash"])
+        obligation_r = float(ledger["periodic_obligation_r"])
         b_bar = float(ledger["credit_limit_b_bar"]) * self.macro_state.borrowing_limit_scale
         c_it = float(ledger["inventory"]["CONSUMABLE_NECESSITY"])
         c_min = self.hank_spec.subsistence_min_c
-        b_safe = self.hank_spec.safe_cash_buffer_b
+        b_safe = self.hank_spec.safe_cash_buffer_b + obligation_r
 
-        consumable_gap = max(0.0, c_min - c_it) / max(c_min, 1e-6)
+        c_safe = 2.0 * c_min
+        consumable_gap = max(0.0, c_safe - c_it) / max(c_safe, 1e-6)
         cash_gap = max(0.0, (b_safe - b_it) / max(b_safe - b_bar, 1e-6))
         f_it = max(0.0, min(1.0, 0.55 * consumable_gap + 0.45 * cash_gap))
 
         subsistence_cost = max(
-            1.0, self.macro_state.reference_consumable_price_pc * c_min
+            1.0,
+            self.macro_state.reference_consumable_price_pc * c_min + obligation_r,
         )
         liquidity_ratio = max(-4.0, min(8.0, b_it / subsistence_cost))
         beta_min = self.hank_spec.present_bias_beta_min
@@ -336,11 +414,19 @@ class AccountingAndLawEngine:
         return (float(f_it), float(beta_i), float(tilde_delta))
 
     # ========================================================================
-    # PILLAR B.3: PARAMETERIZED 4-CRISIS SHOCK ENGINE
+    # PARAMETERIZED 4-CRISIS SHOCK ENGINE & ENDOGENOUS PRICE CLEARING
     # ========================================================================
 
     def step_crisis_regime(self, tick: int) -> MacroRegimeState:
         self.macro_state.tick = tick
+        self._generate_latent_signals_for_tick(tick=tick)
+
+        # Reset intra-tick order flow counters
+        self.tick_order_flow = {
+            "CONSUMABLE_NECESSITY": {"buy": 0.0, "sell": 0.0},
+            "PRODUCTIVE_CAPITAL_ASSET": {"buy": 0.0, "sell": 0.0},
+        }
+
         crisis_type = self.hank_spec.active_crisis
         if not self.omega.omega_d1_scarcity_and_hank or crisis_type == "NONE":
             self.macro_state.crisis_intensity_s = 0.0
@@ -361,17 +447,11 @@ class AccountingAndLawEngine:
             self.macro_state.consumable_tfp_ac = round(
                 self.hank_spec.prod_tfp_baseline_ac * max(0.45, 1.0 - 0.55 * s_t), 4
             )
-            self.macro_state.reference_consumable_price_pc = round(
-                self.hank_spec.reference_consumable_price_pc * (1.0 + 0.65 * s_t), 2
-            )
         elif crisis_type == "ASYMMETRIC_UNEMPLOYMENT_SHOCK":
             pass
         elif crisis_type == "ASSET_VALUATION_CRASH":
             self.macro_state.capital_yield_rk = round(
                 self.hank_spec.capital_yield_rate_rk * max(0.15, 1.0 - 0.80 * s_t), 4
-            )
-            self.macro_state.reference_capital_price_qk = round(
-                self.hank_spec.reference_capital_price_qk * max(0.45, 1.0 - 0.50 * s_t), 2
             )
         elif crisis_type == "LIQUIDITY_CREDIT_CRUNCH":
             self.macro_state.borrowing_limit_scale = round(max(0.0, 1.0 - 0.95 * s_t), 4)
@@ -402,6 +482,12 @@ class AccountingAndLawEngine:
         unit_price = float(intent.unit_price)
         gross = round(qty * unit_price, 4)
 
+        # Record order-flow demand/supply intent for endogenous price formation (M5)
+        if intent.action_type == "BUY" and qty > 0:
+            self.tick_order_flow[item_id]["buy"] += qty
+        elif intent.action_type == "SELL" and qty > 0:
+            self.tick_order_flow[item_id]["sell"] += qty
+
         if intent.action_type == "HOLD_OR_WORK":
             return self._record_rejected_tx(
                 tx_id,
@@ -416,7 +502,7 @@ class AccountingAndLawEngine:
                 unit_price,
                 gross,
                 "NO_TRADE_REQUESTED",
-                "Initiator selected HOLD_OR_WORK instead of a bilateral trade.",
+                "Initiator selected HOLD_OR_WORK.",
                 kkt_gouging_index,
                 intent.is_distress_fire_sale,
             )
@@ -497,7 +583,7 @@ class AccountingAndLawEngine:
                         unit_price,
                         gross,
                         "LEGAL_RESTRICTION",
-                        "One of the parties is legally sanctioned/imprisoned.",
+                        "Party legally restricted.",
                         kkt_gouging_index,
                         intent.is_distress_fire_sale,
                     )
@@ -526,9 +612,17 @@ class AccountingAndLawEngine:
                         intent.is_distress_fire_sale,
                     )
 
-                kmv_cost = 0.0
+                seller_kmv_cost = 0.0
+                buyer_kmv_cost = 0.0
                 if item_id == "PRODUCTIVE_CAPITAL_ASSET":
-                    kmv_cost = self.compute_kmv_adjustment_cost(qty, seller_avail)
+                    buyer_avail_k = float(buyer_inv.get(item_id, 0.0))
+                    seller_kmv_cost = round(
+                        0.50 * self.compute_kmv_adjustment_cost(qty, seller_avail), 4
+                    )
+                    buyer_kmv_cost = round(
+                        0.50 * self.compute_kmv_adjustment_cost(qty, buyer_avail_k), 4
+                    )
+                kmv_cost = round(seller_kmv_cost + buyer_kmv_cost, 4)
 
                 buyer_cash = float(buyer_row["liquid_wealth_cash"])
                 b_bar = (
@@ -538,7 +632,7 @@ class AccountingAndLawEngine:
                     else 0.0
                 )
                 max_spendable = buyer_cash - b_bar
-                if max_spendable + 1e-9 < gross:
+                if max_spendable + 1e-9 < (gross + buyer_kmv_cost):
                     conn.rollback()
                     return self._record_rejected_tx(
                         tx_id,
@@ -553,7 +647,7 @@ class AccountingAndLawEngine:
                         unit_price,
                         gross,
                         "INSUFFICIENT_FUNDS",
-                        f"Buyer {buyer_id} max spendable is ${max_spendable:.2f} (cash=${buyer_cash:.2f}, limit=${b_bar:.2f}), needs ${gross:.2f}.",
+                        f"Buyer {buyer_id} spendable=${max_spendable:.2f} < cost=${gross + buyer_kmv_cost:.2f}.",
                         kkt_gouging_index,
                         intent.is_distress_fire_sale,
                     )
@@ -564,10 +658,11 @@ class AccountingAndLawEngine:
                     else 0.0
                 )
                 tax_withheld = round(gross * sales_tax_rate, 4)
-                kmv_cost = min(kmv_cost, round(gross - tax_withheld, 4))
-                seller_net = round(gross - tax_withheld - kmv_cost, 4)
+                seller_kmv_cost = min(seller_kmv_cost, round(gross - tax_withheld, 4))
+                kmv_cost = round(seller_kmv_cost + buyer_kmv_cost, 4)
+                seller_net = round(gross - tax_withheld - seller_kmv_cost, 4)
 
-                new_buyer_cash = round(buyer_cash - gross, 4)
+                new_buyer_cash = round(buyer_cash - gross - buyer_kmv_cost, 4)
                 new_seller_cash = round(
                     float(seller_row["liquid_wealth_cash"]) + seller_net, 4
                 )
@@ -615,19 +710,6 @@ class AccountingAndLawEngine:
 
                 sfc_err = self.get_conservation_error(conn)
                 assert sfc_err < 1e-6, f"SFC violation in trade {tx_id}: {sfc_err}"
-
-                if item_id == "CONSUMABLE_NECESSITY":
-                    self.macro_state.reference_consumable_price_pc = round(
-                        0.70 * self.macro_state.reference_consumable_price_pc
-                        + 0.30 * unit_price,
-                        2,
-                    )
-                else:
-                    self.macro_state.reference_capital_price_qk = round(
-                        0.65 * self.macro_state.reference_capital_price_qk
-                        + 0.35 * unit_price,
-                        2,
-                    )
 
                 conn.execute(
                     """
@@ -680,7 +762,7 @@ class AccountingAndLawEngine:
                 return GameMasterVerdict(
                     status="APPROVED",
                     error_code=None,
-                    diagnostic_message=f"APPROVED: {buyer_id} bought {qty:.1f} {item_id} from {seller_id} @ ${unit_price:.2f} (Tax=${tax_withheld:.2f}, KMV=${kmv_cost:.2f}).",
+                    diagnostic_message=f"APPROVED: {buyer_id} bought {qty:.1f} {item_id} from {seller_id} @ ${unit_price:.2f}.",
                     ledger_receipt=receipt,
                 )
             except Exception:
@@ -742,7 +824,7 @@ class AccountingAndLawEngine:
         )
 
     # ========================================================================
-    # PILLAR B & E: END-OF-TICK HANK PRODUCTION, METABOLISM, SAEZ TAX & OSTROM
+    # END-OF-TICK HANK PRODUCTION, OBLIGATIONS R_{i,t}, UTILITY & OSTROM
     # ========================================================================
 
     def execute_end_of_tick_upkeep_and_fiscal_state(
@@ -756,7 +838,6 @@ class AccountingAndLawEngine:
 
         s_t = self.macro_state.crisis_intensity_s
         crisis_type = self.hank_spec.active_crisis
-        tier_weights = {"LOW": 1.8, "MID": 1.0, "HIGH": 0.3}
 
         saez_top_rate = (
             self.fiscal_spec.compute_saez_optimal_top_rate()
@@ -780,12 +861,14 @@ class AccountingAndLawEngine:
 
         upkeep_report: Dict[str, Any] = {
             "starved_agents": [],
+            "defaulted_agents": [],
             "harvested_units": {},
             "sanctioned_agents": {},
             "pg_provision_rate": 1.0,
             "free_rider_share": 0.0,
             "total_sanction_points": 0,
             "saez_top_rate": saez_top_rate,
+            "mean_period_utility_u": 0.0,
         }
 
         with self._connect() as conn:
@@ -808,7 +891,8 @@ class AccountingAndLawEngine:
                 )
 
                 agent_state_work: Dict[str, Dict[str, Any]] = {}
-                total_taxes_collected = 0.0
+                total_supply_harvested = 0.0
+                total_demand_eaten = 0.0
 
                 for r in rows:
                     aid = r["agent_id"]
@@ -817,15 +901,17 @@ class AccountingAndLawEngine:
                     a_qty = float(inv.get("PRODUCTIVE_CAPITAL_ASSET", 0.0))
                     b_cash = float(r["liquid_wealth_cash"])
                     base_w = float(r["base_wage"])
+                    obligation_r = float(r["periodic_obligation_r"])
+                    exposure_e = float(r["shock_exposure_e"])
                     base_q = float(r["base_consumable_prod_q"])
-                    w_tier = r["wage_tier"]
 
-                    # 1. Agricultural / Consumable Production Q_{i,t}
+                    # 1. Consumable Production Q_{i,t}
                     if base_q > 0.0:
                         q_harvest = self.macro_state.consumable_tfp_ac * (
                             base_q + self.hank_spec.prod_capital_elasticity_eta * a_qty
                         )
                         c_qty = round(c_qty + q_harvest, 4)
+                        total_supply_harvested += q_harvest
                         upkeep_report["harvested_units"][aid] = round(q_harvest, 2)
 
                     # 2. Metabolic Depreciation (1.0 unit of CONSUMABLE_NECESSITY)
@@ -834,28 +920,40 @@ class AccountingAndLawEngine:
                         if self.omega.omega_d1_scarcity_and_hank
                         else 0.0
                     )
+                    ate_qty = 0.0
                     ate_full = True
                     if c_min > 0.0:
+                        total_demand_eaten += c_min
                         if c_qty >= c_min:
                             c_qty = round(c_qty - c_min, 4)
+                            ate_qty = c_min
                         else:
+                            ate_qty = c_qty
                             c_qty = 0.0
                             ate_full = False
                             upkeep_report["starved_agents"].append(aid)
+                    else:
+                        ate_qty = 1.0
 
-                    # 3. Wage Income + Asymmetric Unemployment Shock + Capital Dividends + Interest
+                    # 3. Wage Income (with heterogeneous shock exposure e_i * s_t) + Capital Dividends
                     wage_mult = 1.0
                     if (
                         self.omega.omega_d1_scarcity_and_hank
-                        and crisis_type == "ASYMMETRIC_UNEMPLOYMENT_SHOCK"
+                        and crisis_type in ("ASYMMETRIC_UNEMPLOYMENT_SHOCK", "STAGFLATION_SUBSISTENCE_SHOCK")
                     ):
-                        theta_k = tier_weights.get(w_tier, 1.0)
-                        wage_mult = max(0.25, 1.0 - theta_k * 0.22 * s_t)
+                        wage_mult = max(0.30, 1.0 - 0.32 * exposure_e * s_t)
                     realized_wage = round(base_w * wage_mult, 4)
 
+                    # Latent state theta_t modulates capital dividend yield
+                    theta_mult = (
+                        1.15
+                        if self.macro_state.latent_macro_state_theta > 0
+                        else 0.65
+                    )
                     capital_div = round(
                         a_qty
                         * self.macro_state.capital_yield_rk
+                        * theta_mult
                         * self.macro_state.reference_capital_price_qk,
                         4,
                     )
@@ -872,7 +970,12 @@ class AccountingAndLawEngine:
                     b_cash = round(b_cash + gross_income, 4)
                     firm_cash = round(firm_cash - gross_income, 4)
 
-                    # 4. Saez (2001) Three-Bracket Progressive Income & Wealth Tax
+                    # 4. Contractual Periodic Obligation R_{i,t} (M3: housing/debt service)
+                    ob_paid = round(obligation_r, 4) if self.omega.omega_d1_scarcity_and_hank else 0.0
+                    b_cash = round(b_cash - ob_paid, 4)
+                    firm_cash = round(firm_cash + ob_paid, 4)
+
+                    # 5. Saez (2001) Progressive Income & Wealth Tax
                     saez_tax = 0.0
                     w_tax = 0.0
                     evaded_amount = 0.0
@@ -907,9 +1010,6 @@ class AccountingAndLawEngine:
                         total_agent_tax = round(saez_tax + w_tax, 4)
                         b_cash = round(b_cash - total_agent_tax, 4)
                         treasury_cash = round(treasury_cash + total_agent_tax, 4)
-                        total_taxes_collected = round(
-                            total_taxes_collected + total_agent_tax, 4
-                        )
 
                     b_bar = (
                         float(r["credit_limit_b_bar"])
@@ -923,8 +1023,8 @@ class AccountingAndLawEngine:
                     b_gap = (
                         max(
                             0.0,
-                            (self.hank_spec.safe_cash_buffer_b - b_cash)
-                            / max(self.hank_spec.safe_cash_buffer_b - b_bar, 1.0),
+                            (self.hank_spec.safe_cash_buffer_b + ob_paid - b_cash)
+                            / max(self.hank_spec.safe_cash_buffer_b + ob_paid - b_bar, 1.0),
                         )
                         if self.omega.omega_d1_scarcity_and_hank
                         else 0.0
@@ -936,15 +1036,18 @@ class AccountingAndLawEngine:
                         "c_qty": c_qty,
                         "a_qty": a_qty,
                         "b_cash": b_cash,
+                        "b_bar": b_bar,
+                        "ate_qty": ate_qty,
                         "ate_full": ate_full,
                         "gross_income": gross_income,
+                        "ob_paid": ob_paid,
                         "saez_tax": saez_tax,
                         "w_tax": w_tax,
                         "evaded_amount": evaded_amount,
                         "f_it": f_it,
                     }
 
-                # 5. Redistributive Transfers d_{i,t} (UBI + Targeted Scarcity Relief)
+                # 6. Redistributive Transfers d_{i,t} (UBI + Targeted Scarcity Relief)
                 distributable_pool = (
                     round(0.45 * max(0.0, treasury_cash - 40.0), 4)
                     if self.omega.omega_d4_fiscal_and_legal_state
@@ -973,7 +1076,7 @@ class AccountingAndLawEngine:
                     treasury_cash = round(treasury_cash - d_it, 4)
                     st["transfer_d"] = d_it
 
-                # 6. Fehr & Gächter (2000) Public Goods & Ostrom Graduated Sanctions
+                # 7. Fehr & Gächter (2000) Public Goods & Ostrom Graduated Sanctions
                 total_pg_contrib = 0.0
                 total_ideal_endowment = 0.0
                 free_riders_count = 0
@@ -991,7 +1094,7 @@ class AccountingAndLawEngine:
                     if not self.omega.omega_d4_fiscal_and_legal_state:
                         g_it = 0.0
                     else:
-                        if aid in pg_contributions:
+                        if aid in pg_contributions and pg_contributions[aid] > 0.0:
                             g_it = max(
                                 0.0, min(endowment_e, float(pg_contributions[aid]))
                             )
@@ -1033,6 +1136,9 @@ class AccountingAndLawEngine:
                 surplus_from_firm = round(actual_pg_paid - total_pg_contrib, 4)
                 treasury_cash = round(treasury_cash - total_pg_contrib, 4)
                 firm_cash = round(firm_cash - surplus_from_firm, 4)
+
+                utilities_this_tick: List[float] = []
+                sigma_crra = self.hank_spec.crra_risk_aversion_sigma
 
                 for aid, st in agent_state_work.items():
                     st["b_cash"] = round(st["b_cash"] + per_agent_pg_div, 4)
@@ -1094,8 +1200,51 @@ class AccountingAndLawEngine:
                             }
                             upkeep_report["total_sanction_points"] += p_points
 
+                    # M1 & M3: Compute Realized CRRA Period Utility u_{i,t} & Default Penalty
+                    defaulted = (not st["ate_full"]) or (st["b_cash"] < st["b_bar"])
+                    if defaulted:
+                        upkeep_report["defaulted_agents"].append(aid)
+                    eff_c = max(
+                        0.20,
+                        st["ate_qty"]
+                        + 0.10
+                        * max(0.0, st["b_cash"])
+                        / max(1.0, self.macro_state.reference_consumable_price_pc),
+                    )
+                    if abs(sigma_crra - 1.0) < 1e-4:
+                        crra_u = math.log(eff_c)
+                    else:
+                        crra_u = ((eff_c ** (1.0 - sigma_crra)) - 1.0) / (
+                            1.0 - sigma_crra
+                        )
+                    period_u = round(
+                        crra_u
+                        - (
+                            self.hank_spec.default_utility_penalty_phi
+                            if defaulted
+                            else 0.0
+                        ),
+                        4,
+                    )
+                    utilities_this_tick.append(period_u)
+                    prev_cum_u = float(st["row"]["cumulative_utility_u"])
+                    disc_factor = self.hank_spec.long_run_discount_delta ** tick
+                    new_cum_u = round(prev_cum_u + disc_factor * period_u, 4)
+
+                    old_cs = float(st["row"]["credit_score"])
+                    new_cs = max(
+                        300.0,
+                        min(
+                            850.0,
+                            old_cs
+                            + (4.0 if not defaulted else -22.0)
+                            - 4.0 * p_points,
+                        ),
+                    )
+
                     disposable_y = round(
                         st["gross_income"]
+                        - st["ob_paid"]
                         - st["saez_tax"]
                         - st["w_tax"]
                         + st["transfer_d"]
@@ -1114,16 +1263,22 @@ class AccountingAndLawEngine:
                         """
                         UPDATE agents_external_ledger
                         SET liquid_wealth_cash = ?,
+                            credit_score = ?,
                             inventory_json = ?,
                             last_disposable_income = ?,
+                            last_period_utility_u = ?,
+                            cumulative_utility_u = ?,
                             prior_violations_count = ?,
                             last_sanction_points = ?
                         WHERE agent_id = ?;
                         """,
                         (
                             st["b_cash"],
+                            round(new_cs, 1),
                             new_inv_json,
                             disposable_y,
+                            period_u,
+                            new_cum_u,
                             prior_v,
                             p_points,
                             aid,
@@ -1132,13 +1287,14 @@ class AccountingAndLawEngine:
                     conn.execute(
                         """
                         INSERT OR REPLACE INTO fiscal_and_commons_log VALUES (
-                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                         );
                         """,
                         (
                             tick,
                             aid,
                             st["gross_income"],
+                            st["ob_paid"],
                             st["saez_tax"],
                             st["w_tax"],
                             st["transfer_d"],
@@ -1147,6 +1303,7 @@ class AccountingAndLawEngine:
                             audited,
                             p_points,
                             penalty_cash,
+                            period_u,
                         ),
                     )
 
@@ -1163,6 +1320,27 @@ class AccountingAndLawEngine:
                 assert sfc_err < 1e-6, f"SFC violation in upkeep tick {tick}: {sfc_err}"
                 conn.commit()
 
+                # M5: Endogenous Market-Clearing Price Formation from Order Flow & Supply/Demand
+                phi_clear = self.hank_spec.market_clearing_elasticity_phi
+                c_buy = self.tick_order_flow["CONSUMABLE_NECESSITY"]["buy"] + total_demand_eaten
+                c_sell = self.tick_order_flow["CONSUMABLE_NECESSITY"]["sell"] + max(0.5, total_supply_harvested)
+                excess_c = (c_buy - c_sell) / max(1.0, c_buy + c_sell)
+                self.macro_state.reference_consumable_price_pc = round(
+                    self.macro_state.reference_consumable_price_pc
+                    * max(0.80, min(1.30, 1.0 + phi_clear * excess_c)),
+                    2,
+                )
+
+                k_buy = self.tick_order_flow["PRODUCTIVE_CAPITAL_ASSET"]["buy"]
+                k_sell = self.tick_order_flow["PRODUCTIVE_CAPITAL_ASSET"]["sell"]
+                if k_buy + k_sell > 0:
+                    excess_k = (k_buy - k_sell) / max(1.0, k_buy + k_sell)
+                    self.macro_state.reference_capital_price_qk = round(
+                        self.macro_state.reference_capital_price_qk
+                        * max(0.75, min(1.25, 1.0 + phi_clear * excess_k)),
+                        2,
+                    )
+
                 self.macro_state.public_treasury_cash = round(treasury_cash, 4)
                 self.macro_state.firm_sector_cash = round(firm_cash, 4)
                 upkeep_report["pg_provision_rate"] = round(
@@ -1170,6 +1348,9 @@ class AccountingAndLawEngine:
                 )
                 upkeep_report["free_rider_share"] = round(
                     free_riders_count / max(1, n_agents), 4
+                )
+                upkeep_report["mean_period_utility_u"] = round(
+                    sum(utilities_this_tick) / max(1, len(utilities_this_tick)), 4
                 )
                 return upkeep_report
             except Exception:

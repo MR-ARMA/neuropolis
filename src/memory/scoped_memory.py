@@ -6,11 +6,7 @@ import sqlite3
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from src.core.contracts import (
-    AgentSeedConfig,
-    SimulationConfig,
-    normalize_item_id,
-)
+from src.core.contracts import SimulationConfig
 
 
 class EpistemicIsolationViolationError(PermissionError):
@@ -44,8 +40,7 @@ class AhoCorasickEntityScanner:
         for aid in agent_ids:
             self._add_keyword(aid, aid)
             parts = aid.split("_")
-            if len(parts) >= 3:
-                # Also index given name alias (e.g., "Elena", "Viktor")
+            if len(parts) >= 2:
                 self._add_keyword(parts[-1], aid)
 
         queue: List[int] = []
@@ -81,7 +76,7 @@ class AhoCorasickEntityScanner:
 
 
 class ScopedAgentMemoryView:
-    """Cryptographically/logically bound memory handle enforcing WHERE owner_id = self.owner_id."""
+    """Logically bound memory handle enforcing WHERE owner_id = self.owner_id."""
 
     def __init__(self, memory_engine: "MultiTierScopedMemory", owner_id: str) -> None:
         self._engine = memory_engine
@@ -111,17 +106,10 @@ class ScopedAgentMemoryView:
 
 class MultiTierScopedMemory:
     """
-    M5: Multi-Tier Psychological, Relational & Opinion Memory Engine.
-    Implements:
-    - Tier 0: Baseline Personality, Fehr-Schmidt Table III (alpha_i, beta_i), Innate Anchor s_i.
-    - Tier 1 & 2: STM / LTM Episodic Buffers with Ebbinghaus-McGaugh Read-Time Retention R_m(Delta_t).
-    - 3-Tier Social Trust Architecture:
-        Level 1: Relational Trust tau_{ij,t} in [0, 1] (with Slovic negativity bias eta_- > eta_+)
-        Level 2: Generalized Social Trust T_bar_{soc,t} in [0, 1] (5-driver macro feedback)
-        Level 3: Institutional Trust T_{inst,t} in [0, 1]
-        Composite Effective Trust: T^{eff}_{ij,t} = omega_{ij,t} * tau_{ij,t} + (1 - omega_{ij,t}) * T_bar_{soc,t}
-    - Unified Opinion State: Innate anchor s_i, Expressed belief z_i(t), Adaptive HK confidence eps_{ij}(t),
-      and Centola-Macy complex contagion adoption state Y_{i,t}.
+    M5: Remediated Multi-Tier Psychological, Relational & Episodic Memory Engine.
+    - Enforces strict epistemic isolation (`ScopedAgentMemoryView`).
+    - Provides full episodic trade and message narratives to the prompt (Fixing Section 2.6).
+    - Records explicit `llm_valid` and `attention_measured` flags in `inference_telemetry`.
     """
 
     def __init__(self, db_path: str, config: SimulationConfig) -> None:
@@ -236,9 +224,10 @@ class MultiTierScopedMemory:
                     agent_id TEXT NOT NULL,
                     partner_id TEXT,
                     wave INTEGER NOT NULL DEFAULT 1,
+                    llm_valid INTEGER NOT NULL DEFAULT 1,
+                    attention_measured INTEGER NOT NULL DEFAULT 0,
                     financial_stress REAL NOT NULL,
-                    dissonance_score REAL NOT NULL,
-                    yerkes_dodson_beta REAL NOT NULL,
+                    easterbrook_beta REAL NOT NULL,
                     mean_shannon_entropy REAL NOT NULL,
                     tms_triggered INTEGER NOT NULL DEFAULT 0,
                     attn_mass_drives_finance REAL NOT NULL,
@@ -277,14 +266,12 @@ class MultiTierScopedMemory:
                         }
                     )
                     pad_json = json.dumps(
-                        {"valence": 0.10, "arousal": 0.30, "dominance": 0.50}
+                        {"valence": 0.10, "arousal": 0.45, "dominance": 0.50}
                     )
                     maslow_json = json.dumps(
                         {
                             "survival_satiety": 0.85,
                             "financial_safety": 0.70,
-                            "belonging": 0.60,
-                            "esteem_status": 0.60,
                         }
                     )
                     conn.execute(
@@ -303,11 +290,10 @@ class MultiTierScopedMemory:
                             float(ag.identity_rigidity),
                             float(ag.innate_opinion_anchor_s),
                             float(ag.innate_opinion_anchor_s),
-                            json.dumps([0.0] * 6),
+                            json.dumps([0.0] * 7),
                         ),
                     )
 
-                # Initialize directed relational edges & Bayesian TMS priors
                 for ag_i in self.config.agents:
                     for ag_j in self.config.agents:
                         if ag_i.agent_id == ag_j.agent_id:
@@ -360,14 +346,12 @@ class MultiTierScopedMemory:
                                 ag_j.agent_id,
                                 json.dumps(
                                     {
-                                        "perceived_honesty": init_tau_01,
-                                        "estimated_alpha_fs": ag_j.alpha_disadvantageous,
+                                        "perceived_reliability": init_tau_01,
                                     }
                                 ),
-                                f"{ag_j.agent_id} ({ag_j.occupation_role}): specialty in {ag_j.tms_specialty}.",
+                                f"Counterparty {ag_j.agent_id} ({ag_j.occupation_role}).",
                             ),
                         )
-                        # Initialize Beta-Bernoulli TMS expertise priors across both domains
                         for dom in ("CONSUMABLE_NECESSITY", "PRODUCTIVE_CAPITAL_ASSET"):
                             is_spec = ag_j.tms_specialty == dom
                             alpha_p = 6.0 if is_spec else 2.0
@@ -380,16 +364,7 @@ class MultiTierScopedMemory:
                             )
             conn.commit()
 
-    # ========================================================================
-    # COMPOSITE EFFECTIVE TRUST (T^{eff}_{ij,t}) & DUAL-PASS RETRIEVAL
-    # ========================================================================
-
     def compute_effective_trust(self, owner_id: str, target_id: str) -> float:
-        """
-        T^{eff}_{ij,t} = omega_{ij,t} * tau_{ij,t} + (1 - omega_{ij,t}) * T_bar_{soc,t}
-        where omega_{ij,t} = 1 - exp(-lambda_n * n_{ij,t}).
-        Clamped to 0.50 when Omega_D2 == False.
-        """
         if not self.omega.omega_d2_trust_and_parochialism:
             return 0.50
         with self._connect() as conn:
@@ -429,12 +404,6 @@ class MultiTierScopedMemory:
         incoming_texts: List[str],
         current_tick: int,
     ) -> Dict[str, Any]:
-        """
-        Executes Dual-Pass Scoped Memory Retrieval:
-        - Pass 1: Continuous self internal state + Direct Counterparty B relational row.
-        - Pass 2: Aho-Corasick scan over incoming_texts for mentioned third-party IDs C.
-        - Episodic Retrieval: Ranks STM memories by dynamic Ebbinghaus-McGaugh retention R_m(Delta_t) * S_enc(m).
-        """
         exclude = {owner_id}
         if partner_id:
             exclude.add(partner_id)
@@ -495,7 +464,6 @@ class MultiTierScopedMemory:
                     pmd["perceived_traits"] = json.loads(pmd["perceived_traits_json"])
                     scoped_peer_models[pmd["target_id"]] = pmd
 
-            # Ebbinghaus-McGaugh Dynamic Read-Time Retention R_m(Delta_t)
             stm_rows = conn.execute(
                 "SELECT * FROM stm_episodic WHERE owner_id = ?;", (owner_id,)
             ).fetchall()
@@ -517,7 +485,6 @@ class MultiTierScopedMemory:
             scored_memories.sort(key=lambda x: x[0], reverse=True)
             top_episodes = [item[1] for item in scored_memories[:4]]
 
-            # Rehearsal update on retrieved memories
             for ep in top_episodes:
                 conn.execute(
                     """
@@ -541,10 +508,6 @@ class MultiTierScopedMemory:
             "institutional_trust": self.institutional_trust,
         }
 
-    # ========================================================================
-    # PILLAR C: 3-TIER TRUST UPDATES (DYADIC, GENERALIZED & INSTITUTIONAL)
-    # ========================================================================
-
     def update_dyadic_trust_and_memory(
         self,
         tick: int,
@@ -561,10 +524,6 @@ class MultiTierScopedMemory:
         rpe_magnitude: float,
         updated_hebbian: List[float],
     ) -> float:
-        """
-        Computes Dyadic Net Fairness Signal S_{ij,t} and updates Level-1 Relational Trust tau_{ij,t+1}
-        via Slovic's Asymmetric Negativity-Biased rule, plus persists STM/LTM episodic records.
-        """
         with self._connect() as conn:
             int_row = conn.execute(
                 "SELECT fehr_schmidt_json, pad_mood_json FROM agents_internal WHERE agent_id = ?;",
@@ -600,7 +559,6 @@ class MultiTierScopedMemory:
                 s_ijt = 0.0
             else:
                 if not trade_approved:
-                    # Contract rejection or breach penalty
                     s_ijt = -0.65 if consent_decision == "REJECT" else -0.35
                     stats["defections_suffered"] = (
                         int(stats.get("defections_suffered", 0)) + 1
@@ -667,14 +625,15 @@ class MultiTierScopedMemory:
                 ),
             )
 
-            # Update Hebbian trace
             conn.execute(
                 "UPDATE agents_internal SET hebbian_vec_json = ? WHERE agent_id = ?;",
-                (json.dumps([round(float(x), 4) for x in updated_hebbian[:6]]), owner_id),
+                (
+                    json.dumps([round(float(x), 4) for x in updated_hebbian[:7]]),
+                    owner_id,
+                ),
             )
 
-            # Ebbinghaus-McGaugh Encoding Salience S_enc(m)
-            arousal_a = float(pad.get("arousal", 0.3))
+            arousal_a = float(pad.get("arousal", 0.45))
             s_enc = round(
                 1.0 + 1.2 * arousal_a + 0.8 * abs(rpe_magnitude) + 0.6 * abs(s_ijt), 4
             )
@@ -698,7 +657,6 @@ class MultiTierScopedMemory:
                 ),
             )
 
-            # LTM Consolidation Gate (S_enc >= 2.1)
             if s_enc >= 2.10:
                 conn.execute(
                     """
@@ -709,7 +667,7 @@ class MultiTierScopedMemory:
                         owner_id,
                         tick,
                         partner_id,
-                        f"Tick {tick} w/ {partner_id} ({consent_decision}): {verbal_message[:80]}",
+                        f"Tick {tick} w/ {partner_id} ({consent_decision}): {verbal_message[:100]}",
                         s_enc,
                     ),
                 )
@@ -725,26 +683,26 @@ class MultiTierScopedMemory:
         universal_transfer_share_phi: float,
         fair_audit_rate: float = 1.0,
     ) -> Tuple[float, float]:
-        """
-        Updates Level-2 Generalized Social Trust T_bar_{soc,t+1} (5-driver Alesina & La Ferrara law)
-        and Level-3 Institutional Trust T_{inst,t+1} (Rothstein & Uslaner universalism law).
-        """
         if not self.omega.omega_d2_trust_and_parochialism:
             self.generalized_social_trust = 0.50
             self.institutional_trust = 0.50
             return (0.50, 0.50)
 
         prev_inst = self.institutional_trust
-        # Universalism (phi >= 0.5) builds institutional trust; heavy means-testing stigma erodes it
         univ_signal = 0.04 * (universal_transfer_share_phi - 0.45) + 0.02 * (
             fair_audit_rate - 0.50
         )
-        new_inst = max(0.05, min(0.95, prev_inst + univ_signal - 0.15 * max(0.0, delta_mean_scarcity_f)))
+        new_inst = max(
+            0.05,
+            min(
+                0.95,
+                prev_inst + univ_signal - 0.15 * max(0.0, delta_mean_scarcity_f),
+            ),
+        )
         delta_inst = new_inst - prev_inst
         self.institutional_trust = round(new_inst, 4)
 
         cr_ref = 0.77
-        # Anchor gently toward baseline (0.58) while rising inequality & scarcity erode trust
         mean_rev = 0.15 * (
             self.trust_spec.initial_generalized_trust - self.generalized_social_trust
         )
@@ -767,9 +725,10 @@ class MultiTierScopedMemory:
         agent_id: str,
         partner_id: Optional[str],
         wave: int,
+        llm_valid: bool,
+        attention_measured: bool,
         financial_stress: float,
-        dissonance_score: float,
-        yerkes_dodson_beta: float,
+        easterbrook_beta: float,
         mean_shannon_entropy: float,
         tms_triggered: bool,
         attn_telemetry: Dict[str, float],
@@ -778,7 +737,7 @@ class MultiTierScopedMemory:
             conn.execute(
                 """
                 INSERT INTO inference_telemetry VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 );
                 """,
                 (
@@ -786,9 +745,10 @@ class MultiTierScopedMemory:
                     agent_id,
                     partner_id,
                     wave,
+                    int(llm_valid),
+                    int(attention_measured),
                     round(financial_stress, 4),
-                    round(dissonance_score, 4),
-                    round(yerkes_dodson_beta, 4),
+                    round(easterbrook_beta, 4),
                     round(mean_shannon_entropy, 4),
                     int(tms_triggered),
                     round(float(attn_telemetry.get("SPAN_DRIVES_AND_FINANCE", 0.0)), 4),

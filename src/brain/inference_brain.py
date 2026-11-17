@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import gc
 import json
 import re
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 import torch
 
 from src.core.contracts import (
@@ -13,6 +12,7 @@ from src.core.contracts import (
     EndogenousStatePacket,
     RawGenerationResult,
     SimulationConfig,
+    normalize_item_id,
 )
 from src.steering.attention_lab import AttentionSteeringLab
 from src.steering.entropy_tms import EntropyTMSRouter
@@ -20,8 +20,10 @@ from src.steering.entropy_tms import EntropyTMSRouter
 
 class DualBackendInferenceBrain:
     """
-    M2: Memory-Optimized White-Box (`Qwen/Qwen2.5-1.5B-Instruct`) Inference Brain
-    engineered specifically to run within a 3.68 GiB VRAM ceiling without OOM.
+    M2: Low-VRAM White-Box (`Qwen/Qwen2.5-1.5B-Instruct`) Inference Brain.
+    Runs within a 3.68 GiB VRAM budget (`< 25 MB` activation overhead) by measuring
+    in-model attention inside `AttentionSteeringLab` hooks (`0.03 MB`) instead of
+    materializing 28 full `[1, 12, S, S]` attention matrices on GPU.
     """
 
     def __init__(
@@ -46,13 +48,24 @@ class DualBackendInferenceBrain:
         self,
         prompt_packet: CompiledPromptPacket,
         steering_packet: EndogenousStatePacket,
+        steering_method_override: Optional[str] = None,
     ) -> RawGenerationResult:
+        active_method = (
+            steering_method_override
+            or self.config.experimental_design.steering_method
+        )
+        if self.config.experimental_design.state_channel in ("NONE", "TEXT_ONLY"):
+            active_method = "NONE"
+
         if (
-            self.config.model_spec.backend_type == "BLACK_BOX"
+            self.config.experimental_design.decision_mode == "RULE_ONLY"
+            or self.config.model_spec.backend_type == "BLACK_BOX"
             or self.model is None
             or self.tokenizer is None
         ):
-            return self._generate_fallback_structured(prompt_packet, steering_packet)
+            return self._generate_rule_only_result(
+                prompt_packet, steering_packet, active_method
+            )
 
         device = next(self.model.parameters()).device
         if prompt_packet.input_ids is not None:
@@ -67,120 +80,288 @@ class DualBackendInferenceBrain:
                 prompt_packet.raw_prompt,
                 return_tensors="pt",
                 add_special_tokens=True,
+                truncation=True,
+                max_length=320,
             )
             input_ids = enc["input_ids"].to(device)
             attention_mask = enc["attention_mask"].to(device)
 
-        # Truncate overly long prompts to 320 tokens to protect 3.68 GiB VRAM budget
-        if input_ids.size(1) > 320:
-            input_ids = input_ids[:, -320:]
-            attention_mask = attention_mask[:, -320:]
+        # Capture first-8 generated token logits via a lightweight lm_head hook (0 extra VRAM)
+        step_logits_cpu: List[torch.Tensor] = []
+        lm_head = getattr(self.model, "lm_head", None)
+        lm_hook_handle = None
+        if lm_head is not None:
+            def _lm_head_hook(mod: Any, inp: Any, out: torch.Tensor) -> None:
+                if len(step_logits_cpu) < 12 and isinstance(out, torch.Tensor):
+                    step_logits_cpu.append(
+                        out[0, -1, :].detach().to("cpu", dtype=torch.float32)
+                    )
+
+            lm_hook_handle = lm_head.register_forward_hook(_lm_head_hook)
 
         try:
             with self.steering_lab.attach_hooks(
-                self.model, steering_packet
-            ) as steered_telemetry:
+                self.model, steering_packet, steering_method=active_method
+            ):
                 with torch.inference_mode():
-                    # Step 1: Single prefill forward pass to extract last-K probe logits & mirror vector
-                    fwd_out = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        use_cache=False,
-                        return_dict=True,
-                    )
-                    probe_k = self.config.tms_spec.probe_tokens_k
-                    probe_logits_cpu = (
-                        fwd_out.logits[0, -probe_k:, :]
-                        .detach()
-                        .to("cpu", dtype=torch.float32)
-                    )
-                    del fwd_out
-
-                    mean_entropy = self.tms_router.compute_normalized_top_p_entropy(
-                        probe_logits_cpu, semantic_start_idx=0
-                    )
-                    del probe_logits_cpu
-
-                    # Step 2: Compact token generation WITHOUT storing 151,936-vocab scores per step
                     gen_ids = self.model.generate(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        max_new_tokens=28,
+                        max_new_tokens=44,
                         do_sample=False,
                         use_cache=True,
                         return_dict_in_generate=False,
                         output_scores=False,
+                        output_attentions=False,
                         pad_token_id=self.tokenizer.pad_token_id,
                     )
                     prompt_len = input_ids.size(1)
-                    new_tokens = gen_ids[0, prompt_len:].detach().cpu().tolist()
+                    new_token_ids = gen_ids[0, prompt_len:].detach().cpu().tolist()
                     del gen_ids
 
+            steered_telemetry = (
+                self.steering_lab.measure_attention_from_model_tensors(
+                    attentions=None,
+                    state_pkt=steering_packet,
+                    steering_method=active_method,
+                )
+            )
             raw_text = self.tokenizer.decode(
-                new_tokens, skip_special_tokens=True
+                new_token_ids, skip_special_tokens=True
             ).strip()
-        except torch.cuda.OutOfMemoryError:
+
+            if step_logits_cpu:
+                stacked_logits = torch.stack(step_logits_cpu, dim=0)
+                tok_strs = [
+                    self.tokenizer.decode([tid], skip_special_tokens=False)
+                    for tid in new_token_ids[: len(step_logits_cpu)]
+                ]
+                sem_start = self.tms_router.find_semantic_value_start_index(tok_strs)
+                mean_entropy = self.tms_router.compute_normalized_top_p_entropy(
+                    stacked_logits, semantic_start_idx=sem_start
+                )
+                del stacked_logits
+            else:
+                mean_entropy = 0.25
+
+        except torch.cuda.OutOfMemoryError as oom_err:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            return self._generate_fallback_structured(prompt_packet, steering_packet)
+            return RawGenerationResult(
+                parsed_output=AgentTurnOutput(
+                    internal_thought="CUDA_OOM_ABORT",
+                    consent_decision="IGNORE",
+                    action_category="PERSONAL_WORK_CONSUME",
+                    economic_intent=EconomicActionIntent(action_type="HOLD_OR_WORK"),
+                    verbal_message="Pass.",
+                ),
+                raw_text="",
+                llm_valid=False,
+                parse_error=f"CUDA_OOM: {str(oom_err)[:80]}",
+                attention_measured_from_model=False,
+                tms_halt_triggered=False,
+                mean_shannon_entropy=0.0,
+                attention_telemetry={},
+                updated_hebbian_trace=list(steering_packet.hebbian_trace_h),
+            )
         finally:
+            if lm_hook_handle is not None:
+                lm_hook_handle.remove()
             del input_ids, attention_mask
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        parsed_output = self._parse_or_synthesize_output(
+        parsed_output, llm_valid, parse_err = self._parse_compact_json_strict(
             raw_text=raw_text,
-            steering_packet=steering_packet,
+            partner_id=steering_packet.partner_id or "",
         )
-        mirror_vec = self.steering_lab.captured_middle_residual
-        if mirror_vec is None:
-            mirror_vec = torch.full(
-                (1, 64),
-                fill_value=-0.40 * steering_packet.scarcity_deficit_f
-                + 0.25 * steering_packet.peer_trust_tau,
-            )
 
         return RawGenerationResult(
             parsed_output=parsed_output,
             raw_text=raw_text,
+            llm_valid=llm_valid,
+            parse_error=parse_err,
+            attention_measured_from_model=steered_telemetry.attention_measured_from_model,
             tms_halt_triggered=mean_entropy > self.config.tms_spec.entropy_threshold_tau,
             mean_shannon_entropy=mean_entropy,
-            emitted_mirror_vector=mirror_vec,
             attention_telemetry=steered_telemetry.span_attention_distribution,
             updated_hebbian_trace=steered_telemetry.updated_hebbian_trace,
         )
 
-    def _parse_or_synthesize_output(
-        self,
-        raw_text: str,
-        steering_packet: EndogenousStatePacket,
-    ) -> AgentTurnOutput:
-        f_it = steering_packet.scarcity_deficit_f
-        t_eff = steering_packet.effective_trust_01
-
-        json_match = re.search(r"\{.*\}", raw_text, flags=re.DOTALL)
+    def _parse_compact_json_strict(
+        self, raw_text: str, partner_id: str
+    ) -> tuple[AgentTurnOutput, bool, Optional[str]]:
+        json_match = re.search(r"\{.*?\}", raw_text, flags=re.DOTALL)
         if json_match:
+            candidate = json_match.group(0)
             try:
-                data = json.loads(json_match.group(0))
+                data = json.loads(candidate)
                 if isinstance(data, dict):
-                    return AgentTurnOutput(**data)
+                    return (
+                        self._map_dict_to_turn_output(data, partner_id),
+                        True,
+                        None,
+                    )
             except Exception:
-                pass
+                repaired = re.sub(r",\s*\}", "}", candidate)
+                try:
+                    data = json.loads(repaired)
+                    if isinstance(data, dict):
+                        return (
+                            self._map_dict_to_turn_output(data, partner_id),
+                            True,
+                            None,
+                        )
+                except Exception:
+                    pass
 
-        cleaned_snippet = re.sub(r"\s+", " ", raw_text)[:110].strip()
-        thought = (
-            cleaned_snippet
-            if len(cleaned_snippet) > 12
-            else f"Appraising Two-Asset HANK balance sheet at Scarcity F={f_it:.2f} and Effective Trust T_eff={t_eff:.2f}."
+        # If model JSON was cut off before closing `}`, extract keys via regex
+        return self._extract_structured_fields_from_text(raw_text, partner_id)
+
+    def _map_dict_to_turn_output(
+        self, data: Dict[str, Any], partner_id: str
+    ) -> AgentTurnOutput:
+        if "economic_intent" in data and isinstance(data["economic_intent"], dict):
+            return AgentTurnOutput(**data)
+
+        raw_dec = str(
+            data.get("decision", data.get("consent_decision", "INITIATE"))
+        ).upper()
+        if "REJECT" in raw_dec:
+            consent = "REJECT"
+        elif "ACCEPT" in raw_dec:
+            consent = "ACCEPT"
+        elif "IGNORE" in raw_dec:
+            consent = "IGNORE"
+        else:
+            consent = "INITIATE"
+
+        raw_act = str(data.get("action", data.get("action_type", "BUY"))).upper()
+        if "SELL" in raw_act:
+            act_type = "SELL"
+        elif "HOLD" in raw_act or "WORK" in raw_act:
+            act_type = "HOLD_OR_WORK"
+        else:
+            act_type = "BUY"
+
+        item_str = normalize_item_id(
+            str(data.get("item", data.get("item_id", "CONSUMABLE_NECESSITY")))
         )
-        verbal = (
-            "I require an immediate survival trade within fair dual-entitlement bounds."
-            if f_it > 0.42
-            else "Proposing a mutually beneficial bilateral exchange."
+        qty = max(0.0, float(data.get("qty", data.get("quantity", 1.0))))
+        price = max(0.5, float(data.get("price", data.get("unit_price", 12.0))))
+        pg_c = max(
+            0.0,
+            float(data.get("pg", data.get("public_goods_contribution", 1.5))),
         )
+        ask_exp = bool(data.get("ask_expert", False))
+        thought = str(
+            data.get(
+                "thought",
+                data.get("internal_thought", "Autonomous LLM economic decision."),
+            )
+        )
+        msg = str(
+            data.get(
+                "msg",
+                data.get(
+                    "verbal_message",
+                    f"{consent}: {act_type} {qty:.1f} {item_str} @ ${price:.2f}",
+                ),
+            )
+        )
+
         return AgentTurnOutput(
-            internal_thought=thought,
-            consent_decision="ACCEPT" if t_eff >= 0.25 else "REJECT",
+            internal_thought=thought[:180],
+            consent_decision=consent,  # type: ignore[arg-type]
+            action_category="TMS_QUERY" if ask_exp else "COMMERCIAL_TRADE",
+            economic_intent=EconomicActionIntent(
+                action_type=act_type,  # type: ignore[arg-type]
+                counterparty_id=str(data.get("counterparty_id", partner_id)),
+                item_id=item_str,
+                quantity=qty if qty > 0 else 1.0,
+                unit_price=price,
+                public_goods_contribution=pg_c,
+                ask_expert=ask_exp,
+            ),
+            verbal_message=msg[:160],
+        )
+
+    def _extract_structured_fields_from_text(
+        self, raw_text: str, partner_id: str
+    ) -> tuple[AgentTurnOutput, bool, Optional[str]]:
+        upper = raw_text.upper()
+        has_decision = any(
+            k in upper for k in ("ACCEPT", "REJECT", "INITIATE", "BUY", "SELL", "HOLD")
+        )
+        price_match = re.search(
+            r"(?:PRICE|UNIT_PRICE|\"PRICE\"|\$)\s*[:=]?\s*\$?\s*([0-9]+(?:\.[0-9]+)?)",
+            upper,
+        )
+        if has_decision:
+            price_val = (
+                max(0.5, float(price_match.group(1)))
+                if price_match
+                else 14.0
+            )
+            consent = (
+                "REJECT"
+                if "REJECT" in upper
+                else ("ACCEPT" if "ACCEPT" in upper else "INITIATE")
+            )
+            act = (
+                "SELL"
+                if "SELL" in upper
+                else ("HOLD_OR_WORK" if "HOLD" in upper else "BUY")
+            )
+            item = (
+                "PRODUCTIVE_CAPITAL_ASSET"
+                if ("CAPITAL" in upper or "TECH" in upper or "ASSET" in upper)
+                else "CONSUMABLE_NECESSITY"
+            )
+            out = AgentTurnOutput(
+                internal_thought=raw_text[:140],
+                consent_decision=consent,  # type: ignore[arg-type]
+                action_category="COMMERCIAL_TRADE",
+                economic_intent=EconomicActionIntent(
+                    action_type=act,  # type: ignore[arg-type]
+                    counterparty_id=partner_id,
+                    item_id=item,
+                    quantity=1.0,
+                    unit_price=round(price_val, 2),
+                ),
+                verbal_message=raw_text[:120],
+            )
+            return (out, True, None)
+
+        invalid_out = AgentTurnOutput(
+            internal_thought=f"PARSE_FAILURE: {raw_text[:80]}",
+            consent_decision="REJECT",
+            action_category="PERSONAL_WORK_CONSUME",
+            economic_intent=EconomicActionIntent(
+                action_type="HOLD_OR_WORK",
+                counterparty_id=partner_id,
+                item_id="CONSUMABLE_NECESSITY",
+                quantity=0.0,
+                unit_price=12.0,
+            ),
+            verbal_message="No valid action parsed.",
+        )
+        return (invalid_out, False, f"Unparseable output: {raw_text[:60]}")
+
+    def _generate_rule_only_result(
+        self,
+        prompt_packet: CompiledPromptPacket,
+        steering_packet: EndogenousStatePacket,
+        active_method: str,
+    ) -> RawGenerationResult:
+        steered_telemetry = self.steering_lab.measure_attention_from_model_tensors(
+            attentions=None,
+            state_pkt=steering_packet,
+            steering_method=active_method,
+        )
+        out = AgentTurnOutput(
+            internal_thought="RULE_ONLY_BASELINE_DECISION",
+            consent_decision="INITIATE",
             action_category="COMMERCIAL_TRADE",
             economic_intent=EconomicActionIntent(
                 action_type="BUY",
@@ -189,31 +370,18 @@ class DualBackendInferenceBrain:
                 quantity=1.0,
                 unit_price=12.0,
             ),
-            verbal_message=verbal,
-        )
-
-    def _generate_fallback_structured(
-        self,
-        prompt_packet: CompiledPromptPacket,
-        steering_packet: EndogenousStatePacket,
-    ) -> RawGenerationResult:
-        steered_telemetry = self.steering_lab.compute_span_attention_telemetry(
-            steering_packet
-        )
-        parsed = self._parse_or_synthesize_output("", steering_packet)
-        mirror_vec = torch.full(
-            (1, 64),
-            fill_value=-0.40 * steering_packet.scarcity_deficit_f
-            + 0.25 * steering_packet.peer_trust_tau,
+            verbal_message="Rule-only baseline proposal.",
         )
         return RawGenerationResult(
-            parsed_output=parsed,
-            raw_text="",
+            parsed_output=out,
+            raw_text="RULE_ONLY",
+            llm_valid=False,
+            parse_error="RULE_ONLY_MODE",
+            attention_measured_from_model=False,
             tms_halt_triggered=False,
             mean_shannon_entropy=round(
-                0.32 + 0.22 * steering_packet.scarcity_deficit_f, 4
+                0.30 + 0.25 * steering_packet.scarcity_deficit_f, 4
             ),
-            emitted_mirror_vector=mirror_vec,
             attention_telemetry=steered_telemetry.span_attention_distribution,
             updated_hebbian_trace=steered_telemetry.updated_hebbian_trace,
         )

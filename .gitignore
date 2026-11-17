@@ -251,3 +251,14 @@ outputs/
 .env
 .vscode/
 .idea/
+
+# Runtime simulation databases & live telemetry streams
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.jsonl
+
+
+# Local model weights & mechanistic calibration cache
+models/

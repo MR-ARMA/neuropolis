@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 import torch
@@ -12,7 +13,15 @@ from src.core.contracts import SimulationConfig, TMSSpec, normalize_item_id
 class EntropyTMSRouter:
     """
     M4: Semantic-Offset Entropy-Triggered Transactive Memory System (TMS)
-    & Bayesian Conjugate Social Routing Engine.
+    & Value-of-Information Experimental Comparator (Hypothesis H3).
+    Supports all 5 Reviewer #2 C12 conditions:
+      - `OFF`: Never queries an expert.
+      - `ENTROPY_TRIGGER`: Queries when generated semantic token entropy H_bar > tau_TMS.
+      - `RANDOM_TRIGGER`: Queries with matched probability p = 0.35.
+      - `ALWAYS_ASK`: Queries on 100% of turns.
+      - `ORACLE_TRIGGER`: Queries if and only if agent has high signal noise (is_ignorant == True).
+    Also tracks turn-by-turn `(entropy, is_ignorant)` pairs to compute the exact
+    Mann-Whitney U **AUROC** of the entropy probe against ground-truth epistemic ignorance.
     """
 
     def __init__(
@@ -41,6 +50,9 @@ class EntropyTMSRouter:
             self.config = SimulationConfig()
             self.tms_spec = self.config.tms_spec
 
+        self.rng = random.Random(self.config.random_seed + 77)
+        self.entropy_ignorance_records: List[Tuple[float, int]] = []
+
     def compute_normalized_top_p_entropy(
         self,
         logits: torch.Tensor,
@@ -61,24 +73,18 @@ class EntropyTMSRouter:
         end = min(seq_len, start + self.tms_spec.probe_tokens_k)
         probe_slice = logits_2d[start:end].detach().float()
 
-        probs = F.softmax(probe_slice, dim=-1)
-        sorted_probs, _ = torch.sort(probs, dim=-1, descending=True)
-        cum_probs = torch.cumsum(sorted_probs, dim=-1)
+        clean_slice = torch.nan_to_num(
+            probe_slice, nan=0.0, posinf=20.0, neginf=-20.0
+        )
+        k_top = min(32, int(clean_slice.size(-1)))
+        top_logits, _ = torch.topk(clean_slice, k=k_top, dim=-1)
+        probs = F.softmax(top_logits, dim=-1)
+        max_ent = math.log(float(max(2, k_top)))
 
-        top_p = self.tms_spec.top_p_truncation
         token_entropies: List[float] = []
-
-        for row_idx in range(sorted_probs.size(0)):
-            row_p = sorted_probs[row_idx]
-            row_cum = cum_probs[row_idx]
-            keep_mask = row_cum <= top_p
-            cutoff_idx = int(keep_mask.sum().item())
-            cutoff_idx = max(8, min(row_p.size(0), cutoff_idx + 1))
-
-            active_p = row_p[:cutoff_idx]
-            active_p = active_p / active_p.sum().clamp(min=1e-9)
-            ent = -torch.sum(active_p * torch.log(active_p.clamp(min=1e-12))).item()
-            max_ent = math.log(float(cutoff_idx))
+        for row_idx in range(probs.size(0)):
+            row_p = probs[row_idx]
+            ent = -torch.sum(row_p * torch.log(row_p.clamp(min=1e-12))).item()
             norm_ent = ent / max(max_ent, 1e-6)
             token_entropies.append(max(0.0, min(1.0, norm_ent)))
 
@@ -90,12 +96,18 @@ class EntropyTMSRouter:
     def find_semantic_value_start_index(
         generated_token_strings: List[str],
     ) -> int:
+        """
+        Finds the first token index following a JSON value delimiter (`"thought": "`
+        or `"internal_thought": "` or `"decision": "`) so entropy is measured on
+        semantic tokens rather than opening braces.
+        """
         joined = ""
         for idx, tok in enumerate(generated_token_strings):
             joined += tok
-            if "internal_thought" in joined and ":" in joined.split("internal_thought")[-1]:
-                return min(len(generated_token_strings) - 1, idx + 2)
-        return 0
+            for key_marker in ("thought", "decision", "action"):
+                if key_marker in joined and ":" in joined.split(key_marker)[-1]:
+                    return min(len(generated_token_strings) - 1, idx + 1)
+        return min(len(generated_token_strings) - 1, 2) if len(generated_token_strings) > 2 else 0
 
     def evaluate_and_route(
         self,
@@ -103,12 +115,38 @@ class EntropyTMSRouter:
         domain_id: str,
         mean_entropy: float,
         effective_trust_map: Dict[str, float],
+        is_ground_truth_ignorant: bool = False,
+        tms_mode_override: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """
+        Evaluates whether to trigger `ASK_EXPERT` under the active `TMSMode`,
+        logs `(mean_entropy, int(is_ground_truth_ignorant))` for AUROC calculation,
+        and selects expert j* maximizing expected competence weighted by effective trust.
+        """
         norm_domain = normalize_item_id(domain_id)
-        if not self.tms_spec.enabled or mean_entropy <= self.tms_spec.entropy_threshold_tau:
+        self.entropy_ignorance_records.append(
+            (float(mean_entropy), int(is_ground_truth_ignorant))
+        )
+
+        active_mode = (
+            tms_mode_override or self.config.experimental_design.tms_mode
+        )
+        if not self.tms_spec.enabled or active_mode == "OFF":
+            should_trigger = False
+        elif active_mode == "ALWAYS_ASK":
+            should_trigger = True
+        elif active_mode == "RANDOM_TRIGGER":
+            should_trigger = self.rng.random() < 0.35
+        elif active_mode == "ORACLE_TRIGGER":
+            should_trigger = bool(is_ground_truth_ignorant)
+        else:
+            # ENTROPY_TRIGGER (default)
+            should_trigger = mean_entropy > self.tms_spec.entropy_threshold_tau
+
+        if not should_trigger:
             return {
                 "halt_and_route": False,
-                "mean_entropy": mean_entropy,
+                "mean_entropy": round(mean_entropy, 4),
                 "selected_expert_id": None,
                 "domain_id": norm_domain,
                 "expected_competence": 0.0,
@@ -159,6 +197,10 @@ class EntropyTMSRouter:
         accuracy_realization_y: float,
         tick: int = 0,
     ) -> Tuple[float, float, float]:
+        """
+        Updates Beta-Bernoulli priors (alpha, beta) based on whether the expert's
+        private signal theta_tilde_{j*,t} matched the realized macro state theta_t.
+        """
         norm_domain = normalize_item_id(domain_id)
         y = max(0.0, min(1.0, float(accuracy_realization_y)))
 
@@ -188,3 +230,23 @@ class EntropyTMSRouter:
 
         expected_d = new_alpha / max(new_alpha + new_beta, 1e-6)
         return (new_alpha, new_beta, round(expected_d, 4))
+
+    def compute_entropy_ignorance_auroc(self) -> float:
+        """
+        Computes exact Mann-Whitney U AUROC measuring how well semantic token entropy
+        discriminates true high-noise ignorance (label=1) from specialist competence (label=0).
+        """
+        pos = [e for e, lbl in self.entropy_ignorance_records if lbl == 1]
+        neg = [e for e, lbl in self.entropy_ignorance_records if lbl == 0]
+        if not pos or not neg:
+            return 0.50
+
+        concordant = 0.0
+        total_pairs = float(len(pos) * len(neg))
+        for p_val in pos:
+            for n_val in neg:
+                if p_val > n_val:
+                    concordant += 1.0
+                elif abs(p_val - n_val) <= 1e-6:
+                    concordant += 0.5
+        return round(concordant / max(1.0, total_pairs), 4)

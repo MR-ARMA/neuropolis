@@ -4,7 +4,6 @@ import math
 from typing import Any, Dict, List, Tuple
 
 from src.core.contracts import (
-    CanonicalItemType,
     SimulationConfig,
     normalize_item_id,
 )
@@ -14,11 +13,10 @@ from src.environment.game_master import AccountingAndLawEngine
 class BilateralMarketEngine:
     """
     Implements Dimension 1 & 2 Market Physics:
-    1. Stone-Geary Marginal Survival Valuation for CONSUMABLE_NECESSITY.
-    2. Carvalho et al. Present-Biased Valuation & Distress Fire-Sale Liquidation
-       for PRODUCTIVE_CAPITAL_ASSET when Scarcity F_{i,t} > 0.50.
-    3. Kahneman, Knetsch, & Thaler (1986) Dual-Entitlement Price Gouging Index Phi^{KKT}_{ij,t}.
-    4. Effective-Trust (T^{eff}_{ij,t}) & Economic Surplus Partner Matching (Vizing Disjoint Pairs).
+    - Computes KKT Dual-Entitlement Price Gouging Index (with TFP supply-cost pass-through).
+    - Computes reference reservation bounds for surplus accounting and the `RULE_ONLY`
+      (Rung R1) comparator baseline—WITHOUT injecting pre-computed actions or reservation
+      formulas into the LLM's prompt in `LLM_AUTONOMOUS` mode (Fixing Reviewer #2 Loophole L1).
     """
 
     def __init__(
@@ -37,11 +35,6 @@ class BilateralMarketEngine:
         item_id: str,
         seller_cost_shift: float = 0.0,
     ) -> float:
-        """
-        Kahneman, Knetsch, & Thaler (1986) Dual-Entitlement Price Gouging Index:
-        Phi^{KKT}_{ij,t} = (1 + kappa_desp * F_{i,t}) * max(0, (p_{ij,t} - (p_{ref,t} + Delta_c)) / p_{ref,t})
-        Clamped to 0.0 when Omega_D2 == False.
-        """
         if not self.omega.omega_d2_trust_and_parochialism:
             return 0.0
 
@@ -51,6 +44,11 @@ class BilateralMarketEngine:
             if norm_item == "CONSUMABLE_NECESSITY"
             else self.game_master.macro_state.reference_capital_price_qk
         )
+        if seller_cost_shift == 0.0 and norm_item == "CONSUMABLE_NECESSITY":
+            tfp_ac = max(0.35, self.game_master.macro_state.consumable_tfp_ac)
+            seller_cost_shift = round(
+                p_ref * max(0.0, (1.0 / tfp_ac - 1.0) * 0.20), 4
+            )
         fair_entitlement_price = p_ref + seller_cost_shift
         excess_markup = max(
             0.0, (offered_unit_price - fair_entitlement_price) / max(p_ref, 1e-6)
@@ -71,13 +69,7 @@ class BilateralMarketEngine:
         effective_trust_bs: float,
         intimacy_sb: float = 0.0,
     ) -> Dict[str, float]:
-        """
-        Computes Seller Minimum Reservation Price P^{seller}_{min} and
-        Buyer Maximum Willingness to Pay P^{buyer}_{max} for either
-        CONSUMABLE_NECESSITY or PRODUCTIVE_CAPITAL_ASSET.
-        """
         norm_item = normalize_item_id(item_id)
-        seller_ledger = self.game_master.get_agent_ledger(seller_id)
         buyer_ledger = self.game_master.get_agent_ledger(buyer_id)
 
         f_seller, _, delta_seller = (
@@ -87,7 +79,6 @@ class BilateralMarketEngine:
             self.game_master.compute_agent_scarcity_and_present_bias(buyer_id)
         )
 
-        # Convert Effective Trust in [0, 1] to distrust penalty in [0, 1]
         if self.omega.omega_d2_trust_and_parochialism:
             distrust_sb = max(0.0, 0.55 - effective_trust_sb) * 1.6
             distrust_bs = max(0.0, 0.55 - effective_trust_bs) * 1.6
@@ -106,30 +97,27 @@ class BilateralMarketEngine:
             p_min_seller = base_cost * (
                 1.0 + mu_margin * (1.0 - friend_discount) + phi_risk * distrust_sb
             )
-            # Stone-Geary urgency boosts buyer willingness to pay when c_{i,t} <= c_min
             buyer_c = float(buyer_ledger["inventory"]["CONSUMABLE_NECESSITY"])
             urgency_boost = 1.0 + 0.45 * f_buyer + (0.20 if buyer_c <= 1.0 else 0.0)
             base_val = p_ref * 1.15 * urgency_boost
             p_max_buyer = base_val * max(0.65, 1.0 - 0.50 * phi_risk * distrust_bs)
             is_fire_sale = False
         else:
-            # PRODUCTIVE_CAPITAL_ASSET valuation via discounted stream of yields r_{K,t}
             q_ref = self.game_master.macro_state.reference_capital_price_qk
-            # If Seller is in high scarcity F_{seller} > 0.45, present bias tilde{delta}_seller
-            # triggers a Distress Fire-Sale discount to raise immediate survival cash!
-            if self.omega.omega_d1_scarcity_and_hank and f_seller > 0.45:
+            if self.omega.omega_d1_scarcity_and_hank and f_seller > 0.42:
                 fire_sale_factor = max(0.52, delta_seller * (1.0 - 0.38 * f_seller))
                 p_min_seller = q_ref * fire_sale_factor * (1.0 + 0.25 * distrust_sb)
                 is_fire_sale = True
             else:
                 p_min_seller = q_ref * (
-                    0.92 + 0.50 * mu_margin * (1.0 - friend_discount) + 0.50 * phi_risk * distrust_sb
+                    0.92
+                    + 0.50 * mu_margin * (1.0 - friend_discount)
+                    + 0.50 * phi_risk * distrust_sb
                 )
                 is_fire_sale = False
 
-            # Liquid-wealthy buyer valuation of productive capital
             buyer_cash = float(buyer_ledger["liquid_wealth_cash"])
-            liquidity_premium = 1.12 if buyer_cash >= 110.0 else 0.75
+            liquidity_premium = 1.12 if buyer_cash >= 100.0 else 0.75
             p_max_buyer = (
                 q_ref
                 * liquidity_premium
@@ -151,13 +139,8 @@ class BilateralMarketEngine:
         self, initiator_id: str, partner_id: str, effective_trust_ij: float
     ) -> Dict[str, Any]:
         """
-        Determines the highest-surplus trade opportunity between Initiator and Partner:
-        - Priority 1: If Initiator has high Scarcity (F_{i,t} > 0.45) and owns PRODUCTIVE_CAPITAL_ASSET
-          while Partner has abundant cash, recommend a Distress Fire-Sale of PRODUCTIVE_CAPITAL_ASSET!
-        - Priority 2: If Initiator needs CONSUMABLE_NECESSITY (c <= 2) and Partner has surplus (c >= 3),
-          Initiator BUYs CONSUMABLE_NECESSITY.
-        - Priority 3: If Initiator has surplus CONSUMABLE_NECESSITY (c >= 3) and Partner needs it,
-          Initiator SELLs CONSUMABLE_NECESSITY.
+        Computes the closed-form Stone-Geary / KMV benchmark trade direction used
+        by the `RULE_ONLY` baseline (Rung R1) and for post-trade surplus accounting.
         """
         init_ledger = self.game_master.get_agent_ledger(initiator_id)
         part_ledger = self.game_master.get_agent_ledger(partner_id)
@@ -177,7 +160,6 @@ class BilateralMarketEngine:
         part_k = float(part_ledger["inventory"]["PRODUCTIVE_CAPITAL_ASSET"])
         part_cash = float(part_ledger["liquid_wealth_cash"])
 
-        # Case 1: Initiator Distress Fire-Sale of PRODUCTIVE_CAPITAL_ASSET
         if (
             self.omega.omega_d1_scarcity_and_hank
             and f_init > 0.42
@@ -199,7 +181,6 @@ class BilateralMarketEngine:
                 **bounds,
             }
 
-        # Case 2: Partner Distress Fire-Sale of PRODUCTIVE_CAPITAL_ASSET (Initiator BUYs)
         if (
             self.omega.omega_d1_scarcity_and_hank
             and f_part > 0.42
@@ -221,7 +202,6 @@ class BilateralMarketEngine:
                 **bounds,
             }
 
-        # Case 3: Initiator BUYs CONSUMABLE_NECESSITY from surplus Partner
         if init_c <= 2.5 and part_c >= 2.0:
             bounds = self.compute_reservation_prices(
                 seller_id=partner_id,
@@ -238,7 +218,6 @@ class BilateralMarketEngine:
                 **bounds,
             }
 
-        # Case 4: Initiator SELLs surplus CONSUMABLE_NECESSITY to Partner
         if init_c >= 2.0:
             bounds = self.compute_reservation_prices(
                 seller_id=initiator_id,
@@ -255,7 +234,6 @@ class BilateralMarketEngine:
                 **bounds,
             }
 
-        # Default fallback
         bounds = self.compute_reservation_prices(
             seller_id=partner_id,
             buyer_id=initiator_id,
@@ -277,10 +255,6 @@ class BilateralMarketEngine:
         agent_ids: List[str],
         effective_trust_matrix: Dict[Tuple[str, str], float],
     ) -> List[Tuple[str, str]]:
-        """
-        Matches the N agents into N/2 conflict-free disjoint pairs (Initiator, Responder)
-        maximizing P(i selects j) ~ exp(beta_trust * T^{eff}_{ij,t} + beta_surplus * Surplus_{ij,t}).
-        """
         ledgers = {
             aid: self.game_master.get_agent_ledger(aid) for aid in agent_ids
         }
@@ -303,15 +277,17 @@ class BilateralMarketEngine:
                 k_i = float(ledgers[aid_i]["inventory"]["PRODUCTIVE_CAPITAL_ASSET"])
                 cash_j = float(ledgers[aid_j]["liquid_wealth_cash"])
 
-                # Economic complementarity surplus
-                food_comp = 1.0 if (c_i <= 2.0 and c_j >= 2.5) or (c_i >= 2.5 and c_j <= 2.0) else 0.1
+                food_comp = (
+                    1.0
+                    if (c_i <= 2.0 and c_j >= 2.5) or (c_i >= 2.5 and c_j <= 2.0)
+                    else 0.1
+                )
                 fire_sale_comp = (
                     1.2
                     if (scarcities[aid_i] > 0.42 and k_i >= 1.0 and cash_j >= 70.0)
                     else 0.0
                 )
                 surplus_score = food_comp + fire_sale_comp
-                # Deterministic tie-breaking rotation across ticks
                 rot_bonus = 0.15 * math.sin(0.9 * tick + 1.7 * i_idx - 1.1 * j_idx)
 
                 total_score = (

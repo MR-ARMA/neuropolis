@@ -1,21 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import inspect
 import os
-from typing import Any, Dict, List
+import random
+from typing import Any, List
 import yaml
-import torch
 
 from src.brain.inference_brain import DualBackendInferenceBrain
 from src.brain.model_vault import ModelVaultManager
 from src.core.contracts import (
-    AgentTurnOutput,
-    CompiledPromptPacket,
-    EconomicActionIntent,
-    EndogenousStatePacket,
     FourDimTickTelemetry,
-    RawGenerationResult,
     SimulationConfig,
 )
 from src.environment.bilateral_market import BilateralMarketEngine
@@ -29,179 +23,9 @@ from src.steering.attention_lab import AttentionSteeringLab
 from src.steering.entropy_tms import EntropyTMSRouter
 
 
-class FastDeterministicBrain:
-    """
-    Lightweight, deterministic behavioral-economics brain used when `--mock-brain`
-    is passed for instant pre-flight/ablation verification without GPU overhead.
-    """
-
-    def __init__(self, config: SimulationConfig) -> None:
-        self.config = config
-        self.tokenizer = None
-
-    def generate_turn(
-        self,
-        prompt_packet: CompiledPromptPacket,
-        steering_packet: EndogenousStatePacket,
-    ) -> RawGenerationResult:
-        f_it = steering_packet.scarcity_deficit_f
-        t_eff = steering_packet.effective_trust_01
-        d_it = steering_packet.dissonance_d
-        arousal = steering_packet.arousal_a
-        fatigue = steering_packet.fatigue_f
-
-        beta_lc = self.config.steering_spec.beta_base_temp * (
-            (
-                1.0
-                + self.config.steering_spec.zeta_panic
-                * max(0.0, arousal - self.config.steering_spec.optimal_arousal) ** 2
-            )
-            / (1.0 + self.config.steering_spec.zeta_fatigue * fatigue)
-        )
-        attn_fin = min(0.75, 0.22 + 0.45 * f_it)
-        attn_sink = min(0.65, 0.08 + 0.48 * d_it)
-        attn_peer = max(0.08, 0.35 - 0.30 * attn_fin)
-        attn_msg = max(0.08, 1.0 - (attn_fin + attn_sink + attn_peer))
-
-        thought = (
-            f"Evaluating HANK portfolio under Scarcity F={f_it:.2f} and Effective Trust T_eff={t_eff:.2f}."
-        )
-        msg = (
-            "I need an urgent survival trade within fair bounds."
-            if f_it > 0.45
-            else "Proposing a mutually beneficial bilateral exchange."
-        )
-        out = AgentTurnOutput(
-            internal_thought=thought,
-            consent_decision="ACCEPT" if t_eff >= 0.25 else "REJECT",
-            action_category="COMMERCIAL_TRADE",
-            economic_intent=EconomicActionIntent(
-                action_type="BUY",
-                counterparty_id=steering_packet.partner_id or "",
-                item_id="CONSUMABLE_NECESSITY",
-                quantity=1.0,
-                unit_price=12.0,
-            ),
-            verbal_message=msg,
-        )
-        mirror_vec = torch.full(
-            (1, 64), fill_value=-0.45 * f_it + 0.25 * (2.0 * t_eff - 1.0)
-        )
-        return RawGenerationResult(
-            parsed_output=out,
-            tms_halt_triggered=False,
-            mean_shannon_entropy=0.32 + 0.22 * f_it,
-            emitted_mirror_vector=mirror_vec,
-            attention_telemetry={
-                "yerkes_dodson_beta": round(beta_lc, 4),
-                "SPAN_DRIVES_AND_FINANCE": round(attn_fin, 4),
-                "SPAN_PEER_MEMORY": round(attn_peer, 4),
-                "SPAN_INCOMING_MSG": round(attn_msg, 4),
-                "SPAN_SINK": round(attn_sink, 4),
-            },
-            updated_hebbian_trace=[
-                round(0.5 * x + 0.2 * f_it, 4)
-                for x in steering_packet.hebbian_trace_h
-            ],
-        )
-
-
-def _bootstrap_whitebox_brain(
-    config: SimulationConfig, tms_router: EntropyTMSRouter
-) -> Any:
-    """
-    Signature-adaptive bootstrapper that mounts `ModelVaultManager`,
-    `AttentionSteeringLab`, and `DualBackendInferenceBrain` using their exact
-    constructor and method signatures on disk.
-    """
-    # 1. Instantiate ModelVaultManager
-    v_sig = inspect.signature(ModelVaultManager.__init__)
-    v_params = [p for p in v_sig.parameters.keys() if p != "self"]
-    if not v_params:
-        vault = ModelVaultManager()  # type: ignore[call-arg]
-    elif "model_spec" in v_params:
-        vault = ModelVaultManager(config.model_spec)  # type: ignore[call-arg]
-    else:
-        vault = ModelVaultManager(config)  # type: ignore[call-arg]
-
-    # Call mount/bootstrap method on vault
-    mount_fn = (
-        getattr(vault, "mount_model_and_calibrate", None)
-        or getattr(vault, "load_and_calibrate", None)
-        or getattr(vault, "bootstrap", None)
-        or getattr(vault, "initialize", None)
-        or getattr(vault, "load_model", None)
-    )
-    mount_res = mount_fn() if mount_fn is not None else None
-
-    model = getattr(vault, "model", None)
-    tokenizer = getattr(vault, "tokenizer", None)
-    calibration_bundle = getattr(vault, "calibration_bundle", None)
-
-    if isinstance(mount_res, tuple):
-        if len(mount_res) == 3:
-            model, tokenizer, calibration_bundle = mount_res
-        elif len(mount_res) == 2:
-            model, tokenizer = mount_res
-    elif mount_res is not None:
-        model = getattr(mount_res, "model", model)
-        tokenizer = getattr(mount_res, "tokenizer", tokenizer)
-        calibration_bundle = getattr(
-            mount_res, "calibration_bundle", calibration_bundle or mount_res
-        )
-
-    # 2. Instantiate AttentionSteeringLab
-    s_sig = inspect.signature(AttentionSteeringLab.__init__)
-    s_kwargs: Dict[str, Any] = {}
-    for p in s_sig.parameters.keys():
-        if p == "self":
-            continue
-        pl = p.lower()
-        if "calib" in pl or "bundle" in pl:
-            s_kwargs[p] = calibration_bundle
-        elif "steer" in pl or "spec" in pl:
-            s_kwargs[p] = config.steering_spec
-        elif "config" in pl:
-            annot = str(s_sig.parameters[p].annotation)
-            s_kwargs[p] = (
-                config if "SimulationConfig" in annot else config.steering_spec
-            )
-    steering_lab = (
-        AttentionSteeringLab(**s_kwargs)
-        if s_kwargs
-        else AttentionSteeringLab(config.steering_spec, calibration_bundle)  # type: ignore[call-arg]
-    )
-
-    # 3. Instantiate DualBackendInferenceBrain
-    b_sig = inspect.signature(DualBackendInferenceBrain.__init__)
-    b_kwargs: Dict[str, Any] = {}
-    for p in b_sig.parameters.keys():
-        if p == "self":
-            continue
-        pl = p.lower()
-        if "vault" in pl:
-            b_kwargs[p] = vault
-        elif "model_spec" in pl:
-            b_kwargs[p] = config.model_spec
-        elif "config" in pl:
-            b_kwargs[p] = config
-        elif "model" in pl and "spec" not in pl:
-            b_kwargs[p] = model
-        elif "tok" in pl:
-            b_kwargs[p] = tokenizer
-        elif "steer" in pl or "lab" in pl:
-            b_kwargs[p] = steering_lab
-        elif "tms" in pl or "router" in pl:
-            b_kwargs[p] = tms_router
-        elif "calib" in pl:
-            b_kwargs[p] = calibration_bundle
-
-    return DualBackendInferenceBrain(**b_kwargs)
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Neuropolis 4-Dimensional HANK & Mechanistic Social Simulation Runner"
+        description="Neuropolis Remediated Causal Steering & HANK Laboratory Runner"
     )
     parser.add_argument(
         "--config",
@@ -216,10 +40,57 @@ def parse_args() -> argparse.Namespace:
         help="Override total simulation ticks",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Override random seed",
+    )
+    parser.add_argument(
+        "--decision-mode",
+        type=str,
+        default=None,
+        choices=["LLM_AUTONOMOUS", "RULE_ONLY"],
+        help="Select LLM_AUTONOMOUS or RULE_ONLY (Rung R1 baseline)",
+    )
+    parser.add_argument(
+        "--channel",
+        type=str,
+        default=None,
+        choices=["NONE", "TEXT_ONLY", "STEER_ONLY", "TEXT_AND_STEER", "CUE_CONFLICT"],
+        help="State delivery channel (C0..C4, including CUE_CONFLICT C4)",
+    )
+    parser.add_argument(
+        "--steering-method",
+        type=str,
+        default=None,
+        choices=[
+            "NONE",
+            "PLACEBO_RANDOM",
+            "SHUFFLED_STATE",
+            "PASTA",
+            "ACTADD_CAA",
+            "OUR_COUPLED_STEER",
+        ],
+        help="Active mechanistic steering intervention or control (C5, C6, C8)",
+    )
+    parser.add_argument(
+        "--tms-mode",
+        type=str,
+        default=None,
+        choices=[
+            "OFF",
+            "ENTROPY_TRIGGER",
+            "RANDOM_TRIGGER",
+            "ALWAYS_ASK",
+            "ORACLE_TRIGGER",
+        ],
+        help="Epistemic routing condition (C12)",
+    )
+    parser.add_argument(
         "--omega",
         type=str,
         default=None,
-        help="Comma-separated Orthogonal Clamping Vector Omega in {0,1}^4, e.g. '1,1,1,1' or '1,0,1,0'",
+        help="Comma-separated Orthogonal Clamping Vector Omega in {0,1}^4, e.g. '1,1,1,1'",
     )
     parser.add_argument(
         "--crisis",
@@ -243,9 +114,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mock-brain",
         action="store_true",
-        help="Use fast deterministic brain for instant verification without loading LLM weights",
+        help="Run in RULE_ONLY baseline mode (Rung R1) without loading LLM weights",
     )
     return parser.parse_args()
+
+
+def _permute_agent_identities(config: SimulationConfig) -> None:
+    """
+    Fixes Reviewer #2 Loophole L13: Permutes neutral agent IDs across endowments
+    and roles per random seed so identity labels are unconfounded with wealth or role.
+    """
+    if not config.experimental_design.randomize_agent_identities:
+        return
+    rng = random.Random(config.random_seed)
+    neutral_ids = [f"Agent_{idx:02d}" for idx in range(1, len(config.agents) + 1)]
+    rng.shuffle(neutral_ids)
+    for ag, new_id in zip(config.agents, neutral_ids):
+        ag.agent_id = new_id
+    config.agents.sort(key=lambda a: a.agent_id)
 
 
 def run_simulation() -> List[FourDimTickTelemetry]:
@@ -256,6 +142,19 @@ def run_simulation() -> List[FourDimTickTelemetry]:
 
     if args.ticks is not None:
         config.total_ticks = int(args.ticks)
+    if args.seed is not None:
+        config.random_seed = int(args.seed)
+    if args.mock_brain:
+        config.experimental_design.decision_mode = "RULE_ONLY"
+    if args.decision_mode is not None:
+        config.experimental_design.decision_mode = args.decision_mode  # type: ignore[assignment]
+    if args.channel is not None:
+        config.experimental_design.state_channel = args.channel  # type: ignore[assignment]
+    if args.steering_method is not None:
+        config.experimental_design.steering_method = args.steering_method  # type: ignore[assignment]
+        config.steering_spec.mode = args.steering_method
+    if args.tms_mode is not None:
+        config.experimental_design.tms_mode = args.tms_mode  # type: ignore[assignment]
     if args.omega is not None:
         parts = [int(x.strip()) for x in args.omega.split(",")]
         if len(parts) != 4:
@@ -267,24 +166,42 @@ def run_simulation() -> List[FourDimTickTelemetry]:
     if args.crisis is not None:
         config.hank_and_crisis_spec.active_crisis = args.crisis  # type: ignore[assignment]
 
+    _permute_agent_identities(config)
+
     os.makedirs(os.path.dirname(args.db_path) or ".", exist_ok=True)
     if os.path.exists(args.db_path):
         os.remove(args.db_path)
 
-    # 1. Initialize Deterministic Environment, Memory, Appraisal, and TMS
     game_master = AccountingAndLawEngine(db_path=args.db_path, config=config)
     market_engine = BilateralMarketEngine(config=config, game_master=game_master)
     memory_engine = MultiTierScopedMemory(db_path=args.db_path, config=config)
     appraisal_engine = CognitiveAppraisalAndToM(
         config=config, game_master=game_master, memory_engine=memory_engine
     )
-    tms_router = EntropyTMSRouter(db_path=args.db_path, config=config)
+    tms_router = EntropyTMSRouter(config=config, db_path=args.db_path)
 
-    # 2. Initialize White-Box Steered Brain (or FastDeterministicBrain if --mock-brain)
-    if args.mock_brain:
-        brain: Any = FastDeterministicBrain(config=config)
+    if config.experimental_design.decision_mode == "RULE_ONLY":
+        steering_lab = AttentionSteeringLab(config=config.steering_spec)
+        brain = DualBackendInferenceBrain(
+            config=config,
+            model=None,
+            tokenizer=None,
+            steering_lab=steering_lab,
+            tms_router=tms_router,
+        )
     else:
-        brain = _bootstrap_whitebox_brain(config=config, tms_router=tms_router)
+        vault = ModelVaultManager(config=config)
+        model, tokenizer, calibration_bundle = vault.mount_model_and_calibrate()
+        steering_lab = AttentionSteeringLab(
+            config=config.steering_spec, calibration=calibration_bundle
+        )
+        brain = DualBackendInferenceBrain(
+            config=config,
+            model=model,
+            tokenizer=tokenizer,
+            steering_lab=steering_lab,
+            tms_router=tms_router,
+        )
 
     orchestrator = TurnOrchestrator(
         config=config,
@@ -306,7 +223,6 @@ def run_simulation() -> List[FourDimTickTelemetry]:
     history: List[FourDimTickTelemetry] = []
     agent_ids = [a.agent_id for a in config.agents]
 
-    # 3. Main Tick Loop
     for tick in range(1, config.total_ticks + 1):
         macro_state = game_master.step_crisis_regime(tick=tick)
         monitor.log_tick_header(tick=tick, macro=macro_state)
@@ -327,8 +243,13 @@ def run_simulation() -> List[FourDimTickTelemetry]:
             monitor.log_dyadic_interaction(pair_idx=p_idx, outcome=outcome)
 
         upkeep_report = game_master.execute_end_of_tick_upkeep_and_fiscal_state(
-            tick=tick
+            tick=tick,
+            pg_contributions=orchestrator.tick_pg_contributions,
+            tax_evasion_intents=orchestrator.tick_tax_evasion_intents,
         )
+        orchestrator.tick_pg_contributions.clear()
+        orchestrator.tick_tax_evasion_intents.clear()
+
         monitor.log_upkeep_and_sanctions(tick=tick, upkeep_report=upkeep_report)
 
         tick_telemetry = metrics_engine.compute_and_persist_tick_telemetry(
@@ -336,6 +257,8 @@ def run_simulation() -> List[FourDimTickTelemetry]:
             upkeep_report=upkeep_report,
             cumulative_tms_queries=orchestrator.cumulative_tms_queries,
             successful_tms_routes=orchestrator.successful_tms_routes,
+            llm_valid_rate=orchestrator.get_llm_valid_rate(),
+            tms_entropy_auroc=tms_router.compute_entropy_ignorance_auroc(),
         )
         monitor.log_four_dim_tick_dashboard(tick_telemetry)
         history.append(tick_telemetry)
