@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
-import random
-from typing import Any, List
+from typing import List
 import yaml
 
 from src.brain.inference_brain import DualBackendInferenceBrain
@@ -12,8 +11,10 @@ from src.core.contracts import (
     FourDimTickTelemetry,
     SimulationConfig,
 )
+from src.core.seed_bundle import SeedBundle
 from src.environment.bilateral_market import BilateralMarketEngine
 from src.environment.game_master import AccountingAndLawEngine
+from src.environment.populations import synthesize_parametric_population
 from src.evaluation.live_monitor import RealTimeLiveMonitor
 from src.evaluation.metrics import FourDimensionalMetricsEngine
 from src.memory.scoped_memory import MultiTierScopedMemory
@@ -25,13 +26,20 @@ from src.steering.entropy_tms import EntropyTMSRouter
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Neuropolis Remediated Causal Steering & HANK Laboratory Runner"
+        description="Neuropolis Thesis-Grade Benchmark & Ablation Runner"
     )
     parser.add_argument(
         "--config",
         type=str,
         default="configs/mvp_config.yaml",
         help="Path to YAML experiment configuration",
+    )
+    parser.add_argument(
+        "--scale",
+        type=str,
+        default=None,
+        choices=["mvp_6", "dev", "main", "scale"],
+        help="Population scale: mvp_6 (N=6), dev (N=12), main (N=24), scale (N=48)",
     )
     parser.add_argument(
         "--ticks",
@@ -43,21 +51,21 @@ def parse_args() -> argparse.Namespace:
         "--seed",
         type=int,
         default=None,
-        help="Override random seed",
+        help="Override master random seed",
     )
     parser.add_argument(
         "--decision-mode",
         type=str,
         default=None,
-        choices=["LLM_AUTONOMOUS", "RULE_ONLY"],
-        help="Select LLM_AUTONOMOUS or RULE_ONLY (Rung R1 baseline)",
+        choices=["LLM_AUTONOMOUS", "RULE_ONLY", "ZERO_INTELLIGENCE"],
+        help="Policy mode: LLM_AUTONOMOUS, RULE_ONLY, or ZERO_INTELLIGENCE",
     )
     parser.add_argument(
         "--channel",
         type=str,
         default=None,
         choices=["NONE", "TEXT_ONLY", "STEER_ONLY", "TEXT_AND_STEER", "CUE_CONFLICT"],
-        help="State delivery channel (C0..C4, including CUE_CONFLICT C4)",
+        help="State delivery channel (C0..C4)",
     )
     parser.add_argument(
         "--steering-method",
@@ -67,11 +75,32 @@ def parse_args() -> argparse.Namespace:
             "NONE",
             "PLACEBO_RANDOM",
             "SHUFFLED_STATE",
+            "WRONG_SPAN",
+            "REVERSED_SIGN",
             "PASTA",
             "ACTADD_CAA",
             "OUR_COUPLED_STEER",
         ],
-        help="Active mechanistic steering intervention or control (C5, C6, C8)",
+        help="Active steering intervention or control",
+    )
+    parser.add_argument(
+        "--scope",
+        type=str,
+        default=None,
+        choices=["prefill_only", "prefill_and_decode"],
+        help="Steering hook scope (D4 factor)",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=None,
+        help="Override additive pre-softmax logit bias dose alpha",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Override decoding temperature (0.7 distributional, 0.0 deterministic)",
     )
     parser.add_argument(
         "--tms-mode",
@@ -84,13 +113,13 @@ def parse_args() -> argparse.Namespace:
             "ALWAYS_ASK",
             "ORACLE_TRIGGER",
         ],
-        help="Epistemic routing condition (C12)",
+        help="Epistemic routing condition",
     )
     parser.add_argument(
         "--omega",
         type=str,
         default=None,
-        help="Comma-separated Orthogonal Clamping Vector Omega in {0,1}^4, e.g. '1,1,1,1'",
+        help="Comma-separated Orthogonal Clamping Vector Omega in {0,1}^4",
     )
     parser.add_argument(
         "--crisis",
@@ -108,30 +137,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--db-path",
         type=str,
-        default="data/mvp_world_state.sqlite",
-        help="Path to SQLite world state database",
+        default="results/world_state.sqlite",
+        help="Path to SQLite world state database (untracked in results/)",
     )
     parser.add_argument(
         "--mock-brain",
         action="store_true",
-        help="Run in RULE_ONLY baseline mode (Rung R1) without loading LLM weights",
+        help="Run in RULE_ONLY baseline mode without loading LLM weights",
     )
     return parser.parse_args()
-
-
-def _permute_agent_identities(config: SimulationConfig) -> None:
-    """
-    Fixes Reviewer #2 Loophole L13: Permutes neutral agent IDs across endowments
-    and roles per random seed so identity labels are unconfounded with wealth or role.
-    """
-    if not config.experimental_design.randomize_agent_identities:
-        return
-    rng = random.Random(config.random_seed)
-    neutral_ids = [f"Agent_{idx:02d}" for idx in range(1, len(config.agents) + 1)]
-    rng.shuffle(neutral_ids)
-    for ag, new_id in zip(config.agents, neutral_ids):
-        ag.agent_id = new_id
-    config.agents.sort(key=lambda a: a.agent_id)
 
 
 def run_simulation() -> List[FourDimTickTelemetry]:
@@ -140,6 +154,8 @@ def run_simulation() -> List[FourDimTickTelemetry]:
         raw_cfg = yaml.safe_load(f)
     config = SimulationConfig(**raw_cfg)
 
+    if args.scale is not None:
+        config.population_scale = args.scale  # type: ignore[assignment]
     if args.ticks is not None:
         config.total_ticks = int(args.ticks)
     if args.seed is not None:
@@ -153,6 +169,12 @@ def run_simulation() -> List[FourDimTickTelemetry]:
     if args.steering_method is not None:
         config.experimental_design.steering_method = args.steering_method  # type: ignore[assignment]
         config.steering_spec.mode = args.steering_method
+    if args.scope is not None:
+        config.steering_spec.scope = args.scope  # type: ignore[assignment]
+    if args.alpha is not None:
+        config.steering_spec.alpha_dose = float(args.alpha)
+    if args.temperature is not None:
+        config.model_spec.temperature = float(args.temperature)
     if args.tms_mode is not None:
         config.experimental_design.tms_mode = args.tms_mode  # type: ignore[assignment]
     if args.omega is not None:
@@ -166,7 +188,8 @@ def run_simulation() -> List[FourDimTickTelemetry]:
     if args.crisis is not None:
         config.hank_and_crisis_spec.active_crisis = args.crisis  # type: ignore[assignment]
 
-    _permute_agent_identities(config)
+    seed_bundle = SeedBundle(config.random_seed)
+    config.agents = synthesize_parametric_population(config, seed_bundle)
 
     os.makedirs(os.path.dirname(args.db_path) or ".", exist_ok=True)
     if os.path.exists(args.db_path):
@@ -180,7 +203,7 @@ def run_simulation() -> List[FourDimTickTelemetry]:
     )
     tms_router = EntropyTMSRouter(config=config, db_path=args.db_path)
 
-    if config.experimental_design.decision_mode == "RULE_ONLY":
+    if config.experimental_design.decision_mode in ("RULE_ONLY", "ZERO_INTELLIGENCE"):
         steering_lab = AttentionSteeringLab(config=config.steering_spec)
         brain = DualBackendInferenceBrain(
             config=config,
@@ -188,6 +211,7 @@ def run_simulation() -> List[FourDimTickTelemetry]:
             tokenizer=None,
             steering_lab=steering_lab,
             tms_router=tms_router,
+            seed_bundle=seed_bundle,
         )
     else:
         vault = ModelVaultManager(config=config)
@@ -201,8 +225,13 @@ def run_simulation() -> List[FourDimTickTelemetry]:
             tokenizer=tokenizer,
             steering_lab=steering_lab,
             tms_router=tms_router,
+            seed_bundle=seed_bundle,
         )
 
+    run_id = (
+        f"run_s{config.random_seed}_{config.experimental_design.decision_mode}_"
+        f"{config.experimental_design.state_channel}_{config.experimental_design.steering_method}"
+    )
     orchestrator = TurnOrchestrator(
         config=config,
         game_master=game_master,
@@ -211,6 +240,8 @@ def run_simulation() -> List[FourDimTickTelemetry]:
         appraisal_engine=appraisal_engine,
         tms_router=tms_router,
         brain=brain,
+        seed_bundle=seed_bundle,
+        run_id=run_id,
     )
     metrics_engine = FourDimensionalMetricsEngine(
         db_path=args.db_path,
@@ -218,7 +249,7 @@ def run_simulation() -> List[FourDimTickTelemetry]:
         game_master=game_master,
         memory_engine=memory_engine,
     )
-    monitor = RealTimeLiveMonitor(config=config)
+    monitor = RealTimeLiveMonitor(config=config, seed_bundle=seed_bundle)
 
     history: List[FourDimTickTelemetry] = []
     agent_ids = [a.agent_id for a in config.agents]
@@ -258,11 +289,22 @@ def run_simulation() -> List[FourDimTickTelemetry]:
             cumulative_tms_queries=orchestrator.cumulative_tms_queries,
             successful_tms_routes=orchestrator.successful_tms_routes,
             llm_valid_rate=orchestrator.get_llm_valid_rate(),
+            abstain_rate=orchestrator.get_abstain_rate(),
+            rule_fallback_rate=orchestrator.get_rule_fallback_rate(),
             tms_entropy_auroc=tms_router.compute_entropy_ignorance_auroc(),
         )
         monitor.log_four_dim_tick_dashboard(tick_telemetry)
         history.append(tick_telemetry)
 
+    monitor.write_run_manifest_and_turn_logs(
+        run_id=run_id,
+        turn_logs=orchestrator.turn_log_rows,
+        llm_valid_rate=orchestrator.get_llm_valid_rate(),
+        abstain_rate=orchestrator.get_abstain_rate(),
+        rule_fallback_rate=orchestrator.get_rule_fallback_rate(),
+        manifest_path=f"results/manifest_{run_id}.json",
+        turn_log_path=f"results/turn_logs_{run_id}.jsonl",
+    )
     scorecard = metrics_engine.compute_empirical_validation_scorecard(history)
     monitor.print_final_empirical_scorecard(history=history, scorecard=scorecard)
     return history

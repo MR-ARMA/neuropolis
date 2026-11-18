@@ -1,0 +1,50 @@
+preregistration_status: "FROZEN_BEFORE_PHASE_P6"
+results_status: "NOT_EXECUTED"
+unit_of_analysis: "run_seed_pair"
+multiplicity_correction_primary: "Holm-Bonferroni"
+multiplicity_correction_secondary: "Benjamini-Hochberg (q=0.05)"
+
+smallest_effect_sizes_of_interest:
+  tier_a_standardized_cohen_d: 0.30
+  tier_b_curve_w1_distance: 0.05
+  tier_c_macro_cohen_d: 0.50
+  minimum_observations_per_bin: 30
+  minimum_llm_valid_rate: 0.90
+
+hypotheses:
+  - id: "H1"
+    name: "Channel Dissociation under 2x2 Cue Conflict"
+    primary_outcome: "Decision shift toward steered state (T_low_S_high - T_low_S_low)"
+    comparator: "KL-matched random placebo (PLACEBO_RANDOM) and shuffled state (SHUFFLED_STATE)"
+    statistical_test: "Paired bootstrap CI (10,000 resamples) and TOST equivalence against SESOI d=0.30"
+    falsified_if: "95% CI of excess shift over placebo includes 0 or lies inside [-0.30, +0.30] SD"
+
+  - id: "H2"
+    name: "Monotone Dose-Response on Shadow Attention Mass & Decision Shift"
+    primary_outcome: "Shadow eager attention mass on SPAN_DRIVES_AND_FINANCE across alpha in {0, 0.5, 1, 2, 4, 8}"
+    statistical_test: "Spearman rank correlation rho and paired bootstrap slope"
+    falsified_if: "Spearman rho <= 0.0 or max attention shift < +0.10"
+
+  - id: "H3"
+    name: "Human-Protocol Response-Curve Alignment"
+    primary_outcome: "Whole-curve W1/L1 distance on B1 Ultimatum (Oosterbeek et al. 2004 [VERIFY]) and B3 Windfall MPC (Jappelli & Pistaferri 2014 [VERIFY])"
+    comparator: "Information-matched prompt-only delivery (TEXT_ONLY)"
+    statistical_test: "Paired bootstrap difference in W1 distance and TOST against meta-analytic SE"
+    falsified_if: "Paired W1 reduction CI includes 0 or lies inside [-0.05, +0.05]"
+
+  - id: "H4"
+    name: "Component Heterogeneity & Non-Additive Interactions"
+    primary_outcome: "Shapley share phi_i and pairwise interaction coefficients beta_ij across F1..F9"
+    statistical_test: "Nested likelihood-ratio / F-test comparing additive vs. interaction mixed-effects model"
+    falsified_if: "Additive model cross-validated error is statistically indistinguishable from interaction model"
+
+  - id: "H5"
+    name: "Value of Information in Entropy-Triggered Epistemic Routing"
+    primary_outcome: "Realized CRRA utility gain per query and Mann-Whitney U AUROC for novice vs. specialist discrimination"
+    comparator: "Equal-budget RANDOM_TRIGGER"
+    falsified_if: "Utility gain CI includes 0 or AUROC 95% CI includes 0.65"
+
+  - id: "H6"
+    name: "Out-of-Sample Regime & Cross-Family Generalization"
+    primary_outcome: "Effect sign and magnitude on held-out regimes (r3 Asset Crash, r4 Credit Crunch) and T2 model families"
+    falsified_if: "Effect sign reverses or falls inside the equivalence margin on held-out regimes or T2 models"

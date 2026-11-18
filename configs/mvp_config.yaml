@@ -1,6 +1,8 @@
-experiment_id: "neuropolis-remediated-causal-v3"
+experiment_id: "neuropolis-thesis-benchmark-v4"
 random_seed: 42
 total_ticks: 8
+burn_in_ticks: 2
+population_scale: "dev"
 footprint_profile: "PROTOTYPE_LAPTOP"
 
 experimental_design:
@@ -9,6 +11,25 @@ experimental_design:
   steering_method: "OUR_COUPLED_STEER"
   tms_mode: "ENTROPY_TRIGGER"
   randomize_agent_identities: true
+  max_parse_retries: 3
+  min_valid_rate_threshold: 0.90
+  sesoi_tier_a_cohen_d: 0.30
+  sesoi_tier_b_w1: 0.05
+  sesoi_tier_c_cohen_d: 0.50
+  min_bin_observations: 30
+
+component_variants:
+  state_encoder: "numeric_table"
+  prompt_compiler: "delimited_spans"
+  attention_steering: "additive_span"
+  activation_steering: "caa_value"
+  cognitive_appraisal: "arousal"
+  memory: "scoped_stm_ltm"
+  belief: "bayesian_beta"
+  reasoning: "rationale_json"
+  decision_interface: "schema_constrained"
+  communication: "oneshot_offer"
+  epistemic_routing: "entropy_trigger"
 
 orthogonal_clamping:
   omega_d1_scarcity_and_hank: true
@@ -17,33 +38,48 @@ orthogonal_clamping:
   omega_d4_fiscal_and_legal_state: true
 
 model_spec:
+  tier: "T0_DEV"
   backend_type: "WHITE_BOX"
   model_id: "Qwen/Qwen2.5-1.5B-Instruct"
+  revision: "main"
   local_dir: "./models/Qwen--Qwen2.5-1.5B-Instruct"
+  t1_primary_model_id: "Qwen/Qwen2.5-7B-Instruct"
+  t2_replication_model_ids:
+    - "meta-llama/Llama-3.1-8B-Instruct"
+    - "mistralai/Mistral-7B-Instruct-v0.3"
   auto_download: true
-  precision: "float16"
+  precision: "bfloat16"
   attn_implementation: "eager"
-  max_new_tokens: 96
-  temperature: 0.0
+  max_new_tokens: 128
+  temperature: 0.70
+  top_p: 0.95
 
 steering_spec:
   enabled: true
   mode: "OUR_COUPLED_STEER"
+  scope: "prefill_and_decode"
+  query_row_scope: "all_post_span_tokens"
+  layer_scope: "middle_third"
+  head_selection: "all_heads"
+  top_k_heads: 4
+  alpha_dose: 3.00
   enable_attn_bias: true
   enable_value_steer: true
   enable_easterbrook_beta: true
-  omega_1_drives_finance: 2.20
-  omega_2_peer_memory: 1.60
-  gamma_periph_suppress: 0.85
+  omega_1_drives_finance: 1.00
+  omega_2_peer_memory: 0.75
+  gamma_periph_suppress: 0.35
   gamma_cynicism_scale: 1.20
   eta_threat_scale: 0.85
   easterbrook_beta_min: 0.85
   easterbrook_beta_max: 1.40
   easterbrook_u_opt: 0.45
   easterbrook_sigma: 0.30
-  logit_clamp_max: 6.00
+  logit_clamp_max: 8.00
   pasta_alpha: 0.25
   actadd_coeff: 1.15
+  caa_num_pairs_per_construct: 240
+  caa_permutation_iters: 200
   hebbian_decay_lambda: 0.35
   hebbian_learning_eta: 0.40
 

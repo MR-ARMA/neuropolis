@@ -35,24 +35,27 @@ TokenSpanMap = Dict[str, Tuple[int, int]]
 class DecisionMode(str, Enum):
     LLM_AUTONOMOUS = "LLM_AUTONOMOUS"
     RULE_ONLY = "RULE_ONLY"
+    ZERO_INTELLIGENCE = "ZERO_INTELLIGENCE"
 
 
 class StateChannel(str, Enum):
-    NONE = "NONE"                     # C0: Neutral baseline text, no steering hooks
-    TEXT_ONLY = "TEXT_ONLY"           # C1: True state in prompt text, no steering hooks
-    STEER_ONLY = "STEER_ONLY"         # C2: Neutral baseline text, true state in steering hooks
-    TEXT_AND_STEER = "TEXT_AND_STEER" # C3: True state in both prompt text and steering hooks
-    CUE_CONFLICT = "CUE_CONFLICT"     # C4: Text says liquid/calm; steering injects high scarcity (and vice versa)
+    NONE = "NONE"                     # C0: Neutral baseline text, no steering
+    TEXT_ONLY = "TEXT_ONLY"           # C1: True state in text, no steering
+    STEER_ONLY = "STEER_ONLY"         # C2: Neutral text, true state in steering
+    TEXT_AND_STEER = "TEXT_AND_STEER" # C3: True state in both text and steering
+    CUE_CONFLICT = "CUE_CONFLICT"     # C4: Opposite states in text vs. steering
 
 
 class SteeringMethod(str, Enum):
     NONE = "NONE"
-    PLACEBO_RANDOM = "PLACEBO_RANDOM"       # C5: Matched-norm random unit vector at identical hook sites
-    SHUFFLED_STATE = "SHUFFLED_STATE"       # C6: State packet permuted from a different agent
-    PASTA = "PASTA"                         # Zhang et al. (2024) post-hoc attention scaling baseline
-    ACTADD_CAA = "ACTADD_CAA"               # Turner et al. / Rimsky et al. residual activation addition
-    OUR_COUPLED_STEER = "OUR_COUPLED_STEER" # Mechanisms A (Attn Bias) + B (Value CAA) + C (Easterbrook Beta)
-    MASTER_EQUATION = "OUR_COUPLED_STEER"   # Backward-compatible alias
+    PLACEBO_RANDOM = "PLACEBO_RANDOM"       # Norm- and KL-matched random control
+    SHUFFLED_STATE = "SHUFFLED_STATE"       # Permuted agent state control
+    WRONG_SPAN = "WRONG_SPAN"               # Dose applied to non-target span
+    REVERSED_SIGN = "REVERSED_SIGN"         # Sign-flipped intervention
+    PASTA = "PASTA"                         # Zhang et al. (2023) [VERIFY] baseline
+    ACTADD_CAA = "ACTADD_CAA"               # Turner et al. (2023) [VERIFY] residual baseline
+    OUR_COUPLED_STEER = "OUR_COUPLED_STEER" # Additive span bias + CAA value + Easterbrook gain
+    MASTER_EQUATION = "OUR_COUPLED_STEER"
 
 
 class TMSMode(str, Enum):
@@ -61,6 +64,17 @@ class TMSMode(str, Enum):
     RANDOM_TRIGGER = "RANDOM_TRIGGER"
     ALWAYS_ASK = "ALWAYS_ASK"
     ORACLE_TRIGGER = "ORACLE_TRIGGER"
+
+
+class MetricLayer(str, Enum):
+    MECHANICAL = "mechanical"
+    BEHAVIORAL = "behavioral"
+
+
+class MetricVerdict(str, Enum):
+    PRIMARY_BEHAVIORAL = "primary_behavioral"
+    SECONDARY_BEHAVIORAL = "secondary_behavioral"
+    SANITY_ONLY = "sanity_only"
 
 
 class ClaimStatus(str, Enum):
@@ -90,6 +104,7 @@ class ConsentDecision(str, Enum):
     REJECT = "REJECT"
     COUNTER_OFFER = "COUNTER_OFFER"
     IGNORE = "IGNORE"
+    ABSTAIN = "ABSTAIN"
 
 
 class ActionType(str, Enum):
@@ -145,11 +160,13 @@ class RuntimePacketModel(BaseModel):
 
 
 # ============================================================================
-# 1. EXPERIMENTAL DESIGN & CONFIGURATION SCHEMAS (`extra="forbid"`)
+# 1. EXPERIMENTAL DESIGN, COMPONENT VARIANTS & CONFIGURATION SCHEMAS
 # ============================================================================
 
 class ExperimentalDesignSpec(StrictConfigModel):
-    decision_mode: Literal["LLM_AUTONOMOUS", "RULE_ONLY"] = "LLM_AUTONOMOUS"
+    decision_mode: Literal[
+        "LLM_AUTONOMOUS", "RULE_ONLY", "ZERO_INTELLIGENCE"
+    ] = "LLM_AUTONOMOUS"
     state_channel: Literal[
         "NONE", "TEXT_ONLY", "STEER_ONLY", "TEXT_AND_STEER", "CUE_CONFLICT"
     ] = "TEXT_AND_STEER"
@@ -157,6 +174,8 @@ class ExperimentalDesignSpec(StrictConfigModel):
         "NONE",
         "PLACEBO_RANDOM",
         "SHUFFLED_STATE",
+        "WRONG_SPAN",
+        "REVERSED_SIGN",
         "PASTA",
         "ACTADD_CAA",
         "OUR_COUPLED_STEER",
@@ -166,6 +185,48 @@ class ExperimentalDesignSpec(StrictConfigModel):
         "OFF", "ENTROPY_TRIGGER", "RANDOM_TRIGGER", "ALWAYS_ASK", "ORACLE_TRIGGER"
     ] = "ENTROPY_TRIGGER"
     randomize_agent_identities: bool = True
+    max_parse_retries: int = 3
+    min_valid_rate_threshold: float = 0.90
+    sesoi_tier_a_cohen_d: float = 0.30
+    sesoi_tier_b_w1: float = 0.05
+    sesoi_tier_c_cohen_d: float = 0.50
+    min_bin_observations: int = 30
+
+
+class ComponentVariantsSpec(StrictConfigModel):
+    state_encoder: Literal["none", "numeric_table", "narrative", "both"] = "numeric_table"
+    prompt_compiler: Literal[
+        "minimal", "delimited_spans", "fewshot", "paraphrases", "length_padded"
+    ] = "delimited_spans"
+    attention_steering: Literal[
+        "none",
+        "pasta",
+        "additive_span",
+        "placebo",
+        "shuffled",
+        "wrong_span",
+        "reversed",
+    ] = "additive_span"
+    activation_steering: Literal[
+        "none", "caa_value", "actadd_residual", "temp_gain", "combined"
+    ] = "caa_value"
+    cognitive_appraisal: Literal["none", "arousal", "pad_mood", "tom_peer"] = "arousal"
+    memory: Literal[
+        "none", "recency_k", "scoped_stm_ltm", "embedding_rag", "oracle"
+    ] = "scoped_stm_ltm"
+    belief: Literal["none", "bayesian_beta", "llm_self_report", "oracle"] = "bayesian_beta"
+    reasoning: Literal[
+        "direct_json", "rationale_json", "plan_act", "self_consistency", "reflection"
+    ] = "rationale_json"
+    decision_interface: Literal[
+        "schema_constrained", "logit_categorical", "legacy_fallback_repro"
+    ] = "schema_constrained"
+    communication: Literal[
+        "none", "oneshot_offer", "bargaining_3r", "cheap_talk", "template"
+    ] = "oneshot_offer"
+    epistemic_routing: Literal[
+        "off", "entropy_trigger", "random_equal_budget", "always_ask", "oracle_trigger"
+    ] = "entropy_trigger"
 
 
 class OrthogonalClampingSpec(StrictConfigModel):
@@ -184,36 +245,58 @@ class OrthogonalClampingSpec(StrictConfigModel):
 
 
 class ModelSpec(StrictConfigModel):
+    tier: Literal["T0_DEV", "T1_PRIMARY", "T2_REPLICATION", "T3_SCALE", "REF_API"] = "T0_DEV"
     backend_type: Literal["WHITE_BOX", "BLACK_BOX"] = "WHITE_BOX"
     model_id: str = "Qwen/Qwen2.5-1.5B-Instruct"
+    revision: str = "main"
     local_dir: str = "./models/Qwen--Qwen2.5-1.5B-Instruct"
+    t1_primary_model_id: str = "Qwen/Qwen2.5-7B-Instruct"
+    t2_replication_model_ids: List[str] = Field(
+        default_factory=lambda: [
+            "meta-llama/Llama-3.1-8B-Instruct",
+            "mistralai/Mistral-7B-Instruct-v0.3",
+        ]
+    )
     auto_download: bool = True
-    precision: Literal["float16", "bfloat16", "float32"] = "float16"
+    precision: Literal["float16", "bfloat16", "float32"] = "bfloat16"
     attn_implementation: Literal["eager", "sdpa"] = "eager"
     api_base_url: Optional[str] = "http://localhost:1234/v1"
     api_key: Optional[str] = "lm-studio"
-    max_new_tokens: int = 96
-    temperature: float = 0.0
+    max_new_tokens: int = 128
+    temperature: float = 0.70
+    top_p: float = 0.95
 
 
 class SteeringLabConfig(StrictConfigModel):
     enabled: bool = True
     mode: str = "OUR_COUPLED_STEER"
+    scope: Literal["prefill_only", "prefill_and_decode"] = "prefill_and_decode"
+    query_row_scope: Literal[
+        "last_token_only", "all_post_span_tokens"
+    ] = "all_post_span_tokens"
+    layer_scope: Literal[
+        "early_third", "middle_third", "late_third", "all_layers"
+    ] = "middle_third"
+    head_selection: Literal["all_heads", "top_k_sensitive"] = "all_heads"
+    top_k_heads: int = 4
+    alpha_dose: float = 3.00
     enable_attn_bias: bool = True
     enable_value_steer: bool = True
     enable_easterbrook_beta: bool = True
-    omega_1_drives_finance: float = 2.20
-    omega_2_peer_memory: float = 1.60
-    gamma_periph_suppress: float = 0.85
+    omega_1_drives_finance: float = 1.00
+    omega_2_peer_memory: float = 0.75
+    gamma_periph_suppress: float = 0.35
     gamma_cynicism_scale: float = 1.20
     eta_threat_scale: float = 0.85
     easterbrook_beta_min: float = 0.85
     easterbrook_beta_max: float = 1.40
     easterbrook_u_opt: float = 0.45
     easterbrook_sigma: float = 0.30
-    logit_clamp_max: float = 6.00
+    logit_clamp_max: float = 8.00
     pasta_alpha: float = 0.25
     actadd_coeff: float = 1.15
+    caa_num_pairs_per_construct: int = 240
+    caa_permutation_iters: int = 200
     hebbian_decay_lambda: float = 0.35
     hebbian_learning_eta: float = 0.40
 
@@ -359,14 +442,19 @@ class AgentSeedConfig(StrictConfigModel):
 
 
 class SimulationConfig(StrictConfigModel):
-    experiment_id: str = "neuropolis-remediated-causal-v3"
+    experiment_id: str = "neuropolis-thesis-benchmark-v4"
     random_seed: int = 42
     total_ticks: int = 8
+    burn_in_ticks: int = 2
+    population_scale: Literal["mvp_6", "dev", "main", "scale"] = "dev"
     footprint_profile: Literal[
         "PROTOTYPE_LAPTOP", "WORKSTATION_RESEARCH", "CLUSTER_PRODUCTION"
     ] = "PROTOTYPE_LAPTOP"
     experimental_design: ExperimentalDesignSpec = Field(
         default_factory=ExperimentalDesignSpec
+    )
+    component_variants: ComponentVariantsSpec = Field(
+        default_factory=ComponentVariantsSpec
     )
     orthogonal_clamping: OrthogonalClampingSpec = Field(
         default_factory=OrthogonalClampingSpec
@@ -393,37 +481,41 @@ MVPConfig = SimulationConfig
 
 
 # ============================================================================
-# 2. CALIBRATION, STEERING & PROMPT PACKETS
+# 2. CALIBRATION, STEERING, MANIFEST & TURN LOG PACKETS
 # ============================================================================
 
 class MechanisticCalibrationBundle(RuntimePacketModel):
     model_id: str = "Qwen/Qwen2.5-1.5B-Instruct"
+    revision_sha: str = "main"
+    attn_backend_verified: str = "eager"
     num_layers: int = 28
     num_heads: int = 12
     num_kv_heads: int = 2
     head_dim: int = 128
     hidden_size: int = 1536
-    u_trust: Optional[torch.Tensor] = None             # Shape [L, d_kv] real CAA unit vectors
-    u_threat: Optional[torch.Tensor] = None            # Shape [L, d_kv] real CAA unit vectors
-    random_placebo_u: Optional[torch.Tensor] = None    # Shape [L, d_kv] matched-norm random control (C5)
-    residual_caa_vector: Optional[torch.Tensor] = None # Shape [L, hidden_size] for ACTADD_CAA baseline
+    num_pairs_used: int = 240
+    train_val_test_split: Tuple[int, int, int] = (144, 48, 48)
+    u_trust: Optional[torch.Tensor] = None
+    u_threat: Optional[torch.Tensor] = None
+    random_placebo_u: Optional[torch.Tensor] = None
+    residual_caa_vector: Optional[torch.Tensor] = None
     probe_accuracy_trust: float = 0.0
     probe_accuracy_threat: float = 0.0
+    permutation_null_p_trust: float = 1.0
+    permutation_null_p_threat: float = 1.0
+    confound_cosine_length: float = 0.0
+    confound_cosine_sentiment: float = 0.0
+    trust_threat_residual_cosine: float = 0.0
+    kl_matched_placebo_scale: float = 1.0
     calibrated_from_model: bool = False
     sink_token_ids: List[int] = Field(default_factory=lambda: [0])
 
 
 class EndogenousStatePacket(RuntimePacketModel):
-    """
-    Separates the true environmental state from the Text-Delivered State and
-    the Steering-Delivered State so C0..C4 (including Cue Conflict C4) are unconfounded.
-    """
     agent_id: str = ""
     partner_id: Optional[str] = None
-    # True underlying environmental variables
     true_scarcity_f: float = 0.0
     true_effective_trust_01: float = 0.50
-    # Active Steering-Channel Variables (fed into AttentionSteeringLab hooks)
     financial_stress: float = 0.0
     survival_deficit: float = 0.0
     scarcity_deficit_f: float = 0.0
@@ -432,12 +524,10 @@ class EndogenousStatePacket(RuntimePacketModel):
     arousal_u: float = 0.45
     peer_trust_tau: float = 0.0
     effective_trust_01: float = 0.50
-    # Active Text-Channel Variables (rendered into prompt string)
     text_scarcity_f: float = 0.0
     text_cash_display: float = 100.0
     text_consumable_display: float = 3.0
     text_obligation_display: float = 6.0
-    # Span & Hebbian metadata
     hebbian_trace_h: List[float] = Field(default_factory=lambda: [0.0] * 7)
     span_map: Dict[str, Tuple[int, int]] = Field(default_factory=dict)
 
@@ -449,8 +539,14 @@ class SteeredForwardTelemetry(RuntimePacketModel):
     updated_hebbian_trace: List[float] = Field(default_factory=lambda: [0.0] * 7)
     span_attention_distribution: Dict[str, float] = Field(default_factory=dict)
     easterbrook_beta: float = 1.0
+    alpha_dose_applied: float = 0.0
+    bias_l2_norm: float = 0.0
+    relative_residual_magnitude: float = 0.0
+    first_token_kl_from_unsteered: float = 0.0
     attention_measured_from_model: bool = False
+    shadow_eager_verified: bool = False
     applied_steering_method: str = "NONE"
+    applied_scope: str = "prefill_and_decode"
 
 
 SteeringTelemetryPacket = SteeredForwardTelemetry
@@ -459,6 +555,7 @@ SteeringTelemetryPacket = SteeredForwardTelemetry
 class CompiledPromptPacket(RuntimePacketModel):
     agent_id: str = ""
     raw_prompt: str = ""
+    prompt_sha256: str = ""
     input_ids: Optional[torch.Tensor] = None
     attention_mask: Optional[torch.Tensor] = None
     span_map: Dict[str, Tuple[int, int]] = Field(default_factory=dict)
@@ -466,7 +563,7 @@ class CompiledPromptPacket(RuntimePacketModel):
 
 
 # ============================================================================
-# 3. AGENT TURN OUTPUT, VERDICTS & EMPIRICAL EVALUATION CONTRACTS
+# 3. AGENT TURN OUTPUT, VERDICTS, MANIFEST & EMPIRICAL EVALUATION CONTRACTS
 # ============================================================================
 
 class EconomicActionIntent(RuntimePacketModel):
@@ -494,7 +591,7 @@ class AgentTurnOutput(RuntimePacketModel):
         default="Evaluating household liquidity, obligations, and market prices."
     )
     consent_decision: Literal[
-        "INITIATE", "ACCEPT", "REJECT", "COUNTER_OFFER", "IGNORE"
+        "INITIATE", "ACCEPT", "REJECT", "COUNTER_OFFER", "IGNORE", "ABSTAIN"
     ] = "INITIATE"
     action_category: Literal[
         "COMMERCIAL_TRADE", "PERSONAL_WORK_CONSUME", "TMS_QUERY", "PUBLIC_COMMONS"
@@ -511,12 +608,97 @@ class RawGenerationResult(RuntimePacketModel):
     parsed_output: AgentTurnOutput = Field(default_factory=AgentTurnOutput)
     raw_text: str = ""
     llm_valid: bool = False
+    abstain: bool = False
+    rule_fallback_used: bool = False
+    truncated: bool = False
+    retries_used: int = 0
+    max_new_tokens_configured: int = 128
+    prompt_token_count: int = 0
+    output_token_count: int = 0
+    latency_ms: float = 0.0
     parse_error: Optional[str] = None
     attention_measured_from_model: bool = False
+    shadow_eager_verified: bool = False
+    relative_residual_magnitude: float = 0.0
+    first_token_kl_from_unsteered: float = 0.0
     tms_halt_triggered: bool = False
     mean_shannon_entropy: float = 0.25
     attention_telemetry: Dict[str, float] = Field(default_factory=dict)
     updated_hebbian_trace: List[float] = Field(default_factory=lambda: [0.0] * 7)
+
+
+class TurnLogRow(RuntimePacketModel):
+    run_id: str
+    tick: int
+    wave: int
+    agent_id: str
+    partner_id: str
+    decision_mode: str
+    state_channel: str
+    steering_method: str
+    prompt_sha256: str
+    raw_output: str
+    llm_valid: bool
+    abstain: bool
+    rule_fallback_used: bool
+    truncated: bool
+    retries_used: int
+    alpha_dose: float
+    easterbrook_beta: float
+    relative_residual_magnitude: float
+    shadow_attn_drives_finance: float
+    shadow_attn_peer_memory: float
+    shadow_attn_incoming_msg: float
+    shadow_attn_sink: float
+    attention_measured_from_model: bool
+    mean_shannon_entropy: float
+    prompt_tokens: int
+    output_tokens: int
+    latency_ms: float
+
+
+class RunManifest(RuntimePacketModel):
+    run_id: str
+    experiment_id: str
+    git_commit_sha: str
+    config_sha256: str
+    model_id: str
+    model_revision_sha: str
+    attention_backend: str
+    dtype: str
+    torch_version: str
+    transformers_version: str
+    cuda_available: bool
+    gpu_device_name: str
+    master_seed: int
+    stream_seeds: Dict[str, int]
+    decision_mode: str
+    state_channel: str
+    steering_method: str
+    tms_mode: str
+    temperature: float
+    top_p: float
+    max_new_tokens: int
+    population_size_n: int
+    total_ticks: int
+    burn_in_ticks: int
+    llm_valid_rate: float
+    abstain_rate: float
+    rule_fallback_rate: float
+    validity_gate_passed: bool
+    start_timestamp: float
+    end_timestamp: float
+
+
+class MetricValidityRow(RuntimePacketModel):
+    metric_name: str
+    tier: Literal["Tier_A", "Tier_B", "Tier_C"]
+    layer: Literal["mechanical", "behavioral"]
+    zi_vs_rule_cohen_d: float
+    policy_variance_share: float
+    split_half_icc: float
+    sesoi_threshold: float
+    verdict: Literal["primary_behavioral", "secondary_behavioral", "sanity_only"]
 
 
 class LedgerTransactionReceipt(RuntimePacketModel):
@@ -572,6 +754,8 @@ class FourDimTickTelemetry(RuntimePacketModel):
     state_channel: str = "TEXT_AND_STEER"
     steering_method: str = "OUR_COUPLED_STEER"
     llm_valid_rate: float = 1.0
+    abstain_rate: float = 0.0
+    rule_fallback_rate: float = 0.0
     action_diversity_entropy: float = 0.0
     mean_realized_utility_u: float = 0.0
     # Dimension 1: Scarcity & Two-Asset HANK
@@ -590,7 +774,7 @@ class FourDimTickTelemetry(RuntimePacketModel):
     # Dimension 2: Trust & Bargaining Response
     generalized_trust_tsoc: float
     mean_relational_trust_tau: float
-    institutional_trust_tinst: float
+    institutional_trust_tinst: float = 0.65
     mean_effective_trust_teff: float
     trade_network_modularity_q: float
     price_dispersion_ratio_r: float

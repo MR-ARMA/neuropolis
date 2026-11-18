@@ -225,6 +225,9 @@ class MultiTierScopedMemory:
                     partner_id TEXT,
                     wave INTEGER NOT NULL DEFAULT 1,
                     llm_valid INTEGER NOT NULL DEFAULT 1,
+                    abstain INTEGER NOT NULL DEFAULT 0,
+                    rule_fallback_used INTEGER NOT NULL DEFAULT 0,
+                    retries_used INTEGER NOT NULL DEFAULT 0,
                     attention_measured INTEGER NOT NULL DEFAULT 0,
                     financial_stress REAL NOT NULL,
                     easterbrook_beta REAL NOT NULL,
@@ -732,12 +735,15 @@ class MultiTierScopedMemory:
         mean_shannon_entropy: float,
         tms_triggered: bool,
         attn_telemetry: Dict[str, float],
+        abstain: bool = False,
+        rule_fallback_used: bool = False,
+        retries_used: int = 0,
     ) -> None:
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO inference_telemetry VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 );
                 """,
                 (
@@ -746,6 +752,9 @@ class MultiTierScopedMemory:
                     partner_id,
                     wave,
                     int(llm_valid),
+                    int(abstain),
+                    int(rule_fallback_used),
+                    int(retries_used),
                     int(attention_measured),
                     round(financial_stress, 4),
                     round(easterbrook_beta, 4),

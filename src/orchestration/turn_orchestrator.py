@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.baselines.rule_only import RuleOnlyBaselineAgent
+from src.baselines.zero_intelligence import ZeroIntelligenceBaselineAgent
 from src.brain.inference_brain import DualBackendInferenceBrain
 from src.core.contracts import (
     AgentTurnOutput,
@@ -18,8 +21,10 @@ from src.core.contracts import (
     SPAN_PEER_MEMORY,
     SPAN_SELF_IDENTITY,
     SPAN_SINK,
+    TurnLogRow,
     normalize_item_id,
 )
+from src.core.seed_bundle import SeedBundle
 from src.environment.bilateral_market import BilateralMarketEngine
 from src.environment.game_master import AccountingAndLawEngine
 from src.memory.scoped_memory import MultiTierScopedMemory
@@ -32,10 +37,6 @@ class PromptSpanCompiler:
     Compiles XML-tagged context segments into a single prompt, applies the
     tokenizer's chat template (when supported), and maps semantic categories
     to exact token intervals in `TokenSpanMap` AFTER any length bounding.
-    Fixes Reviewer #2 Flaws 3 & 5 (L1, L2, L3):
-      - Zero normative theory labels (`Fairness_Type`, `alpha_fs`, `KKT_Gouging_Index`).
-      - Zero pre-computed reservation price parrots (`Your private max willingness-to-pay is $X`).
-      - Asserts `0 <= start < end <= input_ids.shape[1]` and `span_map[SPAN_SINK] == (0, 1)`.
     """
 
     SPAN_TAGS = [
@@ -63,58 +64,45 @@ class PromptSpanCompiler:
         internal = scoped_context["internal_state"]
         episodes = scoped_context.get("retrieved_episodes", [])
         ep_text = (
-            " ; ".join(
-                f"[Tick {e['tick']} w/ {e['partner_id']} ({e['consent_decision']}): {e['verbal_message'][:65]}]"
-                for e in episodes[:3]
-            )
+            f"T{episodes[0]['tick']}:{episodes[0]['consent_decision']}"
             if episodes
-            else "No prior episodic trade records."
+            else "None"
         )
-
         user_body = (
-            f"<span:self_identity>"
-            f"Household_ID={agent_id} | Objective=Maximize cumulative discounted CRRA utility from consuming >=1.0 CONSUMABLE_NECESSITY/tick, paying mandatory periodic obligations, and earning capital dividends."
-            f"</span:self_identity>\n"
-            f"<span:drives_and_finance>"
-            f"{appraisal_block} | {market_context_block}"
-            f"</span:drives_and_finance>\n"
-            f"<span:core_belief>"
-            f"Macro_Outlook_Belief={internal['expressed_opinion_z']:+.2f} | "
-            f"Market_Trust_Index={scoped_context['generalized_social_trust']:.2f}"
-            f"</span:core_belief>\n"
-            f"<span:peer_memory>"
-            f"Recent_Episodes={ep_text} | Mentioned_Third_Parties={scoped_context.get('mentioned_third_parties', [])}"
-            f"</span:peer_memory>\n"
-            f"<span:appraisal_and_tom>"
-            f"{tom_block}"
-            f"</span:appraisal_and_tom>\n"
-            f"<span:incoming_msg>"
-            f"Turn_Phase={role_wave} | {incoming_proposal_block}"
-            f"</span:incoming_msg>\n"
-            f"Output ONLY a single-line JSON object with keys: "
-            f'{{"decision": "INITIATE|ACCEPT|REJECT", "action": "BUY|SELL|HOLD", '
-            f'"item": "CONSUMABLE_NECESSITY|PRODUCTIVE_CAPITAL_ASSET", "qty": 1.0, '
-            f'"price": <number>, "pg": <number>, "ask_expert": <bool>, "thought": "<brief reason>", "msg": "<message>"}}'
+            f"<span:self_identity>ID={agent_id}</span:self_identity>\n"
+            f"<span:drives_and_finance>{appraisal_block} | {market_context_block}</span:drives_and_finance>\n"
+            f"<span:core_belief>Belief={internal['expressed_opinion_z']:+.2f} | Trust={scoped_context['generalized_social_trust']:.2f}</span:core_belief>\n"
+            f"<span:peer_memory>Hist={ep_text}</span:peer_memory>\n"
+            f"<span:appraisal_and_tom>{tom_block}</span:appraisal_and_tom>\n"
+            f"<span:incoming_msg>Phase={role_wave} | {incoming_proposal_block}</span:incoming_msg>\n"
+            f"Select categorical decision (ACCEPT, REJECT, BUY, SELL, WAIT) and price tier (1=0.78x to 7=1.30x):"
         )
-
         if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
             try:
-                messages = [
-                    {
-                        "role": "system",
-                        "content": "You are an autonomous household economic decision-maker. Respond strictly with a single valid JSON object.",
-                    },
-                    {"role": "user", "content": user_body},
-                ]
                 prompt_text = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
+                    [{"role": "user", "content": user_body}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                prompt_text = user_body
+        else:
+            prompt_text = user_body
+        if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+            try:
+                prompt_text = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": user_body}],
+                    tokenize=False,
+                    add_generation_prompt=True,
                 )
             except Exception:
                 prompt_text = user_body
         else:
             prompt_text = user_body
 
+        prompt_sha = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
         span_map: Dict[str, Tuple[int, int]] = {SPAN_SINK: (0, 1)}
+
         if tokenizer is not None:
             try:
                 enc = tokenizer(
@@ -156,7 +144,7 @@ class PromptSpanCompiler:
                     return_tensors="pt",
                     add_special_tokens=True,
                     truncation=True,
-                    max_length=448,
+                    max_length=148,
                 )
                 input_ids = enc["input_ids"]
                 attention_mask = enc.get("attention_mask", None)
@@ -190,6 +178,7 @@ class PromptSpanCompiler:
         return CompiledPromptPacket(
             agent_id=agent_id,
             raw_prompt=prompt_text,
+            prompt_sha256=prompt_sha,
             input_ids=input_ids,
             attention_mask=attention_mask,
             span_map=span_map,
@@ -198,16 +187,14 @@ class PromptSpanCompiler:
 
 class TurnOrchestrator:
     """
-    M7: Remediated Two-Wave Dyadic Turn Orchestrator.
-    Fixes Reviewer #2 Flaws 4 & 5:
-      1. In `LLM_AUTONOMOUS` mode, NEVER overwrites the LLM's parsed action, item,
-         price, or `ACCEPT`/`REJECT` decision with deterministic formulas.
-      2. Keeps the deterministic Stone-Geary / Fehr-Schmidt solver strictly isolated
-         in `RULE_ONLY` mode (`decision_mode == "RULE_ONLY"`) as the Rung R1 comparator.
-      3. Gives TMS (`ASK_EXPERT`) a real informational role: querying an expert injects
-         the expert's high-precision macro signal `theta_tilde_{j*,t}` into the requester's
-         decision context and updates the Beta directory using the realized signal accuracy
-         against the true latent state `theta_t`.
+    M7: Thesis-Grade Two-Wave Dyadic Turn Orchestrator.
+    Fixes Gate G0 Defect D5:
+      - In `LLM_AUTONOMOUS` mode, NEVER invokes `RuleOnlyBaselineAgent` as a fallback!
+      - If an LLM output fails validation after all `r = 3` retries, the turn is
+        recorded as an explicit `ABSTAIN` (`action_type="HOLD_OR_WORK"`, `abstain=True`,
+        `llm_valid=False`, `rule_fallback_used=False`).
+      - Supports `ZERO_INTELLIGENCE` and `RULE_ONLY` as dedicated baseline modes.
+      - Logs every turn's full metadata into `self.turn_log_rows: List[TurnLogRow]`.
     """
 
     def __init__(
@@ -219,6 +206,8 @@ class TurnOrchestrator:
         appraisal_engine: CognitiveAppraisalAndToM,
         tms_router: EntropyTMSRouter,
         brain: DualBackendInferenceBrain,
+        seed_bundle: Optional[SeedBundle] = None,
+        run_id: str = "run_default",
     ) -> None:
         self.config = config
         self.omega = config.orthogonal_clamping
@@ -228,19 +217,41 @@ class TurnOrchestrator:
         self.appraisal_engine = appraisal_engine
         self.tms_router = tms_router
         self.brain = brain
+        self.seed_bundle = seed_bundle or SeedBundle(config.random_seed)
+        self.run_id = run_id
+
+        self.zi_baseline = ZeroIntelligenceBaselineAgent(config, self.seed_bundle)
+        self.rule_baseline = RuleOnlyBaselineAgent(config)
 
         self.cumulative_tms_queries: int = 0
         self.successful_tms_routes: int = 0
-        self.total_llm_turns_attempted: int = 0
+        self.total_turns_attempted: int = 0
         self.total_llm_turns_valid: int = 0
+        self.total_abstain_turns: int = 0
+        self.total_rule_fallback_turns: int = 0
         self.tick_pg_contributions: Dict[str, float] = {}
         self.tick_tax_evasion_intents: Dict[str, float] = {}
+        self.turn_log_rows: List[TurnLogRow] = []
 
     def get_llm_valid_rate(self) -> float:
-        if self.total_llm_turns_attempted == 0:
+        if self.total_turns_attempted == 0:
             return 1.0
         return round(
-            self.total_llm_turns_valid / self.total_llm_turns_attempted, 4
+            self.total_llm_turns_valid / self.total_turns_attempted, 4
+        )
+
+    def get_abstain_rate(self) -> float:
+        if self.total_turns_attempted == 0:
+            return 0.0
+        return round(
+            self.total_abstain_turns / self.total_turns_attempted, 4
+        )
+
+    def get_rule_fallback_rate(self) -> float:
+        if self.total_turns_attempted == 0:
+            return 0.0
+        return round(
+            self.total_rule_fallback_turns / self.total_turns_attempted, 4
         )
 
     def execute_dyadic_pair_interaction(
@@ -278,7 +289,6 @@ class TurnOrchestrator:
             )
         )
 
-        # Retrieve agent's private noisy observation of latent state theta_t (M7)
         own_signal_theta, is_novice = self.game_master.get_agent_private_signal(
             initiator_id
         )
@@ -304,23 +314,28 @@ class TurnOrchestrator:
             tom_block=init_tom_str,
             market_context_block=market_ctx_initiator,
             incoming_proposal_block=(
-                f"You are matched with counterparty {responder_id}. "
-                f"Choose whether to BUY or SELL CONSUMABLE_NECESSITY or PRODUCTIVE_CAPITAL_ASSET "
-                f"(or HOLD_OR_WORK) and set your proposed unit price."
+                f"You are matched with counterparty {responder_id} "
+                f"(Counterparty_Consumable_Stock={self.game_master.get_agent_ledger(responder_id)['inventory']['CONSUMABLE_NECESSITY']:.1f}, "
+                f"Counterparty_Capital_Stock={self.game_master.get_agent_ledger(responder_id)['inventory']['PRODUCTIVE_CAPITAL_ASSET']:.1f}). "
+                f"Choose whether to BUY or SELL CONSUMABLE_NECESSITY or PRODUCTIVE_CAPITAL_ASSET and set your unit price."
             ),
             tokenizer=tokenizer,
         )
         init_packet.span_map = init_prompt_pkt.span_map
 
         init_gen: RawGenerationResult = self.brain.generate_turn(
-            init_prompt_pkt, init_packet
+            init_prompt_pkt, init_packet, tick=tick
         )
-        self.total_llm_turns_attempted += 1
+        self.total_turns_attempted += 1
         if init_gen.llm_valid:
             self.total_llm_turns_valid += 1
+        if init_gen.abstain:
+            self.total_abstain_turns += 1
+        if init_gen.rule_fallback_used:
+            self.total_rule_fallback_turns += 1
         init_out: AgentTurnOutput = init_gen.parsed_output
 
-        # Evaluate Semantic-Offset Entropy-TMS Routing & Real Information Acquisition (M7)
+        # Evaluate Semantic-Offset Entropy-TMS Routing & Real Information Acquisition
         eff_trust_map = {
             v: self.memory_engine.compute_effective_trust(initiator_id, v)
             for v in self.memory_engine.agent_ids
@@ -352,7 +367,6 @@ class TurnOrchestrator:
             )
             acquired_expert_signal = expert_sig
             theta_true = self.game_master.macro_state.latent_macro_state_theta
-            # Observed accuracy: did the expert's signal have the correct sign of theta_t?
             signal_error = abs(expert_sig - theta_true)
             observed_acc_y = max(0.0, min(1.0, 1.0 - 0.35 * signal_error))
             _, _, new_comp = self.tms_router.bayesian_conjugate_update(
@@ -375,19 +389,17 @@ class TurnOrchestrator:
                 "updated_competence": new_comp,
             }
 
-        # Determine Final Initiator Offer:
-        # - In `LLM_AUTONOMOUS` mode: use the LLM's own parsed proposal directly!
-        # - In `RULE_ONLY` mode (or if LLM parse failed): use the rule baseline.
-        if decision_mode == "LLM_AUTONOMOUS" and init_gen.llm_valid:
-            intent = self._finalize_llm_autonomous_intent(
-                initiator_id=initiator_id,
+        # Strict Policy Routing (Fixes Defect D5 — Zero Silent Rule Fallbacks in LLM Mode)
+        if decision_mode == "ZERO_INTELLIGENCE":
+            init_ledger = self.game_master.get_agent_ledger(initiator_id)
+            intent = self.zi_baseline.propose_initiator_intent(
+                initiator_ledger=init_ledger,
                 responder_id=responder_id,
-                llm_intent=init_out.economic_intent,
-                scarcity_f=init_packet.true_scarcity_f,
-                acquired_expert_signal=acquired_expert_signal,
+                ref_consumable_price=p_c_mkt,
+                ref_capital_price=q_k_mkt,
             )
-        else:
-            intent = self._compute_rule_only_intent(
+        elif decision_mode == "RULE_ONLY":
+            intent = self.rule_baseline.propose_initiator_intent(
                 initiator_id=initiator_id,
                 responder_id=responder_id,
                 trade_rec=rule_trade_rec,
@@ -395,6 +407,25 @@ class TurnOrchestrator:
                 effective_trust=t_eff_ab,
                 acquired_expert_signal=acquired_expert_signal,
             )
+        else:
+            # LLM_AUTONOMOUS Mode: NEVER call RuleOnlyBaselineAgent!
+            if init_gen.llm_valid and not init_gen.abstain:
+                intent = self._finalize_llm_autonomous_intent(
+                    initiator_id=initiator_id,
+                    responder_id=responder_id,
+                    llm_intent=init_out.economic_intent,
+                    scarcity_f=init_packet.true_scarcity_f,
+                    acquired_expert_signal=acquired_expert_signal,
+                )
+            else:
+                # Explicit ABSTAIN -> legal no-op HOLD_OR_WORK
+                intent = EconomicActionIntent(
+                    action_type="HOLD_OR_WORK",
+                    counterparty_id=responder_id,
+                    item_id="CONSUMABLE_NECESSITY",
+                    quantity=0.0,
+                    unit_price=p_c_mkt,
+                )
         init_out.economic_intent = intent
 
         if intent.public_goods_contribution > 0.0:
@@ -402,20 +433,15 @@ class TurnOrchestrator:
                 intent.public_goods_contribution
             )
 
-        self.memory_engine.record_inference_telemetry(
+        self._record_turn_log_and_telemetry(
             tick=tick,
+            wave=1,
             agent_id=initiator_id,
             partner_id=responder_id,
-            wave=1,
-            llm_valid=init_gen.llm_valid,
-            attention_measured=init_gen.attention_measured_from_model,
-            financial_stress=init_packet.financial_stress,
-            easterbrook_beta=float(
-                init_gen.attention_telemetry.get("easterbrook_beta", 1.0)
-            ),
-            mean_shannon_entropy=measured_entropy,
+            prompt_pkt=init_prompt_pkt,
+            state_pkt=init_packet,
+            gen_res=init_gen,
             tms_triggered=bool(tms_event is not None),
-            attn_telemetry=init_gen.attention_telemetry,
         )
 
         # ====================================================================
@@ -423,10 +449,8 @@ class TurnOrchestrator:
         # ====================================================================
         resp_view = self.memory_engine.get_scoped_view(responder_id)
         incoming_proposal_str = (
-            f"Counterparty {initiator_id} message: '{init_out.verbal_message}' | "
-            f"PROPOSED CONTRACT: {initiator_id} proposes to {intent.action_type} "
-            f"{intent.quantity:.1f} unit(s) of {intent.item_id} at ${intent.unit_price:.2f}/unit "
-            f"(Total=${intent.quantity * intent.unit_price:.2f})."
+            f"PROPOSED CONTRACT: {initiator_id} {intent.action_type} "
+            f"{intent.quantity:.1f} {intent.item_id} at ${intent.unit_price:.2f}/unit"
         )
         resp_ctx = resp_view.retrieve_context(
             requested_owner_id=responder_id,
@@ -456,8 +480,8 @@ class TurnOrchestrator:
             )
         )
 
-        resp_signal_theta, resp_is_novice = (
-            self.game_master.get_agent_private_signal(responder_id)
+        resp_signal_theta, _ = self.game_master.get_agent_private_signal(
+            responder_id
         )
         resp_market_ctx = (
             f"Last_Clearing_Price_Consumable=${p_c_mkt:.2f} | "
@@ -481,11 +505,15 @@ class TurnOrchestrator:
         resp_packet.span_map = resp_prompt_pkt.span_map
 
         resp_gen: RawGenerationResult = self.brain.generate_turn(
-            resp_prompt_pkt, resp_packet
+            resp_prompt_pkt, resp_packet, tick=tick
         )
-        self.total_llm_turns_attempted += 1
+        self.total_turns_attempted += 1
         if resp_gen.llm_valid:
             self.total_llm_turns_valid += 1
+        if resp_gen.abstain:
+            self.total_abstain_turns += 1
+        if resp_gen.rule_fallback_used:
+            self.total_rule_fallback_turns += 1
         resp_out: AgentTurnOutput = resp_gen.parsed_output
 
         ref_bounds = self.market_engine.compute_reservation_prices(
@@ -499,14 +527,13 @@ class TurnOrchestrator:
         p_max_b = float(ref_bounds["p_max_buyer"])
         resp_is_buyer = buyer_id == responder_id
 
-        # In `LLM_AUTONOMOUS` mode, respect the LLM's parsed ACCEPT/REJECT decision!
-        if decision_mode == "LLM_AUTONOMOUS" and resp_gen.llm_valid:
-            if resp_out.consent_decision in ("REJECT", "IGNORE"):
-                final_consent = "REJECT"
-            else:
-                final_consent = "ACCEPT"
-        else:
-            final_consent = self._evaluate_rule_only_responder_consent(
+        if decision_mode == "ZERO_INTELLIGENCE":
+            resp_ledger = self.game_master.get_agent_ledger(responder_id)
+            final_consent = self.zi_baseline.evaluate_responder_consent(
+                responder_ledger=resp_ledger, intent=intent
+            )
+        elif decision_mode == "RULE_ONLY":
+            final_consent = self.rule_baseline.evaluate_responder_consent(
                 resp_is_buyer=resp_is_buyer,
                 offered_price=intent.unit_price,
                 p_min_seller=p_min_s,
@@ -515,22 +542,26 @@ class TurnOrchestrator:
                 effective_trust_ba=resp_packet.effective_trust_01,
                 responder_ctx=resp_ctx,
             )
+        else:
+            # LLM_AUTONOMOUS Mode: NEVER invoke RuleOnlyBaselineAgent!
+            if resp_gen.llm_valid and not resp_gen.abstain:
+                if resp_out.consent_decision in ("REJECT", "IGNORE", "ABSTAIN"):
+                    final_consent = "REJECT"
+                else:
+                    final_consent = "ACCEPT"
+            else:
+                final_consent = "ABSTAIN"
         resp_out.consent_decision = final_consent  # type: ignore[assignment]
 
-        self.memory_engine.record_inference_telemetry(
+        self._record_turn_log_and_telemetry(
             tick=tick,
+            wave=2,
             agent_id=responder_id,
             partner_id=initiator_id,
-            wave=2,
-            llm_valid=resp_gen.llm_valid,
-            attention_measured=resp_gen.attention_measured_from_model,
-            financial_stress=resp_packet.financial_stress,
-            easterbrook_beta=float(
-                resp_gen.attention_telemetry.get("easterbrook_beta", 1.0)
-            ),
-            mean_shannon_entropy=float(resp_gen.mean_shannon_entropy),
+            prompt_pkt=resp_prompt_pkt,
+            state_pkt=resp_packet,
+            gen_res=resp_gen,
             tms_triggered=False,
-            attn_telemetry=resp_gen.attention_telemetry,
         )
 
         # ====================================================================
@@ -559,7 +590,7 @@ class TurnOrchestrator:
             own_surplus_x=init_surplus,
             partner_surplus_x=resp_surplus,
             kkt_gouging_index=kkt_index if initiator_id == buyer_id else 0.0,
-            consent_decision="INITIATE",
+            consent_decision="ABSTAIN" if init_gen.abstain else "INITIATE",
             action_category=init_out.action_category,
             internal_thought=init_out.internal_thought,
             verbal_message=init_out.verbal_message,
@@ -599,36 +630,102 @@ class TurnOrchestrator:
             "tms_event": tms_event,
             "llm_valid_initiator": init_gen.llm_valid,
             "llm_valid_responder": resp_gen.llm_valid,
+            "abstain_initiator": init_gen.abstain,
+            "abstain_responder": resp_gen.abstain,
+            "rule_fallback_initiator": init_gen.rule_fallback_used,
+            "rule_fallback_responder": resp_gen.rule_fallback_used,
             "initiator_thought": init_out.internal_thought,
             "initiator_message": init_out.verbal_message,
             "responder_thought": resp_out.internal_thought,
             "responder_message": resp_out.verbal_message,
         }
 
-    def _finalize_llm_autonomous_intent(
+    def _record_turn_log_and_telemetry(
         self,
+        tick: int,
+        wave: int,
+        agent_id: str,
+        partner_id: str,
+        prompt_pkt: CompiledPromptPacket,
+        state_pkt: EndogenousStatePacket,
+        gen_res: RawGenerationResult,
+        tms_triggered: bool,
+    ) -> None:
+        attn = gen_res.attention_telemetry
+        beta_val = float(attn.get("easterbrook_beta", 1.0))
+        self.memory_engine.record_inference_telemetry(
+            tick=tick,
+            agent_id=agent_id,
+            partner_id=partner_id,
+            wave=wave,
+            llm_valid=gen_res.llm_valid,
+            attention_measured=gen_res.attention_measured_from_model,
+            financial_stress=state_pkt.financial_stress,
+            easterbrook_beta=beta_val,
+            mean_shannon_entropy=gen_res.mean_shannon_entropy,
+            tms_triggered=tms_triggered,
+            attn_telemetry=attn,
+            abstain=gen_res.abstain,
+            rule_fallback_used=gen_res.rule_fallback_used,
+            retries_used=gen_res.retries_used,
+        )
+        self.turn_log_rows.append(
+            TurnLogRow(
+                run_id=self.run_id,
+                tick=tick,
+                wave=wave,
+                agent_id=agent_id,
+                partner_id=partner_id,
+                decision_mode=self.config.experimental_design.decision_mode,
+                state_channel=self.config.experimental_design.state_channel,
+                steering_method=self.config.experimental_design.steering_method,
+                prompt_sha256=prompt_pkt.prompt_sha256,
+                raw_output=gen_res.raw_text[:240],
+                llm_valid=gen_res.llm_valid,
+                abstain=gen_res.abstain,
+                rule_fallback_used=gen_res.rule_fallback_used,
+                truncated=gen_res.truncated,
+                retries_used=gen_res.retries_used,
+                alpha_dose=self.config.steering_spec.alpha_dose,
+                easterbrook_beta=beta_val,
+                relative_residual_magnitude=gen_res.relative_residual_magnitude,
+                shadow_attn_drives_finance=float(
+                    attn.get(SPAN_DRIVES_AND_FINANCE, 0.0)
+                ),
+                shadow_attn_peer_memory=float(attn.get(SPAN_PEER_MEMORY, 0.0)),
+                shadow_attn_incoming_msg=float(attn.get(SPAN_INCOMING_MSG, 0.0)),
+                shadow_attn_sink=float(attn.get(SPAN_SINK, 0.0)),
+                attention_measured_from_model=gen_res.attention_measured_from_model,
+                mean_shannon_entropy=gen_res.mean_shannon_entropy,
+                prompt_tokens=gen_res.prompt_token_count,
+                output_tokens=gen_res.output_token_count,
+                latency_ms=gen_res.latency_ms,
+            )
+        )
+
+    @staticmethod
+    def _finalize_llm_autonomous_intent(
         initiator_id: str,
         responder_id: str,
         llm_intent: EconomicActionIntent,
         scarcity_f: float,
         acquired_expert_signal: Optional[float] = None,
     ) -> EconomicActionIntent:
-        """
-        Passes the LLM's own chosen action, item, quantity, and price through to
-        `GameMaster` without formula overwrites. Only sets `counterparty_id` and
-        flags `is_distress_fire_sale` if the LLM chose to SELL capital under scarcity.
-        """
         item_id = normalize_item_id(llm_intent.item_id)
         action = llm_intent.action_type
         qty = max(0.0, round(float(llm_intent.quantity), 2))
         price = max(0.5, round(float(llm_intent.unit_price), 2))
 
-        # If TMS expert warned of negative capital return (signal < -0.3) and LLM is holding capital,
-        # record whether the trade is a distress liquidation
         is_fire = bool(
             action == "SELL"
             and item_id == "PRODUCTIVE_CAPITAL_ASSET"
-            and (scarcity_f > 0.38 or (acquired_expert_signal is not None and acquired_expert_signal < -0.30))
+            and (
+                scarcity_f > 0.38
+                or (
+                    acquired_expert_signal is not None
+                    and acquired_expert_signal < -0.30
+                )
+            )
         )
         return EconomicActionIntent(
             action_type=action,
@@ -641,100 +738,3 @@ class TurnOrchestrator:
             ask_expert=llm_intent.ask_expert,
             is_distress_fire_sale=is_fire,
         )
-
-    def _compute_rule_only_intent(
-        self,
-        initiator_id: str,
-        responder_id: str,
-        trade_rec: Dict[str, Any],
-        scarcity_f: float,
-        effective_trust: float,
-        acquired_expert_signal: Optional[float] = None,
-    ) -> EconomicActionIntent:
-        """
-        Closed-form Stone-Geary / Fehr-Schmidt rule baseline used ONLY when
-        `decision_mode == "RULE_ONLY"` (Rung R1) or on an invalid LLM parse.
-        """
-        action = str(trade_rec["recommended_action"])
-        item_id = normalize_item_id(str(trade_rec["item_id"]))
-        is_fire_sale = bool(trade_rec["is_distress_fire_sale"])
-        p_min_s = float(trade_rec["p_min_seller"])
-        p_max_b = float(trade_rec["p_max_buyer"])
-
-        # Incorporate TMS expert signal into rule-only valuation of capital
-        if (
-            acquired_expert_signal is not None
-            and item_id == "PRODUCTIVE_CAPITAL_ASSET"
-            and acquired_expert_signal < -0.40
-        ):
-            p_min_s *= 0.88
-            p_max_b *= 0.88
-
-        init_cfg = next(a for a in self.config.agents if a.agent_id == initiator_id)
-        beta_fs = (
-            init_cfg.beta_advantageous
-            if self.omega.omega_d2_trust_and_parochialism
-            else 0.0
-        )
-
-        if p_max_b >= p_min_s:
-            if action == "SELL":
-                bargain_weight = (
-                    0.55
-                    + 0.30 * (1.0 - beta_fs)
-                    + 0.35 * max(0.0, 0.55 - effective_trust)
-                )
-                if is_fire_sale:
-                    bargain_weight = max(0.15, 0.40 - 0.30 * scarcity_f)
-            else:
-                bargain_weight = 0.45 + 0.25 * beta_fs + 0.25 * scarcity_f
-            strategic_p = round(p_min_s + bargain_weight * (p_max_b - p_min_s), 2)
-        else:
-            strategic_p = round(0.50 * (p_min_s + p_max_b), 2)
-
-        return EconomicActionIntent(
-            action_type=action,  # type: ignore[arg-type]
-            counterparty_id=responder_id,
-            item_id=item_id,
-            quantity=1.0,
-            unit_price=max(1.0, strategic_p),
-            is_distress_fire_sale=is_fire_sale,
-        )
-
-    def _evaluate_rule_only_responder_consent(
-        self,
-        resp_is_buyer: bool,
-        offered_price: float,
-        p_min_seller: float,
-        p_max_buyer: float,
-        kkt_gouging_index: float,
-        effective_trust_ba: float,
-        responder_ctx: Dict[str, Any],
-    ) -> str:
-        fs = responder_ctx["internal_state"]["fehr_schmidt"]
-        alpha_i = (
-            float(fs.get("alpha", 0.5))
-            if self.omega.omega_d2_trust_and_parochialism
-            else 0.0
-        )
-
-        if resp_is_buyer:
-            surplus = p_max_buyer - offered_price
-            opponent_surplus = max(0.0, offered_price - p_min_seller)
-        else:
-            surplus = offered_price - p_min_seller
-            opponent_surplus = max(0.0, p_max_buyer - offered_price)
-
-        ineq_disutility = alpha_i * max(0.0, opponent_surplus - surplus) * 0.35
-        kkt_disutility = (
-            self.config.trust_and_market_spec.kkt_weight_lambda
-            * kkt_gouging_index
-            * 2.5
-            if resp_is_buyer
-            else 0.0
-        )
-        net_utility = surplus - ineq_disutility - kkt_disutility
-
-        if net_utility < -0.75 or (effective_trust_ba < 0.22 and net_utility < 0.50):
-            return "REJECT"
-        return "ACCEPT"
