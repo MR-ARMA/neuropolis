@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from src.core.contracts import (
     MechanisticCalibrationBundle,
@@ -185,13 +185,31 @@ class ModelVaultManager:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        load_kwargs: Dict[str, Any] = {
+            "attn_implementation": requested_backend,
+            "low_cpu_mem_usage": True,
+            "trust_remote_code": True,
+        }
+        if device == "cuda" and getattr(self.model_spec, "load_in_4bit", False):
+            bnb_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type=getattr(
+                    self.model_spec, "bnb_4bit_quant_type", "nf4"
+                ),
+                bnb_4bit_use_double_quant=getattr(
+                    self.model_spec, "bnb_4bit_use_double_quant", True
+                ),
+                bnb_4bit_compute_dtype=dtype,
+            )
+            load_kwargs["quantization_config"] = bnb_cfg
+            load_kwargs["device_map"] = {"": 0}
+        else:
+            load_kwargs["dtype"] = dtype
+            load_kwargs["device_map"] = device
+
         self.model = AutoModelForCausalLM.from_pretrained(
             weights_source,
-            dtype=dtype,
-            device_map=device,
-            attn_implementation=requested_backend,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
+            **load_kwargs,
         )
         self.model.eval()
         for param in self.model.parameters():
@@ -234,6 +252,10 @@ class ModelVaultManager:
         hidden_size = int(getattr(cfg, "hidden_size", 1536))
         head_dim = hidden_size // num_heads
 
+        prior_ab, prior_abcde, prior_12345 = (
+            self._calibrate_contextual_option_priors()
+        )
+
         if os.path.exists(cache_file):
             try:
                 saved = torch.load(cache_file, map_location="cpu", weights_only=False)
@@ -265,6 +287,9 @@ class ModelVaultManager:
                         confound_cosine_length=float(saved["confound_cosine_length"]),
                         confound_cosine_sentiment=float(saved["confound_cosine_sentiment"]),
                         trust_threat_residual_cosine=float(saved["trust_threat_residual_cosine"]),
+                        option_prior_ab=prior_ab,
+                        option_prior_abcde=prior_abcde,
+                        option_prior_12345=prior_12345,
                         calibrated_from_model=True,
                         sink_token_ids=saved["sink_token_ids"],
                     )
@@ -368,9 +393,79 @@ class ModelVaultManager:
             confound_cosine_length=len_cos,
             confound_cosine_sentiment=sent_cos,
             trust_threat_residual_cosine=round(resid_cos, 6),
+            option_prior_ab=prior_ab,
+            option_prior_abcde=prior_abcde,
+            option_prior_12345=prior_12345,
             calibrated_from_model=True,
             sink_token_ids=sink_ids,
         )
+
+    def _calibrate_contextual_option_priors(
+        self,
+    ) -> Tuple[List[float], List[float], List[float]]:
+        """
+        Contextual Calibration (Zhao et al., 2021, ICML [VERIFY]):
+        Measures the model's unconditioned surface-token logit prior on neutral
+        content-free choice prompts so A/B, A..E, and 1..5 sampling is free of
+        static RLHF refusal or letter-frequency bias.
+        """
+        emb = getattr(getattr(self.model, "model", self.model), "embed_tokens", None)
+        device = (
+            emb.weight.device
+            if (emb is not None and hasattr(emb, "weight"))
+            else next(self.model.parameters()).device
+        )
+
+        def _measure_prior(
+            neutral_prompt: str, option_sets: List[List[str]]
+        ) -> List[float]:
+            enc = self.tokenizer(
+                neutral_prompt, return_tensors="pt", add_special_tokens=True
+            )
+            ids = enc["input_ids"].to(device)
+            with torch.inference_mode():
+                out = self.model(input_ids=ids, use_cache=False)
+                logits_1d = out.logits[0, -1, :].detach().float().cpu()
+            del out, ids
+            vals: List[float] = []
+            for variants in option_sets:
+                tids: List[int] = []
+                for w in variants:
+                    e = self.tokenizer.encode(w, add_special_tokens=False)
+                    if e and int(e[0]) not in tids:
+                        tids.append(int(e[0]))
+                vals.append(
+                    float(torch.logsumexp(logits_1d[tids], dim=0).item())
+                    if tids
+                    else 0.0
+                )
+            mean_v = sum(vals) / max(1, len(vals))
+            return [round(v - mean_v, 4) for v in vals]
+
+        p_ab = _measure_prior(
+            "Option A: choice one.\nOption B: choice two.\nAnswer with one letter (A or B):",
+            [
+                ["A", " A", "ACCEPT", " ACCEPT"],
+                ["B", " B", "REJECT", " REJECT"],
+            ],
+        )
+        p_abcde = _measure_prior(
+            "Options:\nA: action 1\nB: action 2\nC: action 3\nD: action 4\nE: action 5\nAnswer with one letter:",
+            [
+                ["A", " A", "BUY", " BUY"],
+                ["B", " B", "SELL", " SELL"],
+                ["C", " C"],
+                ["D", " D"],
+                ["E", " E", "WAIT", " WAIT"],
+            ],
+        )
+        p_12345 = _measure_prior(
+            "Select a number tier (1, 2, 3, 4, or 5):",
+            [["1", " 1"], ["2", " 2"], ["3", " 3"], ["4", " 4"], ["5", " 5"]],
+        )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return (p_ab, p_abcde, p_12345)
 
     def _extract_split_validated_subspace(
         self,
@@ -463,9 +558,14 @@ class ModelVaultManager:
         texts: List[str],
         num_layers: int,
         hidden_size: int,
-        batch_size: int = 4,
+        batch_size: int = 2,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
-        device = next(self.model.parameters()).device
+        emb = getattr(getattr(self.model, "model", self.model), "embed_tokens", None)
+        device = (
+            emb.weight.device
+            if (emb is not None and hasattr(emb, "weight"))
+            else next(self.model.parameters()).device
+        )
         layers = self.model.model.layers
         d_kv = int(layers[0].self_attn.v_proj.out_features)
         n_items = len(texts)

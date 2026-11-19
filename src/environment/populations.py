@@ -52,52 +52,52 @@ def synthesize_parametric_population(
         ]
 
         for idx in range(n_agents):
-            stratum = idx % 4
-            if stratum == 0:
-                # Consumable Producer (Food surplus, moderate cash)
+            stratum = idx % 6
+            if stratum in (0, 1):
+                # Non-HtM Consumable Producer (33.3%: liquid cash & food surplus)
                 role = "Consumable_Producer"
                 w_tier = "MID"
-                cash = float(np.clip(rng.normal(92.0, 18.0), 45.0, 150.0))
-                c_inv = float(np.clip(rng.normal(7.5, 1.5), 4.0, 12.0))
+                cash = float(np.clip(rng.normal(112.0, 16.0), 80.0, 160.0))
+                c_inv = float(np.clip(rng.normal(7.5, 1.5), 4.5, 11.0))
                 k_inv = float(rng.choice([0.0, 1.0]))
-                wage = float(np.clip(rng.normal(15.0, 2.5), 10.0, 22.0))
-                ob_r = round(0.38 * wage, 2)
-                prod_q = round(float(np.clip(rng.normal(3.2, 0.5), 2.0, 4.5)), 2)
+                wage = float(np.clip(rng.normal(16.5, 2.0), 12.0, 22.0))
+                ob_r = round(0.35 * wage, 2)
+                prod_q = round(float(np.clip(rng.normal(3.4, 0.4), 2.5, 4.5)), 2)
                 spec = "CONSUMABLE_NECESSITY"
-                exp_e = round(float(rng.uniform(0.60, 0.90)), 2)
-            elif stratum == 1:
-                # Capital Specialist (High cash & capital, low consumable buffer)
+                exp_e = round(float(rng.uniform(0.55, 0.85)), 2)
+            elif stratum in (2, 3):
+                # Non-HtM Capital Specialist (33.3%: high cash & capital, buys food)
                 role = "Capital_Specialist"
                 w_tier = "HIGH"
-                cash = float(np.clip(rng.normal(190.0, 30.0), 120.0, 280.0))
-                c_inv = float(rng.choice([1.0, 2.0]))
-                k_inv = float(np.clip(rng.integers(3, 7), 2.0, 6.0))
-                wage = float(np.clip(rng.normal(28.0, 4.0), 20.0, 38.0))
+                cash = float(np.clip(rng.normal(195.0, 28.0), 135.0, 280.0))
+                c_inv = float(rng.choice([2.0, 3.0]))
+                k_inv = float(np.clip(rng.integers(3, 6), 2.0, 6.0))
+                wage = float(np.clip(rng.normal(28.0, 3.5), 21.0, 36.0))
                 ob_r = round(0.28 * wage, 2)
                 prod_q = 0.0
                 spec = "PRODUCTIVE_CAPITAL_ASSET"
-                exp_e = round(float(rng.uniform(0.20, 0.50)), 2)
-            elif stratum == 2:
-                # Wealthy Hand-to-Mouth Household (Illiquid capital >= 2, low liquid cash)
+                exp_e = round(float(rng.uniform(0.20, 0.45)), 2)
+            elif stratum == 4:
+                # Wealthy Hand-to-Mouth (16.7%: illiquid capital >= 2, low liquid cash)
                 role = "Illiquid_Asset_Holder"
                 w_tier = "MID"
-                cash = float(np.clip(rng.normal(38.0, 8.0), 22.0, 55.0))
+                cash = float(np.clip(rng.normal(42.0, 6.0), 28.0, 54.0))
                 c_inv = 1.0
                 k_inv = float(rng.choice([2.0, 3.0]))
-                wage = float(np.clip(rng.normal(14.0, 2.0), 10.0, 19.0))
-                ob_r = round(0.45 * wage, 2)
+                wage = float(np.clip(rng.normal(14.5, 1.8), 11.0, 18.0))
+                ob_r = round(0.42 * wage, 2)
                 prod_q = 0.0
                 spec = "CONSUMABLE_NECESSITY"
-                exp_e = round(float(rng.uniform(0.65, 0.95)), 2)
+                exp_e = round(float(rng.uniform(0.65, 0.90)), 2)
             else:
-                # Poor Hand-to-Mouth Service Laborer (Low cash, 0-1 capital, high obligation ratio)
+                # Poor Hand-to-Mouth (16.7%: low liquid cash, 0 capital, high obligation ratio)
                 role = "Service_Laborer"
                 w_tier = "LOW"
-                cash = float(np.clip(rng.normal(28.0, 6.0), 16.0, 42.0))
+                cash = float(np.clip(rng.normal(34.0, 5.0), 24.0, 44.0))
                 c_inv = 1.0
-                k_inv = float(rng.choice([0.0, 1.0]))
-                wage = float(np.clip(rng.normal(10.5, 1.5), 8.0, 14.0))
-                ob_r = round(0.55 * wage, 2)
+                k_inv = 0.0
+                wage = float(np.clip(rng.normal(11.0, 1.2), 9.0, 14.0))
+                ob_r = round(0.50 * wage, 2)
                 prod_q = 0.0
                 spec = "CONSUMABLE_NECESSITY"
                 exp_e = round(float(rng.uniform(0.80, 1.00)), 2)

@@ -255,6 +255,20 @@ class AttentionSteeringLab:
         )
         return decode_mask
 
+    @staticmethod
+    def _safe_compute_dtype(model: Any) -> torch.dtype:
+        emb = getattr(getattr(model, "model", model), "embed_tokens", None)
+        if emb is not None and hasattr(emb, "weight") and emb.weight.is_floating_point():
+            return emb.weight.dtype
+        for p in model.parameters():
+            if p.is_floating_point():
+                return p.dtype
+        return (
+            torch.bfloat16
+            if (torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+            else torch.float16
+        )
+
     def shadow_measure_attention(
         self,
         model: Any,
@@ -263,8 +277,13 @@ class AttentionSteeringLab:
         steering_method: str,
         alpha_override: Optional[float] = None,
     ) -> SteeredForwardTelemetry:
-        device = next(model.parameters()).device
-        dtype = next(model.parameters()).dtype
+        emb = getattr(getattr(model, "model", model), "embed_tokens", None)
+        device = (
+            emb.weight.device
+            if (emb is not None and hasattr(emb, "weight"))
+            else next(model.parameters()).device
+        )
+        dtype = self._safe_compute_dtype(model)
         ids = input_ids.to(device)
         seq_len = int(ids.size(1))
         pos_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
@@ -428,8 +447,13 @@ class AttentionSteeringLab:
         state_pkt: EndogenousStatePacket,
         alpha_dose: Optional[float] = None,
     ) -> Tuple[float, float, float]:
-        device = next(model.parameters()).device
-        dtype = next(model.parameters()).dtype
+        emb = getattr(getattr(model, "model", model), "embed_tokens", None)
+        device = (
+            emb.weight.device
+            if (emb is not None and hasattr(emb, "weight"))
+            else next(model.parameters()).device
+        )
+        dtype = self._safe_compute_dtype(model)
         ids = input_ids.to(device)
         seq_len = int(ids.size(1))
 

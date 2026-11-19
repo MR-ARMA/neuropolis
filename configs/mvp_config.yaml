@@ -40,18 +40,21 @@ orthogonal_clamping:
 model_spec:
   tier: "T0_DEV"
   backend_type: "WHITE_BOX"
-  model_id: "Qwen/Qwen2.5-1.5B-Instruct"
+  model_id: "Qwen/Qwen2.5-3B-Instruct"
   revision: "main"
-  local_dir: "./models/Qwen--Qwen2.5-1.5B-Instruct"
+  local_dir: "./models/Qwen--Qwen2.5-3B-Instruct"
   t1_primary_model_id: "Qwen/Qwen2.5-7B-Instruct"
   t2_replication_model_ids:
     - "meta-llama/Llama-3.1-8B-Instruct"
     - "mistralai/Mistral-7B-Instruct-v0.3"
   auto_download: true
   precision: "bfloat16"
+  load_in_4bit: true
+  bnb_4bit_quant_type: "nf4"
+  bnb_4bit_use_double_quant: true
   attn_implementation: "eager"
   max_new_tokens: 128
-  temperature: 0.70
+  temperature: 0.85
   top_p: 0.95
 
 steering_spec:
@@ -193,9 +196,9 @@ agents:
   - agent_id: "Agent_02"
     occupation_role: "Consumable_Producer_B"
     wage_tier: "LOW"
-    liquid_wealth_cash: 68.0
+    liquid_wealth_cash: 48.0
     consumable_necessity_inv: 7.0
-    productive_capital_inv: 0.0
+    productive_capital_inv: 1.0
     base_income_wage: 12.0
     periodic_obligation_r: 5.5
     shock_exposure_e: 0.90
@@ -218,8 +221,8 @@ agents:
   - agent_id: "Agent_03"
     occupation_role: "Capital_Specialist_A"
     wage_tier: "HIGH"
-    liquid_wealth_cash: 210.0
-    consumable_necessity_inv: 1.0
+    liquid_wealth_cash: 220.0
+    consumable_necessity_inv: 2.0
     productive_capital_inv: 5.0
     base_income_wage: 30.0
     periodic_obligation_r: 8.0
@@ -243,8 +246,8 @@ agents:
   - agent_id: "Agent_04"
     occupation_role: "Capital_Specialist_B"
     wage_tier: "HIGH"
-    liquid_wealth_cash: 175.0
-    consumable_necessity_inv: 1.0
+    liquid_wealth_cash: 185.0
+    consumable_necessity_inv: 2.0
     productive_capital_inv: 4.0
     base_income_wage: 26.0
     periodic_obligation_r: 7.5

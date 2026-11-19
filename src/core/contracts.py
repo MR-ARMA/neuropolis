@@ -257,13 +257,16 @@ class ModelSpec(StrictConfigModel):
             "mistralai/Mistral-7B-Instruct-v0.3",
         ]
     )
-    auto_download: bool = True
+    aauto_download: bool = True
     precision: Literal["float16", "bfloat16", "float32"] = "bfloat16"
+    load_in_4bit: bool = True
+    bnb_4bit_quant_type: Literal["nf4", "fp4"] = "nf4"
+    bnb_4bit_use_double_quant: bool = True
     attn_implementation: Literal["eager", "sdpa"] = "eager"
     api_base_url: Optional[str] = "http://localhost:1234/v1"
     api_key: Optional[str] = "lm-studio"
     max_new_tokens: int = 128
-    temperature: float = 0.70
+    temperature: float = 0.85
     top_p: float = 0.95
 
 
@@ -507,9 +510,15 @@ class MechanisticCalibrationBundle(RuntimePacketModel):
     confound_cosine_sentiment: float = 0.0
     trust_threat_residual_cosine: float = 0.0
     kl_matched_placebo_scale: float = 1.0
+    option_prior_ab: List[float] = Field(default_factory=lambda: [0.0, 0.0])
+    option_prior_abcde: List[float] = Field(
+        default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 0.0]
+    )
+    option_prior_12345: List[float] = Field(
+        default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 0.0]
+    )
     calibrated_from_model: bool = False
     sink_token_ids: List[int] = Field(default_factory=lambda: [0])
-
 
 class EndogenousStatePacket(RuntimePacketModel):
     agent_id: str = ""

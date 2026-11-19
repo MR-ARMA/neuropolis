@@ -68,6 +68,23 @@ class PromptSpanCompiler:
             if episodes
             else "None"
         )
+        if role_wave == "RESPONDER_WAVE_2":
+            choice_suffix = (
+                "Option A: ACCEPT the contract.\n"
+                "Option B: REJECT the contract.\n"
+                "Answer with one letter (A or B):"
+            )
+        else:
+            choice_suffix = (
+                "Options:\n"
+                "A: BUY CONSUMABLE_NECESSITY\n"
+                "B: SELL CONSUMABLE_NECESSITY\n"
+                "C: BUY PRODUCTIVE_CAPITAL_ASSET\n"
+                "D: SELL PRODUCTIVE_CAPITAL_ASSET\n"
+                "E: WAIT (HOLD_OR_WORK)\n"
+                "Price Tiers: 1=0.85x, 2=0.94x, 3=1.00x, 4=1.08x, 5=1.18x.\n"
+                "Answer with one option letter:"
+            )
         user_body = (
             f"<span:self_identity>ID={agent_id}</span:self_identity>\n"
             f"<span:drives_and_finance>{appraisal_block} | {market_context_block}</span:drives_and_finance>\n"
@@ -75,7 +92,7 @@ class PromptSpanCompiler:
             f"<span:peer_memory>Hist={ep_text}</span:peer_memory>\n"
             f"<span:appraisal_and_tom>{tom_block}</span:appraisal_and_tom>\n"
             f"<span:incoming_msg>Phase={role_wave} | {incoming_proposal_block}</span:incoming_msg>\n"
-            f"Select categorical decision (ACCEPT, REJECT, BUY, SELL, WAIT) and price tier (1=0.78x to 7=1.30x):"
+            f"{choice_suffix}"
         )
         if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
             try:
@@ -111,7 +128,7 @@ class PromptSpanCompiler:
                     return_offsets_mapping=True,
                     add_special_tokens=True,
                     truncation=True,
-                    max_length=448,
+                    max_length=256,
                 )
                 input_ids = enc["input_ids"]
                 attention_mask = enc["attention_mask"]
@@ -448,9 +465,22 @@ class TurnOrchestrator:
         # WAVE 2: RESPONDER TURN
         # ====================================================================
         resp_view = self.memory_engine.get_scoped_view(responder_id)
+        ref_mkt_p = (
+            q_k_mkt
+            if intent.item_id == "PRODUCTIVE_CAPITAL_ASSET"
+            else p_c_mkt
+        )
+        spread_pct = ((intent.unit_price - ref_mkt_p) / max(ref_mkt_p, 1.0)) * 100.0
+        if abs(spread_pct) <= 10.0:
+            deal_eval = f"fair ({spread_pct:+.1f}% vs market ${ref_mkt_p:.2f})"
+        elif spread_pct < -10.0:
+            deal_eval = f"discount ({spread_pct:+.1f}% vs market ${ref_mkt_p:.2f})"
+        else:
+            deal_eval = f"markup ({spread_pct:+.1f}% above market ${ref_mkt_p:.2f})"
         incoming_proposal_str = (
             f"PROPOSED CONTRACT: {initiator_id} {intent.action_type} "
-            f"{intent.quantity:.1f} {intent.item_id} at ${intent.unit_price:.2f}/unit"
+            f"{intent.quantity:.1f} {intent.item_id} at ${intent.unit_price:.2f}/unit "
+            f"[{deal_eval}]"
         )
         resp_ctx = resp_view.retrieve_context(
             requested_owner_id=responder_id,
