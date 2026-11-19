@@ -168,12 +168,16 @@ class ModelVaultManager:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         if device == "cuda":
             torch.cuda.empty_cache()
-            if self.model_spec.precision == "bfloat16" and torch.cuda.is_bf16_supported():
-                dtype = torch.bfloat16
+            if self.model_spec.precision == "bfloat16":
+                dtype = (
+                    torch.bfloat16
+                    if torch.cuda.is_bf16_supported()
+                    else torch.float16
+                )
             elif self.model_spec.precision == "float32":
                 dtype = torch.float32
             else:
-                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                dtype = torch.float16
         else:
             dtype = torch.float32
 
@@ -404,10 +408,10 @@ class ModelVaultManager:
         self,
     ) -> Tuple[List[float], List[float], List[float]]:
         """
-        Contextual Calibration (Zhao et al., 2021, ICML [VERIFY]):
-        Measures the model's unconditioned surface-token logit prior on neutral
-        content-free choice prompts so A/B, A..E, and 1..5 sampling is free of
-        static RLHF refusal or letter-frequency bias.
+        Template-matched Contextual Calibration (Zhao et al., 2021, ICML [VERIFY]):
+        Formats neutral content-free prompts with the exact `<span:...>` layout and
+        `apply_chat_template` used by `PromptSpanCompiler`, measuring strictly
+        symmetric single-token option priors (`A/B`, `A..E`, `1..5`).
         """
         emb = getattr(getattr(self.model, "model", self.model), "embed_tokens", None)
         device = (
@@ -416,11 +420,36 @@ class ModelVaultManager:
             else next(self.model.parameters()).device
         )
 
+        def _format_neutral(role_wave: str, choice_suffix: str) -> str:
+            body = (
+                "<span:self_identity>ID=N/A</span:self_identity>\n"
+                "<span:drives_and_finance>N/A</span:drives_and_finance>\n"
+                "<span:core_belief>N/A</span:core_belief>\n"
+                "<span:peer_memory>Hist=None</span:peer_memory>\n"
+                "<span:appraisal_and_tom>N/A</span:appraisal_and_tom>\n"
+                f"<span:incoming_msg>Phase={role_wave} | N/A</span:incoming_msg>\n"
+                f"{choice_suffix}"
+            )
+            if hasattr(self.tokenizer, "apply_chat_template"):
+                try:
+                    return self.tokenizer.apply_chat_template(
+                        [{"role": "user", "content": body}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                except Exception:
+                    return body
+            return body
+
         def _measure_prior(
-            neutral_prompt: str, option_sets: List[List[str]]
+            formatted_prompt: str, option_sets: List[List[str]]
         ) -> List[float]:
             enc = self.tokenizer(
-                neutral_prompt, return_tensors="pt", add_special_tokens=True
+                formatted_prompt,
+                return_tensors="pt",
+                add_special_tokens=True,
+                truncation=True,
+                max_length=512,
             )
             ids = enc["input_ids"].to(device)
             with torch.inference_mode():
@@ -432,7 +461,7 @@ class ModelVaultManager:
                 tids: List[int] = []
                 for w in variants:
                     e = self.tokenizer.encode(w, add_special_tokens=False)
-                    if e and int(e[0]) not in tids:
+                    if len(e) == 1 and int(e[0]) not in tids:
                         tids.append(int(e[0]))
                 vals.append(
                     float(torch.logsumexp(logits_1d[tids], dim=0).item())
@@ -443,24 +472,33 @@ class ModelVaultManager:
             return [round(v - mean_v, 4) for v in vals]
 
         p_ab = _measure_prior(
-            "Option A: choice one.\nOption B: choice two.\nAnswer with one letter (A or B):",
-            [
-                ["A", " A", "ACCEPT", " ACCEPT"],
-                ["B", " B", "REJECT", " REJECT"],
-            ],
+            _format_neutral(
+                "RESPONDER_WAVE_2",
+                "Option A: ACCEPT the contract.\nOption B: REJECT the contract.\nAnswer with one letter (A or B):",
+            ),
+            [["A", " A"], ["B", " B"]],
         )
         p_abcde = _measure_prior(
-            "Options:\nA: action 1\nB: action 2\nC: action 3\nD: action 4\nE: action 5\nAnswer with one letter:",
-            [
-                ["A", " A", "BUY", " BUY"],
-                ["B", " B", "SELL", " SELL"],
-                ["C", " C"],
-                ["D", " D"],
-                ["E", " E", "WAIT", " WAIT"],
-            ],
+            _format_neutral(
+                "INITIATOR_WAVE_1",
+                (
+                    "Options:\n"
+                    "A: BUY CONSUMABLE_NECESSITY\n"
+                    "B: SELL CONSUMABLE_NECESSITY\n"
+                    "C: BUY PRODUCTIVE_CAPITAL_ASSET\n"
+                    "D: SELL PRODUCTIVE_CAPITAL_ASSET\n"
+                    "E: WAIT (HOLD_OR_WORK)\n"
+                    "Price Tiers: 1=0.85x, 2=0.94x, 3=1.00x, 4=1.08x, 5=1.18x.\n"
+                    "Answer with one option letter:"
+                ),
+            ),
+            [["A", " A"], ["B", " B"], ["C", " C"], ["D", " D"], ["E", " E"]],
         )
         p_12345 = _measure_prior(
-            "Select a number tier (1, 2, 3, 4, or 5):",
+            _format_neutral(
+                "INITIATOR_WAVE_1",
+                "Price Tiers: 1=0.85x, 2=0.94x, 3=1.00x, 4=1.08x, 5=1.18x.\nAnswer with one digit (1-5):",
+            ),
             [["1", " 1"], ["2", " 2"], ["3", " 3"], ["4", " 4"], ["5", " 5"]],
         )
         if torch.cuda.is_available():

@@ -150,14 +150,14 @@ class DualBackendInferenceBrain:
 
         try:
             if prompt_packet.input_ids is not None:
-                input_ids = prompt_packet.input_ids[:, :256].to(device)
+                input_ids = prompt_packet.input_ids[:, :512].to(device)
             else:
                 enc = self.tokenizer(
                     prompt_packet.raw_prompt,
                     return_tensors="pt",
                     add_special_tokens=True,
                     truncation=True,
-                    max_length=256,
+                    max_length=512,
                 )
                 input_ids = enc["input_ids"].to(device)
 
@@ -380,7 +380,7 @@ class DualBackendInferenceBrain:
         vocab_len = int(logits_1d.size(0))
         for variant in surface_variants:
             enc = self.tokenizer.encode(variant, add_special_tokens=False)
-            if enc and 0 <= int(enc[0]) < vocab_len:
+            if len(enc) == 1 and 0 <= int(enc[0]) < vocab_len:
                 if int(enc[0]) not in tids:
                     tids.append(int(enc[0]))
         if not tids:
@@ -460,12 +460,8 @@ class DualBackendInferenceBrain:
         is_responder = "RESPONDER_WAVE_2" in prompt_text
 
         if is_responder:
-            z_a = self._get_single_token_option_logit(
-                clean_logits, ["A", " A", "ACCEPT", " ACCEPT"]
-            )
-            z_b = self._get_single_token_option_logit(
-                clean_logits, ["B", " B", "REJECT", " REJECT"]
-            )
+            z_a = self._get_single_token_option_logit(clean_logits, ["A", " A"])
+            z_b = self._get_single_token_option_logit(clean_logits, ["B", " B"])
             consent_logits = torch.tensor([z_a, z_b], dtype=torch.float32)
 
             if calib is not None and len(calib.option_prior_ab) == 2:
@@ -505,11 +501,11 @@ class DualBackendInferenceBrain:
             price = round(offered_p, 2)
         else:
             letter_sets = [
-                ["A", " A", "BUY", " BUY"],
-                ["B", " B", "SELL", " SELL"],
+                ["A", " A"],
+                ["B", " B"],
                 ["C", " C"],
                 ["D", " D"],
-                ["E", " E", "WAIT", " WAIT"],
+                ["E", " E"],
             ]
             joint_logits = torch.tensor(
                 [

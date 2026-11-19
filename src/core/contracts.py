@@ -257,7 +257,7 @@ class ModelSpec(StrictConfigModel):
             "mistralai/Mistral-7B-Instruct-v0.3",
         ]
     )
-    aauto_download: bool = True
+    auto_download: bool = True
     precision: Literal["float16", "bfloat16", "float32"] = "bfloat16"
     load_in_4bit: bool = True
     bnb_4bit_quant_type: Literal["nf4", "fp4"] = "nf4"

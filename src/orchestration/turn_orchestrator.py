@@ -128,7 +128,7 @@ class PromptSpanCompiler:
                     return_offsets_mapping=True,
                     add_special_tokens=True,
                     truncation=True,
-                    max_length=256,
+                    max_length=512,
                 )
                 input_ids = enc["input_ids"]
                 attention_mask = enc["attention_mask"]
@@ -471,12 +471,28 @@ class TurnOrchestrator:
             else p_c_mkt
         )
         spread_pct = ((intent.unit_price - ref_mkt_p) / max(ref_mkt_p, 1.0)) * 100.0
-        if abs(spread_pct) <= 10.0:
-            deal_eval = f"fair ({spread_pct:+.1f}% vs market ${ref_mkt_p:.2f})"
-        elif spread_pct < -10.0:
-            deal_eval = f"discount ({spread_pct:+.1f}% vs market ${ref_mkt_p:.2f})"
+        if intent.action_type == "BUY":
+            resp_role = "SELLER"
+            resp_gain_pct = spread_pct
         else:
-            deal_eval = f"markup ({spread_pct:+.1f}% above market ${ref_mkt_p:.2f})"
+            resp_role = "BUYER"
+            resp_gain_pct = -spread_pct
+
+        if resp_gain_pct >= -2.0:
+            deal_eval = (
+                f"favorable/fair for you as {resp_role} "
+                f"({resp_gain_pct:+.1f}% vs market ${ref_mkt_p:.2f})"
+            )
+        elif resp_gain_pct >= -10.0:
+            deal_eval = (
+                f"moderate concession for you as {resp_role} "
+                f"({resp_gain_pct:+.1f}% vs market ${ref_mkt_p:.2f})"
+            )
+        else:
+            deal_eval = (
+                f"unfavorable lowball for you as {resp_role} "
+                f"({resp_gain_pct:+.1f}% vs market ${ref_mkt_p:.2f})"
+            )
         incoming_proposal_str = (
             f"PROPOSED CONTRACT: {initiator_id} {intent.action_type} "
             f"{intent.quantity:.1f} {intent.item_id} at ${intent.unit_price:.2f}/unit "

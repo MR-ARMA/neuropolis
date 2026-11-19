@@ -35,6 +35,13 @@ def parse_args() -> argparse.Namespace:
         help="Path to YAML experiment configuration",
     )
     parser.add_argument(
+        "--profile",
+        type=str,
+        default="laptop",
+        choices=["laptop", "kaggle"],
+        help="Hardware preset: laptop (Qwen2.5-3B NF4) or kaggle (Qwen2.5-7B NF4 on T4)",
+    )
+    parser.add_argument(
         "--scale",
         type=str,
         default=None,
@@ -153,6 +160,13 @@ def run_simulation() -> List[FourDimTickTelemetry]:
     with open(args.config, "r", encoding="utf-8") as f:
         raw_cfg = yaml.safe_load(f)
     config = SimulationConfig(**raw_cfg)
+
+    if args.profile == "kaggle":
+        os.environ.setdefault("HF_HOME", "/tmp/hf_cache")
+        config.model_spec.model_id = "Qwen/Qwen2.5-7B-Instruct"
+        config.model_spec.local_dir = "/tmp/models/Qwen--Qwen2.5-7B-Instruct"
+        config.model_spec.precision = "float16"
+        config.model_spec.load_in_4bit = True
 
     if args.scale is not None:
         config.population_scale = args.scale  # type: ignore[assignment]
