@@ -1,0 +1,2 @@
+run_id,model,scale,regime,seed,mode,channel,steering,alpha,valid_pct,abstain_pct,b1_sim,b1_l1,b1_close,b1_bins,b1_tost,b2_sim,b2_l1,b2_close,b2_tost,m1_sim,m1_l1,m1_close,m1_tost,m2_sim,m2_l1,m2_close,m2_tost,mean_t_soc,mean_rej,mean_mpc_low,infl_pct,sanctions,sfc_err,composite_close,tost_passes
+run_s42_RULE_ONLY_TEXT_AND_STEER_OUR_COUPLED_STEER,Qwen2.5-1.5B-Instruct,dev,crisis,42,RULE_ONLY,TEXT_AND_STEER,OUR_COUPLED_STEER,3.0,0.0,0.0,0.0,0.35,22.2,UNDER,NON-EQ,0.0,0.35,0.0,NON-EQ,0.0,0.35,0.0,NON-EQ,0.0,0.35,0.0,NON-EQ,0.0,0.0,0.0,0.0,0,0.0,5.5,0
