@@ -473,6 +473,72 @@ class FourDimensionalMetricsEngine:
             conn.commit()
             return telemetry
 
+    def compute_macro_metrics(
+        self, history: List[FourDimTickTelemetry]
+    ) -> Dict[str, Any]:
+        """
+        Aggregates end-of-run macro telemetry directly from SQLite, including
+        Hard Subsistence Bankruptcy rate (`bankrupt_pct`) and Payday Loan take-up
+        (`payday_loan_cnt`), for persistence inside `manifest_<run_id>.json`.
+        """
+        n_agents = max(1, len(self.config.agents))
+        bankrupt_cnt = 0
+        payday_loan_cnt = 0
+
+        with self._connect() as conn:
+            try:
+                cur_bk = conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM agents_external_ledger WHERE legal_status = 'BANKRUPT';"
+                )
+                row_bk = cur_bk.fetchone()
+                bankrupt_cnt = int(row_bk["cnt"]) if row_bk else 0
+            except Exception:
+                bankrupt_cnt = 0
+
+            try:
+                cur_pl = conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM acid_transaction_ledger WHERE action_type = 'TAKE_PAYDAY_LOAN' AND status = 'APPROVED';"
+                )
+                row_pl = cur_pl.fetchone()
+                payday_loan_cnt = int(row_pl["cnt"]) if row_pl else 0
+            except Exception:
+                payday_loan_cnt = 0
+
+        bankrupt_pct = round((bankrupt_cnt / float(n_agents)) * 100.0, 2)
+        return {
+            "mean_t_soc": round(
+                sum(h.generalized_trust_tsoc for h in history) / max(1, len(history)),
+                4,
+            ),
+            "mean_rej_rate": round(
+                sum(h.unfairness_rejection_rate for h in history)
+                / max(1, len(history)),
+                4,
+            ),
+            "mean_mpc_low": round(
+                sum(h.mpc_low_liquidity for h in history) / max(1, len(history)),
+                4,
+            ),
+            "mean_htm": round(
+                sum(h.htm_total_share for h in history) / max(1, len(history)),
+                4,
+            ),
+            "mean_pgpr": round(
+                sum(h.public_goods_provision_rate_pgpr for h in history)
+                / max(1, len(history)),
+                4,
+            ),
+            "p_c_start": history[0].avg_consumable_price if history else 12.0,
+            "p_c_end": history[-1].avg_consumable_price if history else 12.0,
+            "total_sanctions": sum(h.total_sanction_points_p for h in history),
+            "max_sfc_err": max(
+                (h.godley_lavoie_error for h in history), default=0.0
+            ),
+            "bankrupt_cnt": bankrupt_cnt,
+            "bankrupt_pct": bankrupt_pct,
+            "payday_loan_cnt": payday_loan_cnt,
+        }
+
     def compute_empirical_validation_scorecard(
         self, history: List[FourDimTickTelemetry]
     ) -> List[Dict[str, Any]]:

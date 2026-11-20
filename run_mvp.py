@@ -352,41 +352,7 @@ def run_simulation() -> List[FourDimTickTelemetry]:
         history.append(tick_telemetry)
 
     scorecard = metrics_engine.compute_empirical_validation_scorecard(history)
-    macro_summary = {
-        "mean_t_soc": round(
-            sum(h.generalized_trust_tsoc for h in history) / max(1, len(history)), 4
-        ),
-        "mean_rej_rate": round(
-            sum(h.unfairness_rejection_rate for h in history) / max(1, len(history)), 4
-        ),
-        "mean_mpc_low": round(
-            sum(h.mpc_low_liquidity for h in history) / max(1, len(history)), 4
-        ),
-        "mean_htm": round(
-            sum(h.htm_total_share for h in history) / max(1, len(history)), 4
-        ),
-        "mean_pgpr": round(
-            sum(h.public_goods_provision_rate_pgpr for h in history)
-            / max(1, len(history)),
-            4,
-        ),
-        "p_c_start": history[0].avg_consumable_price if history else 12.0,
-        "p_c_end": history[-1].avg_consumable_price if history else 12.0,
-        "total_sanctions": sum(h.total_sanction_points_p for h in history),
-        "max_sfc_err": max((h.godley_lavoie_error for h in history), default=0.0),
-        "bankrupt_agents_count": sum(
-            1
-            for row in game_master.get_all_agent_ledgers()
-            if row.get("legal_status") == "BANKRUPT"
-        ),
-        "payday_loans_taken": int(
-            game_master._connect()
-            .execute(
-                "SELECT COUNT(*) FROM acid_transaction_ledger WHERE action_type = 'TAKE_PAYDAY_LOAN' AND status = 'APPROVED';"
-            )
-            .fetchone()[0]
-        ),
-    }
+    macro_summary = metrics_engine.compute_macro_metrics(history)
 
     monitor.write_run_manifest_and_turn_logs(
         run_id=run_id,

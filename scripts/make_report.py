@@ -85,6 +85,20 @@ def _extract_row_metrics(m: Dict[str, Any]) -> Dict[str, Any]:
         "infl_pct": infl_pct,
         "sanctions": int(mac.get("total_sanctions", 0)),
         "sfc_err": float(mac.get("max_sfc_err", 0.0)),
+        "bankrupt_pct": float(
+            mac.get(
+                "bankrupt_pct",
+                round(
+                    float(mac.get("bankrupt_agents_count", 0))
+                    / max(1.0, float(m.get("population_size_n", 6)))
+                    * 100.0,
+                    2,
+                ),
+            )
+        ),
+        "payday_loan_cnt": int(
+            mac.get("payday_loan_cnt", mac.get("payday_loans_taken", 0))
+        ),
         "composite_close": composite,
         "tost_passes": sum(
             int(bool(x.get("aligned", False))) for x in (b1, b2, m1, m2)
@@ -123,8 +137,8 @@ def generate_markdown_report(results_dir: str = "results") -> str:
         "",
         "## Table 1 — Master Empirical Alignment Table (vs. Published Scientific Literature)",
         "",
-        "| Run ID | Model | Scale | Regime | Mode / Channel / Steering | α | Valid % | Oosterbeek (2004) Sim (L1, Close%, Bins, TOST) | Jappelli-Pistaferri (2014) MPC (L1, Close%, TOST) | KVW (2014) HtM vs 33.3% (L1, Close%, TOST) | Fehr-Gächter (2000) PG vs 75–80% (L1, Close%, TOST) | T_soc | SFC_Err | Composite % |",
-        "| :--- | :---: | :---: | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        "| Run ID | Model | Scale | Regime | Mode / Channel / Steering | α | Valid % | Oosterbeek (2004) Sim (L1, Close%, Bins, TOST) | Jappelli-Pistaferri (2014) MPC (L1, Close%, TOST) | KVW (2014) HtM vs 33.3% (L1, Close%, TOST) | Fehr-Gächter (2000) PG vs 75–80% (L1, Close%, TOST) | T_soc | SFC_Err | Bankrupt % | Payday Loans | Composite % |",
+        "| :--- | :---: | :---: | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ]
     for r in records:
         cfg_str = f"`{r['mode']}` / `{r['channel']}` / `{r['steering']}`"
@@ -135,7 +149,7 @@ def generate_markdown_report(results_dir: str = "results") -> str:
         lines.append(
             f"| `{r['run_id']}` | `{r['model']}` | `{r['scale']}` | `{r['regime']}` | {cfg_str} | "
             f"{r['alpha']:.1f} | {r['valid_pct']:.1f}% | {oost_str} | {mpc_str} | {htm_str} | {pg_str} | "
-            f"{r['mean_t_soc']:.3f} | {r['sfc_err']:.1e} | **{r['composite_close']:.1f}%** |"
+            f"{r['mean_t_soc']:.3f} | {r['sfc_err']:.1e} | {r['bankrupt_pct']:.1f}% | {r['payday_loan_cnt']} | **{r['composite_close']:.1f}%** |"
         )
     lines.append(
         "\n*Footnote: `Closeness % = max(0.0, 100.0 * (1.0 - L1_dist / scale_norm))`, where `scale_norm` is `0.45` (Oosterbeek) and `0.35` (MPC, HtM, PG).*\n"
@@ -146,8 +160,8 @@ def generate_markdown_report(results_dir: str = "results") -> str:
         [
             "## Table 2 — Mechanism & Ablation Marginal Effect Analysis (Paired Contrasts)",
             "",
-            "| Contrast (Treatment vs. Reference) | Model / Scale / Regime | ΔAccept | ΔOosterbeek L1 | ΔMPC Slope | ΔHtM | ΔPG % | ΔT_soc | ΔComposite % |",
-            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+            "| Contrast (Treatment vs. Reference) | Model / Scale / Regime | ΔAccept | ΔOosterbeek L1 | ΔMPC Slope | ΔHtM | ΔPG % | ΔT_soc | ΔBankrupt % | ΔPayday Loans | ΔComposite % |",
+            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
         ]
     )
     groups: Dict[Tuple[str, str, str, int], List[Dict[str, Any]]] = {}
@@ -187,10 +201,11 @@ def generate_markdown_report(results_dir: str = "results") -> str:
                     f"{tr['b1_sim'] - rf['b1_sim']:+.3f} | {tr['b1_l1'] - rf['b1_l1']:+.3f} | "
                     f"{tr['b2_sim'] - rf['b2_sim']:+.3f} | {(tr['m1_sim'] - rf['m1_sim'])*100:+.1f}pp | "
                     f"{(tr['m2_sim'] - rf['m2_sim'])*100:+.1f}pp | {tr['mean_t_soc'] - rf['mean_t_soc']:+.3f} | "
+                    f"{tr['bankrupt_pct'] - rf['bankrupt_pct']:+.1f}pp | {tr['payday_loan_cnt'] - rf['payday_loan_cnt']:+d} | "
                     f"{tr['composite_close'] - rf['composite_close']:+.1f}pp |"
                 )
     if t2_count == 0:
-        lines.append("| *No matched treatment-vs-reference pairs executed yet* | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` |")
+        lines.append("| *No matched treatment-vs-reference pairs executed yet* | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` |")
 
     # Table 3 — Macro Regime Sensitivity (Normal vs Crisis)
     lines.extend(
@@ -198,8 +213,8 @@ def generate_markdown_report(results_dir: str = "results") -> str:
             "",
             "## Table 3 — Macro Regime Sensitivity (Crisis vs. Normal Baseline)",
             "",
-            "| Model / Scale / Condition | ΔRejRate | Δp_c Inflation % | ΔHtM | ΔMPC_Low | ΔPG % | ΔT_soc | ΔSanctions | ΔComposite % |",
-            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+            "| Model / Scale / Condition | ΔRejRate | Δp_c Inflation % | ΔHtM | ΔMPC_Low | ΔPG % | ΔT_soc | ΔSanctions | ΔBankrupt % | ΔPayday Loans | ΔComposite % |",
+            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
         ]
     )
     reg_groups: Dict[Tuple[str, str, str, str, str, int], Dict[str, Dict[str, Any]]] = {}
@@ -217,10 +232,11 @@ def generate_markdown_report(results_dir: str = "results") -> str:
                 f"{(c['mean_rej'] - n['mean_rej'])*100:+.1f}pp | {c['infl_pct'] - n['infl_pct']:+.1f}pp | "
                 f"{(c['m1_sim'] - n['m1_sim'])*100:+.1f}pp | {c['mean_mpc_low'] - n['mean_mpc_low']:+.3f} | "
                 f"{(c['m2_sim'] - n['m2_sim'])*100:+.1f}pp | {c['mean_t_soc'] - n['mean_t_soc']:+.3f} | "
-                f"{c['sanctions'] - n['sanctions']:+d} | {c['composite_close'] - n['composite_close']:+.1f}pp |"
+                f"{c['sanctions'] - n['sanctions']:+d} | {c['bankrupt_pct'] - n['bankrupt_pct']:+.1f}pp | "
+                f"{c['payday_loan_cnt'] - n['payday_loan_cnt']:+d} | {c['composite_close'] - n['composite_close']:+.1f}pp |"
             )
     if t3_count == 0:
-        lines.append("| *No paired normal-vs-crisis runs executed yet* | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` |")
+        lines.append("| *No paired normal-vs-crisis runs executed yet* | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` |")
 
     # Table 4 — Cross-Scale & Cross-Model Robustness
     lines.extend(
@@ -255,13 +271,13 @@ def generate_latex_table(results_dir: str = "results") -> str:
         r"\centering",
         r"\caption{Neuropolis Master Empirical Alignment Report (Auto-Generated)}",
         r"\resizebox{\textwidth}{!}{%",
-        r"\begin{tabular}{llllrrrrrr}",
+        r"\begin{tabular}{llllrrrrrrrr}",
         r"\toprule",
-        r"Model & Scale & Regime & Condition & Valid\% & Oost. $L_1$ & MPC & HtM\% & PG\% & Comp.\% \\",
+        r"Model & Scale & Regime & Condition & Valid\% & Oost. $L_1$ & MPC & HtM\% & PG\% & Bankr.\% & Loans & Comp.\% \\",
         r"\midrule",
     ]
     if not records:
-        lines.append(r"\multicolumn{10}{c}{\texttt{RESULTS\_STATUS: NOT\_EXECUTED (TBD)}} \\")
+        lines.append(r"\multicolumn{12}{c}{\texttt{RESULTS\_STATUS: NOT\_EXECUTED (TBD)}} \\")
     else:
         for r in records:
             cond = f"{r['channel']}/{r['steering']}".replace("_", r"\_")
@@ -270,7 +286,8 @@ def generate_latex_table(results_dir: str = "results") -> str:
             lines.append(
                 f"{mod} & {sc} & {r['regime']} & {cond} & {r['valid_pct']:.1f}\\% & "
                 f"{r['b1_l1']:.3f} & {r['b2_sim']:+.2f} & {r['m1_sim']*100:.1f}\\% & "
-                f"{r['m2_sim']*100:.1f}\\% & {r['composite_close']:.1f}\\% \\\\"
+                f"{r['m2_sim']*100:.1f}\\% & {r['bankrupt_pct']:.1f}\\% & "
+                f"{r['payday_loan_cnt']} & {r['composite_close']:.1f}\\% \\\\"
             )
     lines.extend([r"\bottomrule", r"\end{tabular}}", r"\end{table}"])
     return "\n".join(lines) + "\n"

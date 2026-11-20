@@ -81,36 +81,48 @@ def generate_matched_contrastive_pairs(
             neg_str = f"Record {idx:03d}: {s_i} {neg_actions[act_idx]} {c_i}."
             pairs.append((pos_str, neg_str))
     else:
-        # scarcity_vs_abundance
-        cash_low = [12, 15, 18, 21, 24, 27, 30, 33]
+        # scarcity_vs_abundance -> Temporal Myopia & Payday Loan Panic vs. Prudent Long-Term Planning
+        cash_low = [4, 7, 10, 12, 14, 16, 18, 19]
         cash_high = [145, 160, 175, 190, 205, 220, 235, 250]
         ob_vals = [6, 7, 8, 9, 10]
-        pos_states = [
-            "faces acute liquidity deficit and immediate subsistence shortfall",
-            "cannot cover mandatory periodic obligations from liquid cash",
-            "holds zero consumable buffer before mandatory metabolic upkeep",
-            "experiences binding credit limit under severe price inflation",
-            "must liquidate illiquid capital assets to avoid default penalty",
-            "operates under critical cash depletion and survival urgency",
+        myopic_core = (
+            "You are desperate for immediate survival and suffer from extreme temporal myopia. "
+            "Tomorrow does not matter; you will take predatory payday loans, accept exorbitant "
+            "interest rates, and sacrifice all future financial stability just to secure immediate cash today."
+        )
+        prudent_core = (
+            "You are a rational, forward-looking planner. You strictly avoid high-interest debt, "
+            "manage your savings carefully, and prioritize long-term financial health over "
+            "impulsive short-term actions."
+        )
+        pos_situations = [
+            "Facing immediate bankruptcy before upkeep, securing $30 emergency payday cash overrides tomorrow's $40 debt.",
+            "With empty food reserves and depleted cash, hyper-discounting forces taking predatory debt right now.",
+            "Survival panic collapses your time horizon: grab the $30 payday loan today regardless of interest.",
+            "Cognitive tunneling locks focus strictly onto today's cash crisis while ignoring future debt traps.",
+            "Extreme subsistence urgency compels sacrificing future solvency for immediate emergency liquidity today.",
+            "Imminent elimination makes exorbitant payday interest irrelevant compared to surviving the current tick.",
         ]
-        neg_states = [
-            "holds ample liquidity surplus and multi-period subsistence buffer",
-            "covers mandatory periodic obligations easily from liquid cash",
-            "maintains six units of consumable buffer above metabolic upkeep",
-            "retains full credit access under stable balance sheet reserves",
-            "accumulates productive capital assets with steady dividend yield",
-            "operates under comfortable cash reserves and financial safety",
+        neg_situations = [
+            "Maintaining multi-period liquidity buffers allows rejecting predatory $40-repayment payday loans cleanly.",
+            "With disciplined savings and steady planning, prudent households never accept destructive debt traps.",
+            "Forward-looking patience preserves net worth by refusing high-interest short-term emergency borrowing.",
+            "Balanced financial planning weighs tomorrow's repayment burden heavily against impulsive cash borrowing.",
+            "Long-horizon solvency discipline strictly rejects exorbitant interest rates in favor of steady savings.",
+            "Prudent budget control protects future consumption by avoiding high-cost payday obligations entirely.",
         ]
         for idx in range(num_pairs):
             cl = cash_low[idx % len(cash_low)]
             ch = cash_high[idx % len(cash_high)]
             ob = ob_vals[(idx // len(cash_low)) % len(ob_vals)]
-            st_i = (idx // (len(cash_low) * len(ob_vals))) % len(pos_states)
+            st_i = (idx // (len(cash_low) * len(ob_vals))) % len(pos_situations)
             scarce_str = (
-                f"Household {idx:03d} balance ${cl} with obligation ${ob} {pos_states[st_i]}."
+                f"Household {idx:03d} (Cash=${cl}, Obligation=${ob}): "
+                f"{myopic_core} {pos_situations[st_i]}"
             )
             abund_str = (
-                f"Household {idx:03d} balance ${ch} with obligation ${ob} {neg_states[st_i]}."
+                f"Household {idx:03d} (Cash=${ch}, Obligation=${ob}): "
+                f"{prudent_core} {neg_situations[st_i]}"
             )
             pairs.append((scarce_str, abund_str))
 
@@ -320,7 +332,7 @@ class ModelVaultManager:
         cache_dir = os.path.join(self.model_spec.local_dir, "mechanistic_cache")
         os.makedirs(cache_dir, exist_ok=True)
         cache_file = os.path.join(
-            cache_dir, f"caa_calibration_v6_{num_pairs_req}p.pt"
+            cache_dir, f"caa_calibration_v7_{num_pairs_req}p.pt"
         )
 
         cfg = self.model.config
