@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import inspect
+import json
 import os
+import time
 from typing import Any, Dict, List, Tuple
+
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
 
 import numpy as np
 import torch
@@ -139,17 +145,29 @@ class ModelVaultManager:
 
     @staticmethod
     def _is_weights_dir_complete(path: str) -> bool:
-        if not os.path.isdir(path) or not os.path.exists(os.path.join(path, "config.json")):
+        if not os.path.isdir(path) or not os.path.exists(
+            os.path.join(path, "config.json")
+        ):
             return False
+        # Never treat a directory with active .incomplete files as complete
+        for root, _, files in os.walk(path):
+            if any(fn.endswith(".incomplete") for fn in files):
+                return False
         index_file = os.path.join(path, "model.safetensors.index.json")
         if os.path.exists(index_file):
-            import json
             with open(index_file, "r", encoding="utf-8") as f:
                 shards = set(json.load(f).get("weight_map", {}).values())
-            return bool(shards) and all(os.path.exists(os.path.join(path, s)) for s in shards)
+            return bool(shards) and all(
+                os.path.exists(os.path.join(path, s)) for s in shards
+            )
         return any(fn.endswith(".safetensors") for fn in os.listdir(path))
 
-    def _resolve_weights_dir(self) -> str:
+    def ensure_model_downloaded(self, max_retries: int = 25) -> str:
+        """
+        Crash-proof, reboot-safe resumable download into `local_dir/weights`.
+        Never passes `force_download=True` and never deletes partial files so
+        bytes persist across network drops and full laptop restarts.
+        """
         base_dir = self.model_spec.local_dir
         weights_subdir = os.path.join(base_dir, "weights")
         if self._is_weights_dir_complete(weights_subdir):
@@ -157,22 +175,62 @@ class ModelVaultManager:
         if self._is_weights_dir_complete(base_dir):
             return base_dir
 
-        if self.model_spec.auto_download:
-            os.makedirs(weights_subdir, exist_ok=True)
-            from huggingface_hub import snapshot_download
+        if not self.model_spec.auto_download:
+            return self.model_spec.model_id
 
-            snapshot_download(
-                repo_id=self.model_spec.model_id,
-                revision=self.model_spec.revision,
-                local_dir=weights_subdir,
-            )
-            return weights_subdir
-        return self.model_spec.model_id
+        os.makedirs(weights_subdir, exist_ok=True)
+        from huggingface_hub import snapshot_download
+
+        sig_params = inspect.signature(snapshot_download).parameters
+        dl_kwargs: Dict[str, Any] = {
+            "repo_id": self.model_spec.model_id,
+            "revision": self.model_spec.revision,
+            "local_dir": weights_subdir,
+            "max_workers": 2,
+            "force_download": False,
+        }
+        if "resume_download" in sig_params:
+            dl_kwargs["resume_download"] = True
+        if "etag_timeout" in sig_params:
+            dl_kwargs["etag_timeout"] = 60
+
+        last_err: Exception | None = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                print(
+                    f"[ModelVault] Downloading/resuming '{self.model_spec.model_id}' "
+                    f"-> '{weights_subdir}' (attempt {attempt}/{max_retries}, max_workers=2)..."
+                )
+                snapshot_download(**dl_kwargs)
+                if self._is_weights_dir_complete(weights_subdir):
+                    return weights_subdir
+                raise IOError("Download finished but required weight shards are missing.")
+            except KeyboardInterrupt:
+                print(
+                    "\n[ModelVault] Download paused by user. Partial files preserved on disk for resume."
+                )
+                raise
+            except Exception as exc:
+                last_err = exc
+                wait_s = min(30, 5 * attempt)
+                print(
+                    f"[ModelVault] Network interrupted ({type(exc).__name__}: {str(exc)[:100]}). "
+                    f"Keeping partial files and resuming in {wait_s}s..."
+                )
+                if attempt < max_retries:
+                    time.sleep(wait_s)
+
+        raise RuntimeError(
+            f"Failed to complete download of '{self.model_spec.model_id}' after {max_retries} attempts: {last_err}"
+        )
+
+    _resolve_weights_dir = ensure_model_downloaded
 
     def mount_model_and_calibrate(
         self,
     ) -> Tuple[Any, Any, MechanisticCalibrationBundle]:
-        weights_source = self._resolve_weights_dir()
+        weights_source = self.ensure_model_downloaded()
+        is_local_dir = os.path.isdir(weights_source)
         device = "cuda" if torch.cuda.is_available() else "cpu"
         if device == "cuda":
             torch.cuda.empty_cache()
@@ -192,7 +250,9 @@ class ModelVaultManager:
         requested_backend = self.model_spec.attn_implementation
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            weights_source, trust_remote_code=True
+            weights_source,
+            trust_remote_code=True,
+            local_files_only=is_local_dir,
         )
         if self.tokenizer.pad_token is None and self.tokenizer.eos_token is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -201,6 +261,7 @@ class ModelVaultManager:
             "attn_implementation": requested_backend,
             "low_cpu_mem_usage": True,
             "trust_remote_code": True,
+            "local_files_only": is_local_dir,
         }
         if device == "cuda" and getattr(self.model_spec, "load_in_4bit", False):
             bnb_cfg = BitsAndBytesConfig(

@@ -159,8 +159,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run in RULE_ONLY baseline mode without loading LLM weights",
     )
+    parser.add_argument(
+        "--download-only",
+        action="store_true",
+        help="Resumably download and verify model weights locally for the selected profile, then exit",
+    )
     return parser.parse_args()
-
 
 def run_simulation() -> List[FourDimTickTelemetry]:
     args = parse_args()

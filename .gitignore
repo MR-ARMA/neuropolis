@@ -265,3 +265,6 @@ models/
 data/*.sqlite
 results/manifest_*.json
 results/world_state*.sqlite
+data/*.jsonl
+results/turn_logs_*.jsonl
+results/live_stream.jsonl
