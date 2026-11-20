@@ -169,7 +169,10 @@ class FourDimensionalMetricsEngine:
         rule_fallback_rate: float = 0.0,
         tms_entropy_auroc: float = 0.50,
     ) -> FourDimTickTelemetry:
-        ledgers = self.game_master.get_all_agent_ledgers()
+        all_ledgers = self.game_master.get_all_agent_ledgers()
+        ledgers = [
+            row for row in all_ledgers if row.get("legal_status") != "BANKRUPT"
+        ] or all_ledgers
         p_c = self.game_master.macro_state.reference_consumable_price_pc
         q_k = self.game_master.macro_state.reference_capital_price_qk
         c_min = self.config.hank_and_crisis_spec.subsistence_min_c

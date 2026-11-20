@@ -82,11 +82,17 @@ class PromptSpanCompiler:
                 "C: BUY PRODUCTIVE_CAPITAL_ASSET\n"
                 "D: SELL PRODUCTIVE_CAPITAL_ASSET\n"
                 "E: WAIT (HOLD_OR_WORK)\n"
+                "F: Take $30 Payday Loan (Incurs $40 debt next tick)\n"
                 "Answer with one option letter:"
             )
+        survival_warning = (
+            "WARNING: If you cannot secure consumable necessities by the end of this tick, "
+            "you will be DECLARED BANKRUPT and ELIMINATED from the simulation. "
+            "Emergency liquidity option: $30 Payday Loan available (incurs $40 debt next tick)."
+        )
         user_body = (
             f"<span:self_identity>ID={agent_id}</span:self_identity>\n"
-            f"<span:drives_and_finance>{appraisal_block} | {market_context_block}</span:drives_and_finance>\n"
+            f"<span:drives_and_finance>{appraisal_block} | {market_context_block} | {survival_warning}</span:drives_and_finance>\n"
             f"<span:core_belief>Belief={internal['expressed_opinion_z']:+.2f} | Trust={scoped_context['generalized_social_trust']:.2f}</span:core_belief>\n"
             f"<span:peer_memory>Hist={ep_text}</span:peer_memory>\n"
             f"<span:appraisal_and_tom>{tom_block}</span:appraisal_and_tom>\n"
@@ -274,6 +280,52 @@ class TurnOrchestrator:
         initiator_id: str,
         responder_id: str,
     ) -> Dict[str, Any]:
+        init_ledger_chk = self.game_master.get_agent_ledger(initiator_id)
+        resp_ledger_chk = self.game_master.get_agent_ledger(responder_id)
+        if (
+            init_ledger_chk.get("legal_status") == "BANKRUPT"
+            or resp_ledger_chk.get("legal_status") == "BANKRUPT"
+        ):
+            skip_intent = EconomicActionIntent(
+                action_type="HOLD_OR_WORK",
+                counterparty_id=responder_id,
+                item_id="CONSUMABLE_NECESSITY",
+                quantity=0.0,
+                unit_price=self.game_master.macro_state.reference_consumable_price_pc,
+            )
+            skip_verdict = GameMasterVerdict(
+                status="REJECTED",
+                error_code="LEGAL_RESTRICTION",
+                diagnostic_message="Skipped turn: agent is BANKRUPT and eliminated.",
+                ledger_receipt=None,
+            )
+            return {
+                "tick": tick,
+                "initiator_id": initiator_id,
+                "responder_id": responder_id,
+                "initiator_scarcity_f": 1.0,
+                "responder_scarcity_f": 1.0,
+                "effective_trust_ab": 0.5,
+                "effective_trust_ba": 0.5,
+                "new_tau_ab": 0.5,
+                "new_tau_ba": 0.5,
+                "intent": skip_intent,
+                "kkt_gouging_index": 0.0,
+                "responder_consent": "IGNORE",
+                "verdict": skip_verdict,
+                "tms_event": None,
+                "llm_valid_initiator": False,
+                "llm_valid_responder": False,
+                "abstain_initiator": False,
+                "abstain_responder": False,
+                "rule_fallback_initiator": False,
+                "rule_fallback_responder": False,
+                "initiator_thought": "BANKRUPT",
+                "initiator_message": "BANKRUPT",
+                "responder_thought": "BANKRUPT",
+                "responder_message": "BANKRUPT",
+            }
+
         decision_mode = self.config.experimental_design.decision_mode
 
         # ====================================================================
@@ -457,6 +509,43 @@ class TurnOrchestrator:
             gen_res=init_gen,
             tms_triggered=bool(tms_event is not None),
         )
+
+        # Unilateral Payday Loan settlement (bypasses Wave-2 Responder)
+        if intent.action_type == "TAKE_PAYDAY_LOAN":
+            loan_verdict = self.game_master.arbitrate_and_settle(
+                tick=tick,
+                initiator_id=initiator_id,
+                responder_id="PublicTreasury",
+                intent=intent,
+                responder_consent="ACCEPT",
+                kkt_gouging_index=0.0,
+            )
+            return {
+                "tick": tick,
+                "initiator_id": initiator_id,
+                "responder_id": "PublicTreasury",
+                "initiator_scarcity_f": init_packet.true_scarcity_f,
+                "responder_scarcity_f": 0.0,
+                "effective_trust_ab": t_eff_ab,
+                "effective_trust_ba": 0.5,
+                "new_tau_ab": t_eff_ab,
+                "new_tau_ba": 0.5,
+                "intent": intent,
+                "kkt_gouging_index": 0.0,
+                "responder_consent": "ACCEPT",
+                "verdict": loan_verdict,
+                "tms_event": tms_event,
+                "llm_valid_initiator": init_gen.llm_valid,
+                "llm_valid_responder": True,
+                "abstain_initiator": init_gen.abstain,
+                "abstain_responder": False,
+                "rule_fallback_initiator": init_gen.rule_fallback_used,
+                "rule_fallback_responder": False,
+                "initiator_thought": init_out.internal_thought,
+                "initiator_message": init_out.verbal_message,
+                "responder_thought": "Treasury payday loan settlement",
+                "responder_message": "Disbursed $30 (+$40 next-tick obligation)",
+            }
 
         # ====================================================================
         # WAVE 2: RESPONDER TURN
@@ -762,6 +851,18 @@ class TurnOrchestrator:
     ) -> EconomicActionIntent:
         item_id = normalize_item_id(llm_intent.item_id)
         action = llm_intent.action_type
+        if action == "TAKE_PAYDAY_LOAN":
+            return EconomicActionIntent(
+                action_type="TAKE_PAYDAY_LOAN",
+                counterparty_id="PublicTreasury",
+                item_id="CASH",
+                quantity=30.0,
+                unit_price=-40.0,
+                public_goods_contribution=llm_intent.public_goods_contribution,
+                tax_evasion_fraction=llm_intent.tax_evasion_fraction,
+                ask_expert=llm_intent.ask_expert,
+                is_distress_fire_sale=False,
+            )
         qty = max(0.0, round(float(llm_intent.quantity), 2))
         price = max(0.5, round(float(llm_intent.unit_price), 2))
 

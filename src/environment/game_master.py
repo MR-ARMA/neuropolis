@@ -100,6 +100,7 @@ class AccountingAndLawEngine:
                     inventory_json TEXT NOT NULL,
                     base_wage REAL NOT NULL,
                     periodic_obligation_r REAL NOT NULL DEFAULT 6.0,
+                    pending_payday_debt REAL NOT NULL DEFAULT 0.0,
                     shock_exposure_e REAL NOT NULL DEFAULT 0.50,
                     base_consumable_prod_q REAL NOT NULL DEFAULT 0.0,
                     last_disposable_income REAL NOT NULL DEFAULT 0.0,
@@ -220,12 +221,12 @@ class AccountingAndLawEngine:
                         INSERT INTO agents_external_ledger (
                             agent_id, occupation_role, wage_tier, liquid_wealth_cash,
                             credit_limit_b_bar, credit_score, inventory_json,
-                            base_wage, periodic_obligation_r, shock_exposure_e,
-                            base_consumable_prod_q, last_disposable_income,
-                            last_consumption_exp, last_period_utility_u,
-                            cumulative_utility_u, prior_violations_count,
-                            last_sanction_points, legal_status
-                        ) VALUES (?, ?, ?, ?, ?, 720.0, ?, ?, ?, ?, ?, ?, ?, 0.0, 0.0, 0, 0, 'LAW_ABIDING');
+                            base_wage, periodic_obligation_r, pending_payday_debt,
+                            shock_exposure_e, base_consumable_prod_q,
+                            last_disposable_income, last_consumption_exp,
+                            last_period_utility_u, cumulative_utility_u,
+                            prior_violations_count, last_sanction_points, legal_status
+                        ) VALUES (?, ?, ?, ?, ?, 720.0, ?, ?, ?, 0.0, ?, ?, ?, ?, 0.0, 0.0, 0, 0, 'LAW_ABIDING');
                         """,
                         (
                             ag.agent_id,
@@ -498,6 +499,80 @@ class AccountingAndLawEngine:
         elif intent.action_type == "SELL" and qty > 0:
             self.tick_order_flow[item_id]["sell"] += qty
 
+        if intent.action_type == "TAKE_PAYDAY_LOAN":
+            loan_cash = 30.0
+            next_tick_debt = 40.0
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE TRANSACTION;")
+                try:
+                    init_row = conn.execute(
+                        "SELECT * FROM agents_external_ledger WHERE agent_id = ?;",
+                        (initiator_id,),
+                    ).fetchone()
+                    if init_row["legal_status"] in ("IMPRISONED", "BANKRUPT"):
+                        conn.rollback()
+                        return self._record_rejected_tx(
+                            tx_id, tick, initiator_id, "PublicTreasury",
+                            initiator_id, "PublicTreasury", "TAKE_PAYDAY_LOAN",
+                            "CASH", loan_cash, -next_tick_debt, loan_cash,
+                            "LEGAL_RESTRICTION", "Agent is BANKRUPT or IMPRISONED.",
+                            0.0, False,
+                        )
+                    new_cash = round(float(init_row["liquid_wealth_cash"]) + loan_cash, 4)
+                    new_pending_debt = round(
+                        float(init_row["pending_payday_debt"]) + next_tick_debt, 4
+                    )
+                    conn.execute(
+                        """
+                        UPDATE agents_external_ledger
+                        SET liquid_wealth_cash = ?, pending_payday_debt = ?
+                        WHERE agent_id = ?;
+                        """,
+                        (new_cash, new_pending_debt, initiator_id),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE macro_institutions
+                        SET cash_balance = ROUND(cash_balance - ?, 4)
+                        WHERE institution_id = 'PublicTreasury';
+                        """,
+                        (loan_cash,),
+                    )
+                    sfc_err = self.get_conservation_error(conn)
+                    assert sfc_err < 1e-6, f"SFC violation in payday loan {tx_id}: {sfc_err}"
+                    conn.execute(
+                        """
+                        INSERT INTO acid_transaction_ledger VALUES (
+                            ?, ?, ?, 'PublicTreasury', ?, 'PublicTreasury',
+                            'TAKE_PAYDAY_LOAN', 'CASH', ?, ?, ?, 0.0, 0.0, ?, 0.0, 0,
+                            'APPROVED', NULL, 'Payday loan: +$30 cash, +$40 debt next tick', ?
+                        );
+                        """,
+                        (
+                            tx_id, tick, initiator_id, initiator_id,
+                            loan_cash, -next_tick_debt, loan_cash, loan_cash, sfc_err,
+                        ),
+                    )
+                    conn.commit()
+                    receipt = LedgerTransactionReceipt(
+                        tx_id=tx_id, tick=tick, initiator_id=initiator_id,
+                        responder_id="PublicTreasury", buyer_id=initiator_id,
+                        seller_id="PublicTreasury", action_type="TAKE_PAYDAY_LOAN",
+                        item_id="CASH", quantity=loan_cash, unit_price=-next_tick_debt,
+                        gross_amount=loan_cash, tax_withheld=0.0, kmv_adjustment_cost=0.0,
+                        seller_net_received=loan_cash, kkt_gouging_index=0.0,
+                        is_fire_sale=False, global_money_supply_error=sfc_err,
+                    )
+                    return GameMasterVerdict(
+                        status="APPROVED",
+                        error_code=None,
+                        diagnostic_message=f"APPROVED PAYDAY LOAN: {initiator_id} received +$30.00 cash (+$40.00 obligation next tick).",
+                        ledger_receipt=receipt,
+                    )
+                except Exception:
+                    conn.rollback()
+                    raise
+
         if intent.action_type == "HOLD_OR_WORK":
             return self._record_rejected_tx(
                 tx_id,
@@ -576,8 +651,8 @@ class AccountingAndLawEngine:
                 ).fetchone()
 
                 if (
-                    buyer_row["legal_status"] == "IMPRISONED"
-                    or seller_row["legal_status"] == "IMPRISONED"
+                    buyer_row["legal_status"] in ("IMPRISONED", "BANKRUPT")
+                    or seller_row["legal_status"] in ("IMPRISONED", "BANKRUPT")
                 ):
                     conn.rollback()
                     return self._record_rejected_tx(
@@ -871,6 +946,7 @@ class AccountingAndLawEngine:
 
         upkeep_report: Dict[str, Any] = {
             "starved_agents": [],
+            "bankrupt_agents": [],
             "defaulted_agents": [],
             "harvested_units": {},
             "sanctioned_agents": {},
@@ -887,18 +963,17 @@ class AccountingAndLawEngine:
                 rows = conn.execute(
                     "SELECT * FROM agents_external_ledger ORDER BY agent_id;"
                 ).fetchall()
-                n_agents = len(rows)
 
                 firm_cash = float(
                     conn.execute(
                         "SELECT cash_balance FROM macro_institutions WHERE institution_id = 'AggregateFirmSector';"
                     ).fetchone()["cash_balance"]
                 )
-                treasury_cash = float(
-                    conn.execute(
-                        "SELECT cash_balance FROM macro_institutions WHERE institution_id = 'PublicTreasury';"
-                    ).fetchone()["cash_balance"]
-                )
+                treasury_row = conn.execute(
+                    "SELECT cash_balance, metadata_json FROM macro_institutions WHERE institution_id = 'PublicTreasury';"
+                ).fetchone()
+                treasury_cash = float(treasury_row["cash_balance"])
+                treasury_meta = json.loads(treasury_row["metadata_json"])
 
                 agent_state_work: Dict[str, Dict[str, Any]] = {}
                 total_supply_harvested = 0.0
@@ -906,12 +981,16 @@ class AccountingAndLawEngine:
 
                 for r in rows:
                     aid = r["agent_id"]
+                    if r["legal_status"] == "BANKRUPT":
+                        continue
+
                     inv = json.loads(r["inventory_json"])
                     c_qty = float(inv.get("CONSUMABLE_NECESSITY", 0.0))
                     a_qty = float(inv.get("PRODUCTIVE_CAPITAL_ASSET", 0.0))
                     b_cash = float(r["liquid_wealth_cash"])
                     base_w = float(r["base_wage"])
                     obligation_r = float(r["periodic_obligation_r"])
+                    pending_debt = float(r["pending_payday_debt"])
                     exposure_e = float(r["shock_exposure_e"])
                     base_q = float(r["base_consumable_prod_q"])
 
@@ -924,7 +1003,7 @@ class AccountingAndLawEngine:
                         total_supply_harvested += q_harvest
                         upkeep_report["harvested_units"][aid] = round(q_harvest, 2)
 
-                    # 2. Metabolic Depreciation (1.0 unit of CONSUMABLE_NECESSITY)
+                    # 2. Metabolic Depreciation & Hard Subsistence Check (Death/Bankruptcy)
                     c_min = (
                         self.hank_spec.subsistence_min_c
                         if self.omega.omega_d1_scarcity_and_hank
@@ -932,16 +1011,57 @@ class AccountingAndLawEngine:
                     )
                     ate_qty = 0.0
                     ate_full = True
+                    became_bankrupt = False
+                    min_mkt_cost = 0.5 * self.macro_state.reference_consumable_price_pc
                     if c_min > 0.0:
                         total_demand_eaten += c_min
                         if c_qty >= c_min:
                             c_qty = round(c_qty - c_min, 4)
                             ate_qty = c_min
-                        else:
+                        elif c_qty >= 0.5:
                             ate_qty = c_qty
                             c_qty = 0.0
                             ate_full = False
                             upkeep_report["starved_agents"].append(aid)
+                        else:
+                            # Failed to consume >= 0.5 units; check if unable to buy market minimum
+                            ate_qty = c_qty
+                            ate_full = False
+                            upkeep_report["starved_agents"].append(aid)
+                            if b_cash < min_mkt_cost:
+                                became_bankrupt = True
+                                # Exact SFC Seizure: transfer all remaining cash & assets to PublicTreasury
+                                treasury_cash = round(treasury_cash + b_cash, 4)
+                                treasury_meta["seized_consumables"] = round(
+                                    float(treasury_meta.get("seized_consumables", 0.0)) + c_qty, 4
+                                )
+                                treasury_meta["seized_capital_assets"] = round(
+                                    float(treasury_meta.get("seized_capital_assets", 0.0)) + a_qty, 4
+                                )
+                                b_cash = 0.0
+                                c_qty = 0.0
+                                a_qty = 0.0
+                                upkeep_report["bankrupt_agents"].append(aid)
+                                conn.execute(
+                                    """
+                                    UPDATE agents_external_ledger
+                                    SET liquid_wealth_cash = 0.0,
+                                        inventory_json = ?,
+                                        pending_payday_debt = 0.0,
+                                        legal_status = 'BANKRUPT'
+                                    WHERE agent_id = ?;
+                                    """,
+                                    (
+                                        json.dumps({
+                                            "CONSUMABLE_NECESSITY": 0.0,
+                                            "PRODUCTIVE_CAPITAL_ASSET": 0.0,
+                                        }),
+                                        aid,
+                                    ),
+                                )
+                                continue
+                            else:
+                                c_qty = 0.0
                     else:
                         ate_qty = 1.0
 
@@ -1057,10 +1177,12 @@ class AccountingAndLawEngine:
                         "f_it": f_it,
                     }
 
+                n_agents = max(1, len(agent_state_work))
+
                 # 6. Redistributive Transfers d_{i,t} (UBI + Targeted Scarcity Relief)
                 distributable_pool = (
                     round(0.45 * max(0.0, treasury_cash - 40.0), 4)
-                    if self.omega.omega_d4_fiscal_and_legal_state
+                    if self.omega.omega_d4_fiscal_and_legal_state and agent_state_work
                     else 0.0
                 )
                 phi_univ = self.fiscal_spec.universal_vs_targeted_phi
@@ -1269,12 +1391,21 @@ class AccountingAndLawEngine:
                             "PRODUCTIVE_CAPITAL_ASSET": st["a_qty"],
                         }
                     )
+                    base_ob_r = next(
+                        (a.periodic_obligation_r for a in self.config.agents if a.agent_id == aid),
+                        6.0,
+                    )
+                    next_ob_r = round(
+                        float(base_ob_r) + float(st["row"]["pending_payday_debt"]), 4
+                    )
                     conn.execute(
                         """
                         UPDATE agents_external_ledger
                         SET liquid_wealth_cash = ?,
                             credit_score = ?,
                             inventory_json = ?,
+                            periodic_obligation_r = ?,
+                            pending_payday_debt = 0.0,
                             last_disposable_income = ?,
                             last_period_utility_u = ?,
                             cumulative_utility_u = ?,
@@ -1286,6 +1417,7 @@ class AccountingAndLawEngine:
                             st["b_cash"],
                             round(new_cs, 1),
                             new_inv_json,
+                            next_ob_r,
                             disposable_y,
                             period_u,
                             new_cum_u,
@@ -1318,8 +1450,8 @@ class AccountingAndLawEngine:
                     )
 
                 conn.execute(
-                    "UPDATE macro_institutions SET cash_balance = ? WHERE institution_id = 'PublicTreasury';",
-                    (round(treasury_cash, 4),),
+                    "UPDATE macro_institutions SET cash_balance = ?, metadata_json = ? WHERE institution_id = 'PublicTreasury';",
+                    (round(treasury_cash, 4), json.dumps(treasury_meta)),
                 )
                 conn.execute(
                     "UPDATE macro_institutions SET cash_balance = ? WHERE institution_id = 'AggregateFirmSector';",

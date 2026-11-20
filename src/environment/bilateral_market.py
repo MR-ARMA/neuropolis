@@ -264,17 +264,21 @@ class BilateralMarketEngine:
         agent_ids: List[str],
         effective_trust_matrix: Dict[Tuple[str, str], float],
     ) -> List[Tuple[str, str]]:
-        ledgers = {
+        all_ledgers = {
             aid: self.game_master.get_agent_ledger(aid) for aid in agent_ids
         }
+        active_ids = [
+            aid for aid in agent_ids if all_ledgers[aid].get("legal_status") != "BANKRUPT"
+        ]
+        ledgers = {aid: all_ledgers[aid] for aid in active_ids}
         scarcities = {
             aid: self.game_master.compute_agent_scarcity_and_present_bias(aid)[0]
-            for aid in agent_ids
+            for aid in active_ids
         }
 
         candidate_edges: List[Tuple[float, str, str]] = []
-        for i_idx, aid_i in enumerate(agent_ids):
-            for j_idx, aid_j in enumerate(agent_ids):
+        for i_idx, aid_i in enumerate(active_ids):
+            for j_idx, aid_j in enumerate(active_ids):
                 if i_idx == j_idx:
                     continue
                 t_eff = effective_trust_matrix.get((aid_i, aid_j), 0.50)

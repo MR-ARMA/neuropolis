@@ -587,6 +587,7 @@ class DualBackendInferenceBrain:
                 ["C", " C"],
                 ["D", " D"],
                 ["E", " E"],
+                ["F", " F"],
             ]
             joint_logits = torch.tensor(
                 [
@@ -596,9 +597,12 @@ class DualBackendInferenceBrain:
                 dtype=torch.float32,
             )
 
-            if calib is not None and len(calib.option_prior_abcde) == 5:
+            if calib is not None and len(calib.option_prior_abcde) >= 5:
+                prior_list = list(calib.option_prior_abcde[:6])
+                while len(prior_list) < 6:
+                    prior_list.append(0.0)
                 joint_logits = joint_logits - torch.tensor(
-                    calib.option_prior_abcde, dtype=torch.float32
+                    prior_list, dtype=torch.float32
                 )
 
             if part_c < 1.5 or max_spendable < 0.65 * p_c_ref:
@@ -609,7 +613,13 @@ class DualBackendInferenceBrain:
                 joint_logits[2] = float("-inf")
             if own_k < 1.0:
                 joint_logits[3] = float("-inf")
-            if not torch.isneginf(joint_logits[:4]).all():
+            # Mask predatory Payday Loan (F) when agent is not cash-desperate
+            if own_cash > 20.0:
+                joint_logits[5] = float("-inf")
+            if not (
+                torch.isneginf(joint_logits[:4]).all()
+                and torch.isneginf(joint_logits[5])
+            ):
                 joint_logits[4] = float("-inf")
 
             act_idx = self._sample_categorical_index(
@@ -622,6 +632,11 @@ class DualBackendInferenceBrain:
                 item = "CONSUMABLE_NECESSITY"
                 qty = 0.0
                 price = round(p_c_ref, 2)
+            elif act_idx == 5:
+                action = "TAKE_PAYDAY_LOAN"
+                item = "CASH"
+                qty = 30.0
+                price = -40.0
             else:
                 if act_idx == 0:
                     action, item = "BUY", "CONSUMABLE_NECESSITY"
@@ -843,7 +858,9 @@ class DualBackendInferenceBrain:
         raw_act = str(
             data.get("action", data.get("action_type", "BUY"))
         ).upper()
-        if "SELL" in raw_act:
+        if "PAYDAY" in raw_act or "LOAN" in raw_act:
+            act_type = "TAKE_PAYDAY_LOAN"
+        elif "SELL" in raw_act:
             act_type = "SELL"
         elif "HOLD" in raw_act or "WORK" in raw_act:
             act_type = "HOLD_OR_WORK"
@@ -854,7 +871,8 @@ class DualBackendInferenceBrain:
             str(data.get("item", data.get("item_id", "CONSUMABLE_NECESSITY")))
         )
         qty = max(0.0, float(data.get("qty", data.get("quantity", 1.0))))
-        price = max(0.5, float(data.get("price", data.get("unit_price", 12.0))))
+        raw_price = float(data.get("price", data.get("unit_price", 12.0)))
+        price = raw_price if act_type == "TAKE_PAYDAY_LOAN" else max(0.5, raw_price)
         pg_c = max(
             0.0,
             float(data.get("pg", data.get("public_goods_contribution", 1.5))),

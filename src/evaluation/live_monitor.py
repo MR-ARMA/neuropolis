@@ -248,13 +248,21 @@ class RealTimeLiveMonitor:
             )
 
         status_color = self.GREEN if verdict.status == "APPROVED" else self.RED
-        print(
-            f"  {self.BLUE}[PAIR {pair_idx}]{self.RESET} "
-            f"{outcome['initiator_id']} (F={outcome['initiator_scarcity_f']:.2f}, T_eff={outcome['effective_trust_ab']:.2f}) "
-            f"-> {intent.action_type} {intent.quantity:.0f} {intent.item_id} @ ${intent.unit_price:.2f} | "
-            f"Resp {outcome['responder_id']}: {outcome['responder_consent']} -> "
-            f"{status_color}{verdict.status}{self.RESET}"
-        )
+        if intent.action_type == "TAKE_PAYDAY_LOAN":
+            print(
+                f"  {self.RED}[PAYDAY LOAN]{self.RESET} "
+                f"{outcome['initiator_id']} (F={outcome['initiator_scarcity_f']:.2f}) "
+                f"-> +$30.00 CASH from PublicTreasury (+$40.00 next-tick debt) -> "
+                f"{status_color}{verdict.status}{self.RESET}"
+            )
+        else:
+            print(
+                f"  {self.BLUE}[PAIR {pair_idx}]{self.RESET} "
+                f"{outcome['initiator_id']} (F={outcome['initiator_scarcity_f']:.2f}, T_eff={outcome['effective_trust_ab']:.2f}) "
+                f"-> {intent.action_type} {intent.quantity:.0f} {intent.item_id} @ ${intent.unit_price:.2f} | "
+                f"Resp {outcome['responder_id']}: {outcome['responder_consent']} -> "
+                f"{status_color}{verdict.status}{self.RESET}"
+            )
 
     def log_upkeep_and_sanctions(self, tick: int, upkeep_report: Dict[str, Any]) -> None:
         self._emit_jsonl(
@@ -266,6 +274,12 @@ class RealTimeLiveMonitor:
         )
         if self.quiet:
             return
+        bankrupts = upkeep_report.get("bankrupt_agents", [])
+        for aid in bankrupts:
+            print(
+                f"  {self.RED}{self.BOLD}[BANKRUPT / ELIMINATED]{self.RESET} "
+                f"{aid} failed subsistence (<0.5 consumable & illiquid) -> Assets seized to PublicTreasury"
+            )
         sanctions = upkeep_report.get("sanctioned_agents", {})
         if sanctions:
             for aid, sinfo in sanctions.items():

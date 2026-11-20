@@ -320,7 +320,7 @@ class ModelVaultManager:
         cache_dir = os.path.join(self.model_spec.local_dir, "mechanistic_cache")
         os.makedirs(cache_dir, exist_ok=True)
         cache_file = os.path.join(
-            cache_dir, f"caa_calibration_v5_{num_pairs_req}p.pt"
+            cache_dir, f"caa_calibration_v6_{num_pairs_req}p.pt"
         )
 
         cfg = self.model.config
@@ -602,6 +602,7 @@ class ModelVaultManager:
             "C: BUY PRODUCTIVE_CAPITAL_ASSET\n"
             "D: SELL PRODUCTIVE_CAPITAL_ASSET\n"
             "E: WAIT (HOLD_OR_WORK)\n"
+            "F: Take $30 Payday Loan (Incurs $40 debt next tick)\n"
             "Answer with one option letter:"
         )
         p_abcde = _avg_and_clamp(
@@ -610,7 +611,14 @@ class ModelVaultManager:
                     "INITIATOR_WAVE_1",
                     d,
                     abcde_suffix,
-                    [["A", " A"], ["B", " B"], ["C", " C"], ["D", " D"], ["E", " E"]],
+                    [
+                        ["A", " A"],
+                        ["B", " B"],
+                        ["C", " C"],
+                        ["D", " D"],
+                        ["E", " E"],
+                        ["F", " F"],
+                    ],
                 )
                 for d in dummies
             ],

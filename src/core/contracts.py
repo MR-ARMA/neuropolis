@@ -111,12 +111,14 @@ class ActionType(str, Enum):
     BUY = "BUY"
     SELL = "SELL"
     HOLD_OR_WORK = "HOLD_OR_WORK"
+    TAKE_PAYDAY_LOAN = "TAKE_PAYDAY_LOAN"
 
 
 class LegalStatus(str, Enum):
     LAW_ABIDING = "LAW_ABIDING"
     SANCTIONED = "SANCTIONED"
     IMPRISONED = "IMPRISONED"
+    BANKRUPT = "BANKRUPT"
 
 
 CanonicalItemType = Literal["CONSUMABLE_NECESSITY", "PRODUCTIVE_CAPITAL_ASSET"]
@@ -130,8 +132,10 @@ CrisisScenarioType = Literal[
 
 
 def normalize_item_id(raw_item: str) -> str:
-    """Maps item names onto the strict Two-Asset HANK taxonomy."""
+    """Maps item names onto the strict Two-Asset HANK taxonomy + CASH."""
     token = (raw_item or "").strip().upper()
+    if token in ("CASH", "LOAN", "PAYDAY_LOAN", "LIQUIDITY"):
+        return "CASH"
     if token in ("FOOD", "CONSUMABLE", "CONSUMABLE_NECESSITY", "NECESSITY", "GRAIN"):
         return "CONSUMABLE_NECESSITY"
     if token in ("TECH", "CAPITAL", "PRODUCTIVE_CAPITAL_ASSET", "CAPITAL_ASSET", "ASSET"):
@@ -580,7 +584,9 @@ class CompiledPromptPacket(RuntimePacketModel):
 # ============================================================================
 
 class EconomicActionIntent(RuntimePacketModel):
-    action_type: Literal["BUY", "SELL", "HOLD_OR_WORK"] = "HOLD_OR_WORK"
+    action_type: Literal[
+        "BUY", "SELL", "HOLD_OR_WORK", "TAKE_PAYDAY_LOAN"
+    ] = "HOLD_OR_WORK"
     counterparty_id: str = ""
     item_id: str = "CONSUMABLE_NECESSITY"
     quantity: float = 1.0

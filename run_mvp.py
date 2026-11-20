@@ -374,6 +374,18 @@ def run_simulation() -> List[FourDimTickTelemetry]:
         "p_c_end": history[-1].avg_consumable_price if history else 12.0,
         "total_sanctions": sum(h.total_sanction_points_p for h in history),
         "max_sfc_err": max((h.godley_lavoie_error for h in history), default=0.0),
+        "bankrupt_agents_count": sum(
+            1
+            for row in game_master.get_all_agent_ledgers()
+            if row.get("legal_status") == "BANKRUPT"
+        ),
+        "payday_loans_taken": int(
+            game_master._connect()
+            .execute(
+                "SELECT COUNT(*) FROM acid_transaction_ledger WHERE action_type = 'TAKE_PAYDAY_LOAN' AND status = 'APPROVED';"
+            )
+            .fetchone()[0]
+        ),
     }
 
     monitor.write_run_manifest_and_turn_logs(
