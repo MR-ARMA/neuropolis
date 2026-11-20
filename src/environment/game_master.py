@@ -209,8 +209,8 @@ class AccountingAndLawEngine:
                         + 32.0
                     )
                     init_cash = float(ag.liquid_wealth_cash)
-                    if ag.wage_tier == "LOW" and init_cash >= init_htm_cutoff:
-                        init_cash = round(init_htm_cutoff - 6.0, 2)
+                    if ag.wage_tier == "LOW" and init_cash >= init_htm_cutoff - 34.0:
+                        init_cash = round(max(18.0, init_htm_cutoff - 34.0), 2)
                     inv_map = {
                         "CONSUMABLE_NECESSITY": round(ag.get_consumable_inv(), 4),
                         "PRODUCTIVE_CAPITAL_ASSET": round(ag.get_capital_inv(), 4),

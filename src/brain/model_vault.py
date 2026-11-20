@@ -278,6 +278,7 @@ class ModelVaultManager:
                 range(torch.cuda.device_count()),
                 key=lambda idx: torch.cuda.mem_get_info(idx)[0],
             )
+            torch.cuda.set_device(best_gpu)
             load_kwargs["quantization_config"] = bnb_cfg
             load_kwargs["device_map"] = {"": best_gpu}
         else:
