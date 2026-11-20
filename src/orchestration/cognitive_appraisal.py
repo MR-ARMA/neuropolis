@@ -209,9 +209,13 @@ class CognitiveAppraisalAndToM:
 
         fs_params = internal.get("fehr_schmidt", {"alpha": 0.50, "beta": 0.25})
         cpt_params = internal.get("cpt_params", {"lambda": 2.25, "gamma": 0.88})
+        inc_quintile = int(ledger.get("income_quintile", 3))
+        health_shock = bool(ledger.get("active_health_shock", 0))
+        shock_amt = float(ledger.get("last_shock_amount", 0.0))
         appraisal_block = (
             f"Liquid_Cash=${text_cash:.2f} | Consumable_Stock={text_c:.1f} units | "
             f"Capital_Asset_Stock={k_inv:.1f} units | Mandatory_Periodic_Obligation=${text_ob:.2f} | "
+            f"Income_Quintile={inc_quintile} | Active_Health_Shock={health_shock} (${shock_amt:.2f}) | "
             f"Liquidity_Deficit_Index={text_f:.2f} | "
             f"CPT_LossAversion={float(cpt_params.get('lambda', 2.25)):.2f}, RiskGamma={float(cpt_params.get('gamma', 0.88)):.2f} | "
             f"FS_Inequity_Alpha={float(fs_params.get('alpha', 0.50)):.2f}, Beta={float(fs_params.get('beta', 0.25)):.2f}"

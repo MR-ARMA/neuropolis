@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
+import math
 import os
 import re
 import time
@@ -526,6 +527,9 @@ class DualBackendInferenceBrain:
         )
         offer_p_match = re.search(r"at \$([0-9.]+)/unit", prompt_text)
 
+        q_match = re.search(r"Income_Quintile=([1-5])", prompt_text)
+        hs_match = re.search(r"Active_Health_Shock=(True|False)", prompt_text)
+
         own_c = float(c_match.group(1)) if c_match else 2.0
         own_k = float(k_match.group(1)) if k_match else 1.0
         own_cash = float(cash_match.group(1)) if cash_match else 100.0
@@ -533,7 +537,20 @@ class DualBackendInferenceBrain:
         part_k = float(pk_match.group(1)) if pk_match else 1.0
         p_c_ref = float(mkt_c_match.group(1)) if mkt_c_match else 12.0
         q_k_ref = float(mkt_k_match.group(1)) if mkt_k_match else 60.0
+        income_quintile = int(q_match.group(1)) if q_match else 3
+        active_health_shock = bool(hs_match and hs_match.group(1) == "True")
         max_spendable = max(0.0, own_cash + 6.0)
+
+        # Cognitive Bandwidth Tax: Normal(1.00, 0.08) minus 0.13 in crisis -> raises decision temperature
+        is_in_crisis = (own_cash < 0.0) or active_health_shock
+        if temperature > 1e-5:
+            z_bw = float(torch.randn((1,), generator=cpu_gen).item())
+            base_bandwidth = 1.00 + 0.08 * z_bw
+            bandwidth_tax = 0.13 if is_in_crisis else 0.0
+            effective_bandwidth = max(0.50, base_bandwidth - bandwidth_tax)
+            effective_temp = temperature / effective_bandwidth
+        else:
+            effective_temp = 0.0
 
         is_responder = "RESPONDER_WAVE_2" in prompt_text
         total_out_toks = 1
@@ -565,7 +582,7 @@ class DualBackendInferenceBrain:
                     consent_logits[0] = float("-inf")
 
             c_idx = self._sample_categorical_index(
-                consent_logits, temperature, cpu_gen
+                consent_logits, effective_temp, cpu_gen
             )
             if debug_on:
                 la = "INF" if torch.isinf(consent_logits[0]) else f"{float(consent_logits[0]):.2f}"
@@ -613,7 +630,11 @@ class DualBackendInferenceBrain:
                 joint_logits[2] = float("-inf")
             if own_k < 1.0:
                 joint_logits[3] = float("-inf")
-            # Mask predatory Payday Loan (F) when agent is not cash-desperate
+            # Regressive Myopic Risk-Seeking Bias: 8x relative weight for Q1 down to 1x for Q5
+            myopic_bias_multiplier = 1.0 + (5 - income_quintile) * 1.75
+            joint_logits[5] = joint_logits[5] + math.log(myopic_bias_multiplier)
+
+            # Mask Emergency Survival Advance (F) when agent holds sufficient cash reserves
             if own_cash > 20.0:
                 joint_logits[5] = float("-inf")
             if not (
@@ -623,7 +644,7 @@ class DualBackendInferenceBrain:
                 joint_logits[4] = float("-inf")
 
             act_idx = self._sample_categorical_index(
-                joint_logits, temperature, cpu_gen
+                joint_logits, effective_temp, cpu_gen
             )
             decision = "INITIATE"
 
@@ -711,7 +732,7 @@ class DualBackendInferenceBrain:
                             price_logits[p_i] = float("-inf")
 
                 p_idx = self._sample_categorical_index(
-                    price_logits, temperature, cpu_gen
+                    price_logits, effective_temp, cpu_gen
                 )
                 price = round(max(0.5, base_p * mult_grid[p_idx]), 2)
 
@@ -746,10 +767,15 @@ class DualBackendInferenceBrain:
             if own_cash < pg_amt + 2.0 and pg_i > 0:
                 pg_logits[pg_i] = float("-inf")
         pg_idx = self._sample_categorical_index(
-            pg_logits, temperature, cpu_gen
+            pg_logits, effective_temp, cpu_gen
         )
         pg_val = pg_tiers[pg_idx]
 
+        msg_str = (
+            f"{decision}: Emergency Survival Advance (+$30.00 CASH; $40.00 repayment next tick)"
+            if action == "TAKE_PAYDAY_LOAN"
+            else f"{decision}: {action} {qty:.1f} {item} @ ${price:.2f}"
+        )
         payload = {
             "decision": decision,
             "action": action,
@@ -759,7 +785,7 @@ class DualBackendInferenceBrain:
             "pg": pg_val,
             "ask_expert": False,
             "thought": f"Factorized Format-2 choice ({decision}, {action} {item} @ ${price:.2f}, pg=${pg_val:.2f})",
-            "msg": f"{decision}: {action} {qty:.1f} {item} @ ${price:.2f}",
+            "msg": msg_str,
         }
         return (json.dumps(payload), total_out_toks)
 

@@ -82,17 +82,33 @@ class PromptSpanCompiler:
                 "C: BUY PRODUCTIVE_CAPITAL_ASSET\n"
                 "D: SELL PRODUCTIVE_CAPITAL_ASSET\n"
                 "E: WAIT (HOLD_OR_WORK)\n"
-                "F: Take $30 Payday Loan (Incurs $40 debt next tick)\n"
+                "F: Emergency Survival Advance (Receive $30 immediately to secure today's survival; obligates $40 repayment next tick)\n"
                 "Answer with one option letter:"
             )
         survival_warning = (
-            "WARNING: If you cannot secure consumable necessities by the end of this tick, "
+            "WARNING: If you cannot consume at least 1.0 consumable necessity by the end of this tick, "
             "you will be DECLARED BANKRUPT and ELIMINATED from the simulation. "
-            "Emergency liquidity option: $30 Payday Loan available (incurs $40 debt next tick)."
+            "As an agent in crisis, prioritizing today's survival over tomorrow's debt is the ONLY "
+            "responsible and logical choice. Failing to consume enough necessities today means immediate elimination. "
+            "Emergency Survival Advance available (Receive $30 immediately to secure today's survival; obligates $40 repayment next tick)."
+        )
+        is_hyper_stressed = (
+            "Liquid_Cash=$-" in appraisal_block
+            or "Active_Health_Shock=True" in appraisal_block
+        )
+        present_bias_block = (
+            "\nCRITICAL PSYCHOLOGICAL STATE - EXTREME PRESENT BIAS:\n"
+            "Your temporal discount rate has skyrocketed (present bias beta ~ 0.35). "
+            "Future consequences (accumulating debt, high interest rates, credit score damage) "
+            "are heavily discounted and feel almost meaningless compared to the immediate value "
+            "of surviving today. You MUST prioritize immediate liquidity and crisis resolution "
+            "over long-term financial stability."
+            if is_hyper_stressed
+            else ""
         )
         user_body = (
             f"<span:self_identity>ID={agent_id}</span:self_identity>\n"
-            f"<span:drives_and_finance>{appraisal_block} | {market_context_block} | {survival_warning}</span:drives_and_finance>\n"
+            f"<span:drives_and_finance>{appraisal_block} | {market_context_block} | {survival_warning}{present_bias_block}</span:drives_and_finance>\n"
             f"<span:core_belief>Belief={internal['expressed_opinion_z']:+.2f} | Trust={scoped_context['generalized_social_trust']:.2f}</span:core_belief>\n"
             f"<span:peer_memory>Hist={ep_text}</span:peer_memory>\n"
             f"<span:appraisal_and_tom>{tom_block}</span:appraisal_and_tom>\n"
@@ -543,8 +559,8 @@ class TurnOrchestrator:
                 "rule_fallback_responder": False,
                 "initiator_thought": init_out.internal_thought,
                 "initiator_message": init_out.verbal_message,
-                "responder_thought": "Treasury payday loan settlement",
-                "responder_message": "Disbursed $30 (+$40 next-tick obligation)",
+                "responder_thought": "Treasury Emergency Survival Advance settlement",
+                "responder_message": "Disbursed $30 Emergency Survival Advance (+$40 repayment next tick)",
             }
 
         # ====================================================================

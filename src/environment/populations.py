@@ -51,56 +51,71 @@ def synthesize_parametric_population(
             ("HYPER_EGALITARIAN", 4.00, 0.60),
         ]
 
+        # Kaplan, Violante & Weidner (2014) HtM Distribution: 67% Non-HtM, 11% Poor-HtM, 22% Wealthy-HtM
+        htm_draws = list(
+            rng.choice(
+                ["NON_HTM", "POOR_HTM", "WEALTHY_HTM"],
+                size=n_agents,
+                p=[0.67, 0.11, 0.22],
+            )
+        )
+        non_htm_counter = 0
+
         for idx in range(n_agents):
-            stratum = idx % 6
-            if stratum in (0, 1):
-                # Non-HtM Consumable Producer (33.3%: liquid cash & food surplus)
-                role = "Consumable_Producer"
-                w_tier = "MID"
-                cash = float(np.clip(rng.normal(112.0, 16.0), 80.0, 160.0))
-                c_inv = float(np.clip(rng.normal(7.5, 1.5), 4.5, 11.0))
-                k_inv = float(rng.choice([0.0, 1.0]))
-                wage = float(np.clip(rng.normal(16.5, 2.0), 12.0, 22.0))
-                ob_r = round(0.35 * wage, 2)
-                prod_q = round(float(np.clip(rng.normal(3.4, 0.4), 2.5, 4.5)), 2)
-                spec = "CONSUMABLE_NECESSITY"
-                exp_e = round(float(rng.uniform(0.55, 0.85)), 2)
-            elif stratum in (2, 3):
-                # Non-HtM Capital Specialist (33.3%: high cash & capital, buys food)
-                role = "Capital_Specialist"
-                w_tier = "HIGH"
-                cash = float(np.clip(rng.normal(195.0, 28.0), 135.0, 280.0))
-                c_inv = float(rng.choice([2.0, 3.0]))
-                k_inv = float(np.clip(rng.integers(3, 6), 2.0, 6.0))
-                wage = float(np.clip(rng.normal(28.0, 3.5), 21.0, 36.0))
-                ob_r = round(0.28 * wage, 2)
-                prod_q = 0.0
-                spec = "PRODUCTIVE_CAPITAL_ASSET"
-                exp_e = round(float(rng.uniform(0.20, 0.45)), 2)
-            elif stratum == 4:
-                # Wealthy Hand-to-Mouth (16.7%: illiquid capital >= 2, low liquid cash)
-                role = "Illiquid_Asset_Holder"
-                w_tier = "MID"
-                cash = float(np.clip(rng.normal(42.0, 6.0), 28.0, 54.0))
-                c_inv = 1.0
-                k_inv = float(rng.choice([2.0, 3.0]))
-                wage = float(np.clip(rng.normal(14.5, 1.8), 11.0, 18.0))
-                ob_r = round(0.42 * wage, 2)
-                prod_q = 0.0
-                spec = "CONSUMABLE_NECESSITY"
-                exp_e = round(float(rng.uniform(0.65, 0.90)), 2)
-            else:
-                # Poor Hand-to-Mouth (16.7%: low liquid cash, 0 capital, high obligation ratio)
-                role = "Service_Laborer"
+            htm_status = str(htm_draws[idx])
+            if htm_status == "POOR_HTM":
+                # Poor HtM (11%): zero illiquid capital wealth, low/near-zero liquid cash buffer
+                role = "Poor_HtM_Laborer"
                 w_tier = "LOW"
-                cash = float(np.clip(rng.normal(34.0, 5.0), 24.0, 44.0))
+                cash = float(np.clip(rng.normal(loc=14.0, scale=4.0), 8.0, 22.0))
                 c_inv = 1.0
                 k_inv = 0.0
-                wage = float(np.clip(rng.normal(11.0, 1.2), 9.0, 14.0))
+                wage = float(np.clip(rng.normal(10.5, 1.2), 8.5, 13.5))
                 ob_r = round(0.50 * wage, 2)
                 prod_q = 0.0
                 spec = "CONSUMABLE_NECESSITY"
                 exp_e = round(float(rng.uniform(0.80, 1.00)), 2)
+            elif htm_status == "WEALTHY_HTM":
+                # Wealthy HtM (22%): substantial illiquid capital assets, low liquid cash buffer
+                role = "Wealthy_HtM_Asset_Holder"
+                w_tier = "MID"
+                cash = float(np.clip(rng.normal(loc=19.0, scale=5.0), 10.0, 32.0))
+                c_inv = 1.0
+                k_inv = float(np.clip(rng.lognormal(mean=1.1, sigma=0.35), 2.0, 5.0))
+                k_inv = round(k_inv, 1)
+                wage = float(np.clip(rng.normal(15.0, 2.0), 11.5, 19.5))
+                ob_r = round(0.42 * wage, 2)
+                prod_q = 0.0
+                spec = "CONSUMABLE_NECESSITY"
+                exp_e = round(float(rng.uniform(0.60, 0.90)), 2)
+            else:
+                # Non-HtM (67%): ample liquidity & illiquid holdings (alternating Producers & Capital Specialists)
+                is_producer = (non_htm_counter % 2) == 0
+                non_htm_counter += 1
+                if is_producer:
+                    role = "Consumable_Producer"
+                    w_tier = "MID"
+                    cash = float(np.clip(rng.lognormal(mean=4.75, sigma=0.22), 85.0, 190.0))
+                    c_inv = float(np.clip(rng.normal(7.5, 1.4), 4.5, 11.0))
+                    k_inv = float(np.clip(rng.lognormal(mean=0.4, sigma=0.35), 1.0, 3.0))
+                    k_inv = round(k_inv, 1)
+                    wage = float(np.clip(rng.normal(17.5, 2.2), 13.0, 23.0))
+                    ob_r = round(0.35 * wage, 2)
+                    prod_q = round(float(np.clip(rng.normal(3.6, 0.4), 2.8, 4.8)), 2)
+                    spec = "CONSUMABLE_NECESSITY"
+                    exp_e = round(float(rng.uniform(0.45, 0.75)), 2)
+                else:
+                    role = "Capital_Specialist"
+                    w_tier = "HIGH"
+                    cash = float(np.clip(rng.lognormal(mean=5.25, sigma=0.25), 130.0, 310.0))
+                    c_inv = float(rng.choice([2.0, 3.0]))
+                    k_inv = float(np.clip(rng.lognormal(mean=1.4, sigma=0.35), 2.5, 7.0))
+                    k_inv = round(k_inv, 1)
+                    wage = float(np.clip(rng.normal(28.5, 3.5), 21.0, 38.0))
+                    ob_r = round(0.28 * wage, 2)
+                    prod_q = 0.0
+                    spec = "PRODUCTIVE_CAPITAL_ASSET"
+                    exp_e = round(float(rng.uniform(0.18, 0.45)), 2)
 
             fs_name, a_fs, b_fs = fs_tiers[idx % len(fs_tiers)]
             lam_cpt = round(float(np.clip(rng.normal(2.25, 0.35), 1.40, 3.20)), 2)

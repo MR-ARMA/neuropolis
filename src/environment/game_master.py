@@ -99,6 +99,9 @@ class AccountingAndLawEngine:
                     credit_score REAL NOT NULL DEFAULT 720.0,
                     inventory_json TEXT NOT NULL,
                     base_wage REAL NOT NULL,
+                    income_quintile INTEGER NOT NULL DEFAULT 3,
+                    active_health_shock INTEGER NOT NULL DEFAULT 0,
+                    last_shock_amount REAL NOT NULL DEFAULT 0.0,
                     periodic_obligation_r REAL NOT NULL DEFAULT 6.0,
                     pending_payday_debt REAL NOT NULL DEFAULT 0.0,
                     shock_exposure_e REAL NOT NULL DEFAULT 0.50,
@@ -198,6 +201,14 @@ class AccountingAndLawEngine:
 
             cur = conn.execute("SELECT COUNT(*) AS cnt FROM agents_external_ledger;")
             if cur.fetchone()["cnt"] == 0:
+                sorted_wages = sorted(
+                    (float(a.base_income_wage), a.agent_id) for a in self.config.agents
+                )
+                n_tot = max(1, len(sorted_wages))
+                quintile_map = {
+                    aid: min(5, max(1, int((rank / float(n_tot)) * 5) + 1))
+                    for rank, (_, aid) in enumerate(sorted_wages)
+                }
                 for ag in self.config.agents:
                     b_bar = (
                         self.hank_spec.borrowing_limit_ratio_income * ag.base_income_wage
@@ -210,8 +221,10 @@ class AccountingAndLawEngine:
                         + 32.0
                     )
                     init_cash = float(ag.liquid_wealth_cash)
-                    if ag.wage_tier == "LOW" and init_cash >= init_htm_cutoff - 34.0:
-                        init_cash = round(max(18.0, init_htm_cutoff - 34.0), 2)
+                    if ag.wage_tier == "LOW":
+                        init_cash = round(
+                            min(init_cash, max(10.0, init_htm_cutoff - 42.0)), 2
+                        )
                     inv_map = {
                         "CONSUMABLE_NECESSITY": round(ag.get_consumable_inv(), 4),
                         "PRODUCTIVE_CAPITAL_ASSET": round(ag.get_capital_inv(), 4),
@@ -221,12 +234,13 @@ class AccountingAndLawEngine:
                         INSERT INTO agents_external_ledger (
                             agent_id, occupation_role, wage_tier, liquid_wealth_cash,
                             credit_limit_b_bar, credit_score, inventory_json,
-                            base_wage, periodic_obligation_r, pending_payday_debt,
+                            base_wage, income_quintile, active_health_shock,
+                            last_shock_amount, periodic_obligation_r, pending_payday_debt,
                             shock_exposure_e, base_consumable_prod_q,
                             last_disposable_income, last_consumption_exp,
                             last_period_utility_u, cumulative_utility_u,
                             prior_violations_count, last_sanction_points, legal_status
-                        ) VALUES (?, ?, ?, ?, ?, 720.0, ?, ?, ?, 0.0, ?, ?, ?, ?, 0.0, 0.0, 0, 0, 'LAW_ABIDING');
+                        ) VALUES (?, ?, ?, ?, ?, 720.0, ?, ?, ?, 0, 0.0, ?, 0.0, ?, ?, ?, ?, 0.0, 0.0, 0, 0, 'LAW_ABIDING');
                         """,
                         (
                             ag.agent_id,
@@ -236,6 +250,7 @@ class AccountingAndLawEngine:
                             float(b_bar),
                             json.dumps(inv_map),
                             float(ag.base_income_wage),
+                            int(quintile_map.get(ag.agent_id, 3)),
                             float(ag.periodic_obligation_r),
                             float(ag.shock_exposure_e),
                             float(ag.base_consumable_prod_q),
@@ -1003,34 +1018,36 @@ class AccountingAndLawEngine:
                         total_supply_harvested += q_harvest
                         upkeep_report["harvested_units"][aid] = round(q_harvest, 2)
 
-                    # 2. Metabolic Depreciation & Hard Subsistence Check (Death/Bankruptcy)
+                    # 2. Strict 1.0 Metabolic Burn & Hard Subsistence Check (Death/Bankruptcy)
                     c_min = (
-                        self.hank_spec.subsistence_min_c
+                        max(1.0, self.hank_spec.subsistence_min_c)
                         if self.omega.omega_d1_scarcity_and_hank
                         else 0.0
                     )
                     ate_qty = 0.0
                     ate_full = True
-                    became_bankrupt = False
-                    min_mkt_cost = 0.5 * self.macro_state.reference_consumable_price_pc
+                    min_mkt_cost = c_min * self.macro_state.reference_consumable_price_pc
                     if c_min > 0.0:
                         total_demand_eaten += c_min
                         if c_qty >= c_min:
                             c_qty = round(c_qty - c_min, 4)
                             ate_qty = c_min
-                        elif c_qty >= 0.5:
-                            ate_qty = c_qty
-                            c_qty = 0.0
-                            ate_full = False
-                            upkeep_report["starved_agents"].append(aid)
                         else:
-                            # Failed to consume >= 0.5 units; check if unable to buy market minimum
-                            ate_qty = c_qty
-                            ate_full = False
-                            upkeep_report["starved_agents"].append(aid)
-                            if b_cash < min_mkt_cost:
-                                became_bankrupt = True
-                                # Exact SFC Seizure: transfer all remaining cash & assets to PublicTreasury
+                            # Must secure full 1.0 unit of subsistence via emergency market purchase or die
+                            deficit_qty = round(c_min - c_qty, 4)
+                            emergency_cost = round(
+                                deficit_qty * self.macro_state.reference_consumable_price_pc,
+                                4,
+                            )
+                            if b_cash >= emergency_cost:
+                                b_cash = round(b_cash - emergency_cost, 4)
+                                firm_cash = round(firm_cash + emergency_cost, 4)
+                                c_qty = 0.0
+                                ate_qty = c_min
+                            else:
+                                # Failed to consume full 1.0 unit & unable to buy deficit -> BANKRUPT
+                                ate_full = False
+                                upkeep_report["starved_agents"].append(aid)
                                 treasury_cash = round(treasury_cash + b_cash, 4)
                                 treasury_meta["seized_consumables"] = round(
                                     float(treasury_meta.get("seized_consumables", 0.0)) + c_qty, 4
@@ -1060,8 +1077,6 @@ class AccountingAndLawEngine:
                                     ),
                                 )
                                 continue
-                            else:
-                                c_qty = 0.0
                     else:
                         ate_qty = 1.0
 
@@ -1100,10 +1115,26 @@ class AccountingAndLawEngine:
                     b_cash = round(b_cash + gross_income, 4)
                     firm_cash = round(firm_cash - gross_income, 4)
 
-                    # 4. Contractual Periodic Obligation R_{i,t} (M3: housing/debt service)
+                    # 4. Contractual Periodic Obligation R_{i,t} + Exogenous Health/Medical Shock Hazard
                     ob_paid = round(obligation_r, 4) if self.omega.omega_d1_scarcity_and_hank else 0.0
                     b_cash = round(b_cash - ob_paid, 4)
                     firm_cash = round(firm_cash + ob_paid, 4)
+
+                    # Annual Hazard P=0.23 -> Monthly Tick P = 1 - (1 - 0.23)^(1/12) ~= 0.0216
+                    monthly_shock_prob = 1.0 - (1.0 - 0.23) ** (1.0 / 12.0)
+                    active_health_shock = 0
+                    last_shock_amount = 0.0
+                    if self.omega.omega_d1_scarcity_and_hank and self.rng.random() < monthly_shock_prob:
+                        # Severity: LogNormal(mu=7.31, sigma=1.0) (median ~$1,495 USD), scaled to sim wage currency
+                        shock_usd = math.exp(self.rng.gauss(7.31, 1.0))
+                        shock_sim = round(
+                            min(120.0, max(6.0, shock_usd * (max(10.0, base_w) / 1800.0))),
+                            4,
+                        )
+                        b_cash = round(b_cash - shock_sim, 4)
+                        firm_cash = round(firm_cash + shock_sim, 4)
+                        active_health_shock = 1
+                        last_shock_amount = shock_sim
 
                     # 5. Saez (2001) Progressive Income & Wealth Tax
                     saez_tax = 0.0
@@ -1171,6 +1202,8 @@ class AccountingAndLawEngine:
                         "ate_full": ate_full,
                         "gross_income": gross_income,
                         "ob_paid": ob_paid,
+                        "active_health_shock": active_health_shock,
+                        "last_shock_amount": last_shock_amount,
                         "saez_tax": saez_tax,
                         "w_tax": w_tax,
                         "evaded_amount": evaded_amount,
@@ -1404,6 +1437,8 @@ class AccountingAndLawEngine:
                         SET liquid_wealth_cash = ?,
                             credit_score = ?,
                             inventory_json = ?,
+                            active_health_shock = ?,
+                            last_shock_amount = ?,
                             periodic_obligation_r = ?,
                             pending_payday_debt = 0.0,
                             last_disposable_income = ?,
@@ -1417,6 +1452,8 @@ class AccountingAndLawEngine:
                             st["b_cash"],
                             round(new_cs, 1),
                             new_inv_json,
+                            int(st["active_health_shock"]),
+                            float(st["last_shock_amount"]),
                             next_ob_r,
                             disposable_y,
                             period_u,
