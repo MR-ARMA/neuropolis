@@ -137,16 +137,24 @@ class ModelVaultManager:
         self.tokenizer: Any = None
         self.calibration_bundle: MechanisticCalibrationBundle | None = None
 
+    @staticmethod
+    def _is_weights_dir_complete(path: str) -> bool:
+        if not os.path.isdir(path) or not os.path.exists(os.path.join(path, "config.json")):
+            return False
+        index_file = os.path.join(path, "model.safetensors.index.json")
+        if os.path.exists(index_file):
+            import json
+            with open(index_file, "r", encoding="utf-8") as f:
+                shards = set(json.load(f).get("weight_map", {}).values())
+            return bool(shards) and all(os.path.exists(os.path.join(path, s)) for s in shards)
+        return any(fn.endswith(".safetensors") for fn in os.listdir(path))
+
     def _resolve_weights_dir(self) -> str:
         base_dir = self.model_spec.local_dir
         weights_subdir = os.path.join(base_dir, "weights")
-        if os.path.isdir(weights_subdir) and os.path.exists(
-            os.path.join(weights_subdir, "config.json")
-        ):
+        if self._is_weights_dir_complete(weights_subdir):
             return weights_subdir
-        if os.path.isdir(base_dir) and os.path.exists(
-            os.path.join(base_dir, "config.json")
-        ):
+        if self._is_weights_dir_complete(base_dir):
             return base_dir
 
         if self.model_spec.auto_download:
@@ -186,7 +194,7 @@ class ModelVaultManager:
         self.tokenizer = AutoTokenizer.from_pretrained(
             weights_source, trust_remote_code=True
         )
-        if self.tokenizer.pad_token is None:
+        if self.tokenizer.pad_token is None and self.tokenizer.eos_token is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         load_kwargs: Dict[str, Any] = {
@@ -246,7 +254,7 @@ class ModelVaultManager:
         cache_dir = os.path.join(self.model_spec.local_dir, "mechanistic_cache")
         os.makedirs(cache_dir, exist_ok=True)
         cache_file = os.path.join(
-            cache_dir, f"caa_calibration_v4_{num_pairs_req}p.pt"
+            cache_dir, f"caa_calibration_v5_{num_pairs_req}p.pt"
         )
 
         cfg = self.model.config
@@ -256,7 +264,7 @@ class ModelVaultManager:
         hidden_size = int(getattr(cfg, "hidden_size", 1536))
         head_dim = hidden_size // num_heads
 
-        prior_ab, prior_abcde, prior_12345 = (
+        prior_ab, prior_abcde, prior_12345, prior_1234 = (
             self._calibrate_contextual_option_priors()
         )
 
@@ -294,6 +302,7 @@ class ModelVaultManager:
                         option_prior_ab=prior_ab,
                         option_prior_abcde=prior_abcde,
                         option_prior_12345=prior_12345,
+                        option_prior_1234=prior_1234,
                         calibrated_from_model=True,
                         sink_token_ids=saved["sink_token_ids"],
                     )
@@ -400,18 +409,23 @@ class ModelVaultManager:
             option_prior_ab=prior_ab,
             option_prior_abcde=prior_abcde,
             option_prior_12345=prior_12345,
+            option_prior_1234=prior_1234,
             calibrated_from_model=True,
             sink_token_ids=sink_ids,
         )
 
     def _calibrate_contextual_option_priors(
         self,
-    ) -> Tuple[List[float], List[float], List[float]]:
+    ) -> Tuple[List[float], List[float], List[float], List[float]]:
         """
-        Template-matched Contextual Calibration (Zhao et al., 2021, ICML [VERIFY]):
-        Formats neutral content-free prompts with the exact `<span:...>` layout and
-        `apply_chat_template` used by `PromptSpanCompiler`, measuring strictly
-        symmetric single-token option priors (`A/B`, `A..E`, `1..5`).
+        Format-2 Contextual & Permutation-Averaged Position Calibration
+        (Zhao et al. 2021 [VERIFY]; Zheng et al. 2024 ICLR [VERIFY]):
+        - Uses strict Format-2 system prompt and `add_special_tokens=False` on
+          chat-templated inputs (preventing duplicate BOS on Llama-3.1).
+        - Averages over 3 neutral dummies (`N/A`, `---`, `Unknown`).
+        - Computes `p_ab` via order-swapped permutation averaging clamped to
+          `[-0.35, +0.35]` so pure letter-position bias is removed without
+          penalizing genuine ACCEPT semantics on fair deals.
         """
         emb = getattr(getattr(self.model, "model", self.model), "embed_tokens", None)
         device = (
@@ -419,35 +433,50 @@ class ModelVaultManager:
             if (emb is not None and hasattr(emb, "weight"))
             else next(self.model.parameters()).device
         )
+        sys_prompt = (
+            "You are a rational economic agent in a market simulation. "
+            "Output ONLY the single chosen letter or digit with zero explanation."
+        )
+        dummies = ("N/A", "---", "Unknown")
 
-        def _format_neutral(role_wave: str, choice_suffix: str) -> str:
+        def _format_neutral(role_wave: str, dummy: str, choice_suffix: str) -> Tuple[str, bool]:
             body = (
-                "<span:self_identity>ID=N/A</span:self_identity>\n"
-                "<span:drives_and_finance>N/A</span:drives_and_finance>\n"
-                "<span:core_belief>N/A</span:core_belief>\n"
-                "<span:peer_memory>Hist=None</span:peer_memory>\n"
-                "<span:appraisal_and_tom>N/A</span:appraisal_and_tom>\n"
-                f"<span:incoming_msg>Phase={role_wave} | N/A</span:incoming_msg>\n"
+                f"<span:self_identity>ID={dummy}</span:self_identity>\n"
+                f"<span:drives_and_finance>{dummy}</span:drives_and_finance>\n"
+                f"<span:core_belief>{dummy}</span:core_belief>\n"
+                f"<span:peer_memory>Hist={dummy}</span:peer_memory>\n"
+                f"<span:appraisal_and_tom>{dummy}</span:appraisal_and_tom>\n"
+                f"<span:incoming_msg>Phase={role_wave} | PROPOSED CONTRACT: {dummy}</span:incoming_msg>\n"
                 f"{choice_suffix}"
             )
             if hasattr(self.tokenizer, "apply_chat_template"):
                 try:
-                    return self.tokenizer.apply_chat_template(
-                        [{"role": "user", "content": body}],
+                    txt = self.tokenizer.apply_chat_template(
+                        [
+                            {"role": "system", "content": sys_prompt},
+                            {"role": "user", "content": body},
+                        ],
                         tokenize=False,
                         add_generation_prompt=True,
                     )
+                    return (txt, True)
                 except Exception:
-                    return body
-            return body
+                    return (body, False)
+            return (body, False)
 
-        def _measure_prior(
-            formatted_prompt: str, option_sets: List[List[str]]
+        def _measure_single(
+            role_wave: str,
+            dummy: str,
+            choice_suffix: str,
+            option_sets: List[List[str]],
         ) -> List[float]:
+            formatted_prompt, used_template = _format_neutral(
+                role_wave, dummy, choice_suffix
+            )
             enc = self.tokenizer(
                 formatted_prompt,
                 return_tensors="pt",
-                add_special_tokens=True,
+                add_special_tokens=not used_template,
                 truncation=True,
                 max_length=512,
             )
@@ -469,41 +498,88 @@ class ModelVaultManager:
                     else 0.0
                 )
             mean_v = sum(vals) / max(1, len(vals))
-            return [round(v - mean_v, 4) for v in vals]
+            return [v - mean_v for v in vals]
 
-        p_ab = _measure_prior(
-            _format_neutral(
-                "RESPONDER_WAVE_2",
-                "Option A: ACCEPT the contract.\nOption B: REJECT the contract.\nAnswer with one letter (A or B):",
-            ),
-            [["A", " A"], ["B", " B"]],
+        def _avg_and_clamp(
+            runs: List[List[float]], limit: float = 1.5
+        ) -> List[float]:
+            arr = np.mean(np.asarray(runs, dtype=np.float64), axis=0)
+            arr = arr - float(np.mean(arr))
+            return [round(float(np.clip(v, -limit, limit)), 4) for v in arr]
+
+        # Permutation-averaged position-only prior for A/B (clamped to [-0.35, +0.35])
+        ab_runs: List[List[float]] = []
+        opt_ab = [["A", " A"], ["B", " B"]]
+        for d in dummies:
+            ab_runs.append(
+                _measure_single(
+                    "RESPONDER_WAVE_2",
+                    d,
+                    "Option A: ACCEPT the contract.\nOption B: REJECT the contract.\nAnswer with one letter (A or B):",
+                    opt_ab,
+                )
+            )
+            ab_runs.append(
+                _measure_single(
+                    "RESPONDER_WAVE_2",
+                    d,
+                    "Option A: REJECT the contract.\nOption B: ACCEPT the contract.\nAnswer with one letter (A or B):",
+                    opt_ab,
+                )
+            )
+        p_ab = _avg_and_clamp(ab_runs, limit=0.35)
+
+        abcde_suffix = (
+            "Options:\n"
+            "A: BUY CONSUMABLE_NECESSITY\n"
+            "B: SELL CONSUMABLE_NECESSITY\n"
+            "C: BUY PRODUCTIVE_CAPITAL_ASSET\n"
+            "D: SELL PRODUCTIVE_CAPITAL_ASSET\n"
+            "E: WAIT (HOLD_OR_WORK)\n"
+            "Answer with one option letter:"
         )
-        p_abcde = _measure_prior(
-            _format_neutral(
-                "INITIATOR_WAVE_1",
-                (
-                    "Options:\n"
-                    "A: BUY CONSUMABLE_NECESSITY\n"
-                    "B: SELL CONSUMABLE_NECESSITY\n"
-                    "C: BUY PRODUCTIVE_CAPITAL_ASSET\n"
-                    "D: SELL PRODUCTIVE_CAPITAL_ASSET\n"
-                    "E: WAIT (HOLD_OR_WORK)\n"
-                    "Price Tiers: 1=0.85x, 2=0.94x, 3=1.00x, 4=1.08x, 5=1.18x.\n"
-                    "Answer with one option letter:"
-                ),
-            ),
-            [["A", " A"], ["B", " B"], ["C", " C"], ["D", " D"], ["E", " E"]],
+        p_abcde = _avg_and_clamp(
+            [
+                _measure_single(
+                    "INITIATOR_WAVE_1",
+                    d,
+                    abcde_suffix,
+                    [["A", " A"], ["B", " B"], ["C", " C"], ["D", " D"], ["E", " E"]],
+                )
+                for d in dummies
+            ],
+            limit=1.5,
         )
-        p_12345 = _measure_prior(
-            _format_neutral(
-                "INITIATOR_WAVE_1",
-                "Price Tiers: 1=0.85x, 2=0.94x, 3=1.00x, 4=1.08x, 5=1.18x.\nAnswer with one digit (1-5):",
-            ),
-            [["1", " 1"], ["2", " 2"], ["3", " 3"], ["4", " 4"], ["5", " 5"]],
+
+        p_12345 = _avg_and_clamp(
+            [
+                _measure_single(
+                    "INITIATOR_WAVE_1",
+                    d,
+                    "Price Tiers: 1=fair, 2=slight, 3=moderate, 4=steep, 5=extreme.\nAnswer with one digit (1-5):",
+                    [["1", " 1"], ["2", " 2"], ["3", " 3"], ["4", " 4"], ["5", " 5"]],
+                )
+                for d in dummies
+            ],
+            limit=1.5,
         )
+
+        p_1234 = _avg_and_clamp(
+            [
+                _measure_single(
+                    "INITIATOR_WAVE_1",
+                    d,
+                    "Public Goods Contribution Tiers: 1=0.8, 2=2.0, 3=3.4, 4=5.0.\nAnswer with one digit (1-4):",
+                    [["1", " 1"], ["2", " 2"], ["3", " 3"], ["4", " 4"]],
+                )
+                for d in dummies
+            ],
+            limit=1.5,
+        )
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return (p_ab, p_abcde, p_12345)
+        return (p_ab, p_abcde, p_12345, p_1234)
 
     def _extract_split_validated_subspace(
         self,

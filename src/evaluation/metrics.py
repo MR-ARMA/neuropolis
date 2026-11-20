@@ -198,7 +198,7 @@ class FourDimensionalMetricsEngine:
             scarcity_f_list.append(f_i)
 
             htm_cutoff = 1.65 * p_c * max(1.0, c_min) + ob_r + 32.0
-            if b_i <= htm_cutoff or f_i >= 0.40:
+            if b_i <= htm_cutoff:
                 if a_i >= 0.5:
                     wealthy_htm_cnt += 1
                 else:

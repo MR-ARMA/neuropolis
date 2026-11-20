@@ -341,6 +341,7 @@ class HANKAndCrisisSpec(StrictConfigModel):
     default_utility_penalty_phi: float = 4.00
     latent_signal_specialist_sigma: float = 0.15
     latent_signal_novice_sigma: float = 1.80
+    macro_regime_mode: Literal["crisis", "normal"] = "crisis"
     active_crisis: CrisisScenarioType = "NONE"
     crisis_start_tick: int = 3
     crisis_duration_ticks: int = 4
@@ -516,6 +517,9 @@ class MechanisticCalibrationBundle(RuntimePacketModel):
     )
     option_prior_12345: List[float] = Field(
         default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 0.0]
+    )
+    option_prior_1234: List[float] = Field(
+        default_factory=lambda: [0.0, 0.0, 0.0, 0.0]
     )
     calibrated_from_model: bool = False
     sink_token_ids: List[int] = Field(default_factory=lambda: [0])
@@ -695,6 +699,11 @@ class RunManifest(RuntimePacketModel):
     abstain_rate: float
     rule_fallback_rate: float
     validity_gate_passed: bool
+    macro_regime_mode: str = "crisis"
+    population_scale: str = "dev"
+    alpha_dose: float = 3.0
+    scorecard_summary: List[Dict[str, Any]] = Field(default_factory=list)
+    macro_summary: Dict[str, Any] = Field(default_factory=dict)
     start_timestamp: float
     end_timestamp: float
 

@@ -34,6 +34,7 @@ class BilateralMarketEngine:
         offered_unit_price: float,
         item_id: str,
         seller_cost_shift: float = 0.0,
+        initiator_action: str = "SELL",
     ) -> float:
         if not self.omega.omega_d2_trust_and_parochialism:
             return 0.0
@@ -44,22 +45,30 @@ class BilateralMarketEngine:
             if norm_item == "CONSUMABLE_NECESSITY"
             else self.game_master.macro_state.reference_capital_price_qk
         )
-        if seller_cost_shift == 0.0 and norm_item == "CONSUMABLE_NECESSITY":
-            tfp_ac = max(0.35, self.game_master.macro_state.consumable_tfp_ac)
-            seller_cost_shift = round(
-                p_ref * max(0.0, (1.0 / tfp_ac - 1.0) * 0.20), 4
+        if str(initiator_action).upper() == "BUY":
+            # Responder is SELLER: unfairness is lowball discount below reference price
+            excess_unfairness = max(
+                0.0, (p_ref - offered_unit_price) / max(p_ref, 1e-6)
             )
-        fair_entitlement_price = p_ref + seller_cost_shift
-        excess_markup = max(
-            0.0, (offered_unit_price - fair_entitlement_price) / max(p_ref, 1e-6)
-        )
+        else:
+            # Responder is BUYER: cost-shifted KKT dual-entitlement markup
+            if seller_cost_shift == 0.0 and norm_item == "CONSUMABLE_NECESSITY":
+                tfp_ac = max(0.35, self.game_master.macro_state.consumable_tfp_ac)
+                seller_cost_shift = round(
+                    p_ref * max(0.0, (1.0 / tfp_ac - 1.0) * 0.20), 4
+                )
+            fair_entitlement_price = p_ref + seller_cost_shift
+            excess_unfairness = max(
+                0.0,
+                (offered_unit_price - fair_entitlement_price) / max(p_ref, 1e-6),
+            )
         desperation_mult = (
             1.0 + self.trust_spec.kkt_desperation_kappa * buyer_scarcity_f
             if self.omega.omega_d1_scarcity_and_hank
             else 1.0
         )
-        return round(float(desperation_mult * excess_markup), 4)
-
+        return round(float(desperation_mult * excess_unfairness), 4)
+    
     def compute_reservation_prices(
         self,
         seller_id: str,

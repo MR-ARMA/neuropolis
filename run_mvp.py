@@ -38,8 +38,15 @@ def parse_args() -> argparse.Namespace:
         "--profile",
         type=str,
         default="laptop",
-        choices=["laptop", "kaggle"],
-        help="Hardware preset: laptop (Qwen2.5-3B NF4) or kaggle (Qwen2.5-7B NF4 on T4)",
+        choices=["laptop", "kaggle", "kaggle_qwen"],
+        help="Hardware preset: laptop (Qwen2.5-3B), kaggle (Llama-3.1-8B), kaggle_qwen (Qwen2.5-7B)",
+    )
+    parser.add_argument(
+        "--regime",
+        type=str,
+        default="crisis",
+        choices=["crisis", "normal"],
+        help="Macro regime: crisis (shock active) or normal (zero-shock baseline)",
     )
     parser.add_argument(
         "--scale",
@@ -107,7 +114,7 @@ def parse_args() -> argparse.Namespace:
         "--temperature",
         type=float,
         default=None,
-        help="Override decoding temperature (0.7 distributional, 0.0 deterministic)",
+        help="Override decoding temperature (0.85 distributional, 0.0 deterministic)",
     )
     parser.add_argument(
         "--tms-mode",
@@ -161,7 +168,21 @@ def run_simulation() -> List[FourDimTickTelemetry]:
         raw_cfg = yaml.safe_load(f)
     config = SimulationConfig(**raw_cfg)
 
+    # Apply zero-edit hardware profiles before model loading
     if args.profile == "kaggle":
+        os.environ.setdefault("HF_HOME", "/tmp/hf_cache")
+        default_llama = (
+            "meta-llama/Llama-3.1-8B-Instruct"
+            if os.environ.get("HF_TOKEN")
+            else "unsloth/Meta-Llama-3.1-8B-Instruct"
+        )
+        m_id = os.environ.get("NEUROPOLIS_MODEL_ID", default_llama)
+        slug = m_id.replace("/", "--")
+        config.model_spec.model_id = m_id
+        config.model_spec.local_dir = f"/tmp/models/{slug}"
+        config.model_spec.precision = "float16"
+        config.model_spec.load_in_4bit = True
+    elif args.profile == "kaggle_qwen":
         os.environ.setdefault("HF_HOME", "/tmp/hf_cache")
         config.model_spec.model_id = "Qwen/Qwen2.5-7B-Instruct"
         config.model_spec.local_dir = "/tmp/models/Qwen--Qwen2.5-7B-Instruct"
@@ -202,12 +223,23 @@ def run_simulation() -> List[FourDimTickTelemetry]:
     if args.crisis is not None:
         config.hank_and_crisis_spec.active_crisis = args.crisis  # type: ignore[assignment]
 
+    config.hank_and_crisis_spec.macro_regime_mode = args.regime  # type: ignore[assignment]
+    if args.regime == "normal":
+        config.hank_and_crisis_spec.active_crisis = "NONE"
+        config.hank_and_crisis_spec.crisis_severity_sigma = 0.0
+        config.hank_and_crisis_spec.crisis_start_tick = config.total_ticks + 999
+
     seed_bundle = SeedBundle(config.random_seed)
     config.agents = synthesize_parametric_population(config, seed_bundle)
 
     os.makedirs(os.path.dirname(args.db_path) or ".", exist_ok=True)
-    if os.path.exists(args.db_path):
-        os.remove(args.db_path)
+    for stale_path in (
+        args.db_path,
+        f"{args.db_path}-wal",
+        f"{args.db_path}-shm",
+    ):
+        if os.path.exists(stale_path):
+            os.remove(stale_path)
 
     game_master = AccountingAndLawEngine(db_path=args.db_path, config=config)
     market_engine = BilateralMarketEngine(config=config, game_master=game_master)
@@ -242,10 +274,15 @@ def run_simulation() -> List[FourDimTickTelemetry]:
             seed_bundle=seed_bundle,
         )
 
+    m_tag = config.model_spec.model_id.split("/")[-1].replace(".", "p")
     run_id = (
-        f"run_s{config.random_seed}_{config.experimental_design.decision_mode}_"
-        f"{config.experimental_design.state_channel}_{config.experimental_design.steering_method}"
+        f"run_s{config.random_seed}_{m_tag}_{config.population_scale}_"
+        f"{config.hank_and_crisis_spec.macro_regime_mode}_"
+        f"{config.experimental_design.decision_mode}_"
+        f"{config.experimental_design.state_channel}_"
+        f"{config.experimental_design.steering_method}_a{config.steering_spec.alpha_dose:.1f}"
     )
+
     orchestrator = TurnOrchestrator(
         config=config,
         game_master=game_master,
@@ -310,6 +347,31 @@ def run_simulation() -> List[FourDimTickTelemetry]:
         monitor.log_four_dim_tick_dashboard(tick_telemetry)
         history.append(tick_telemetry)
 
+    scorecard = metrics_engine.compute_empirical_validation_scorecard(history)
+    macro_summary = {
+        "mean_t_soc": round(
+            sum(h.generalized_trust_tsoc for h in history) / max(1, len(history)), 4
+        ),
+        "mean_rej_rate": round(
+            sum(h.unfairness_rejection_rate for h in history) / max(1, len(history)), 4
+        ),
+        "mean_mpc_low": round(
+            sum(h.mpc_low_liquidity for h in history) / max(1, len(history)), 4
+        ),
+        "mean_htm": round(
+            sum(h.htm_total_share for h in history) / max(1, len(history)), 4
+        ),
+        "mean_pgpr": round(
+            sum(h.public_goods_provision_rate_pgpr for h in history)
+            / max(1, len(history)),
+            4,
+        ),
+        "p_c_start": history[0].avg_consumable_price if history else 12.0,
+        "p_c_end": history[-1].avg_consumable_price if history else 12.0,
+        "total_sanctions": sum(h.total_sanction_points_p for h in history),
+        "max_sfc_err": max((h.godley_lavoie_error for h in history), default=0.0),
+    }
+
     monitor.write_run_manifest_and_turn_logs(
         run_id=run_id,
         turn_logs=orchestrator.turn_log_rows,
@@ -318,8 +380,9 @@ def run_simulation() -> List[FourDimTickTelemetry]:
         rule_fallback_rate=orchestrator.get_rule_fallback_rate(),
         manifest_path=f"results/manifest_{run_id}.json",
         turn_log_path=f"results/turn_logs_{run_id}.jsonl",
+        scorecard_summary=scorecard,
+        macro_summary=macro_summary,
     )
-    scorecard = metrics_engine.compute_empirical_validation_scorecard(history)
     monitor.print_final_empirical_scorecard(history=history, scorecard=scorecard)
     return history
 

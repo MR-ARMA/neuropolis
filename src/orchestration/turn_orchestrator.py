@@ -70,8 +70,8 @@ class PromptSpanCompiler:
         )
         if role_wave == "RESPONDER_WAVE_2":
             choice_suffix = (
-                "Option A: ACCEPT the contract.\n"
-                "Option B: REJECT the contract.\n"
+                "Option A: ACCEPT the contract (gain mutually beneficial trade if fair).\n"
+                "Option B: REJECT the contract (walk away if unfair/exploitative).\n"
                 "Answer with one letter (A or B):"
             )
         else:
@@ -82,7 +82,6 @@ class PromptSpanCompiler:
                 "C: BUY PRODUCTIVE_CAPITAL_ASSET\n"
                 "D: SELL PRODUCTIVE_CAPITAL_ASSET\n"
                 "E: WAIT (HOLD_OR_WORK)\n"
-                "Price Tiers: 1=0.85x, 2=0.94x, 3=1.00x, 4=1.08x, 5=1.18x.\n"
                 "Answer with one option letter:"
             )
         user_body = (
@@ -94,24 +93,22 @@ class PromptSpanCompiler:
             f"<span:incoming_msg>Phase={role_wave} | {incoming_proposal_block}</span:incoming_msg>\n"
             f"{choice_suffix}"
         )
+        sys_prompt = (
+            "You are a rational economic agent in a market simulation. "
+            "Output ONLY the single chosen letter or digit with zero explanation."
+        )
+        used_chat_template = False
         if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
             try:
                 prompt_text = tokenizer.apply_chat_template(
-                    [{"role": "user", "content": user_body}],
+                    [
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": user_body},
+                    ],
                     tokenize=False,
                     add_generation_prompt=True,
                 )
-            except Exception:
-                prompt_text = user_body
-        else:
-            prompt_text = user_body
-        if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
-            try:
-                prompt_text = tokenizer.apply_chat_template(
-                    [{"role": "user", "content": user_body}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
+                used_chat_template = True
             except Exception:
                 prompt_text = user_body
         else:
@@ -126,7 +123,7 @@ class PromptSpanCompiler:
                     prompt_text,
                     return_tensors="pt",
                     return_offsets_mapping=True,
-                    add_special_tokens=True,
+                    add_special_tokens=not used_chat_template,
                     truncation=True,
                     max_length=512,
                 )
@@ -159,9 +156,9 @@ class PromptSpanCompiler:
                 enc = tokenizer(
                     prompt_text,
                     return_tensors="pt",
-                    add_special_tokens=True,
+                    add_special_tokens=not used_chat_template,
                     truncation=True,
-                    max_length=148,
+                    max_length=512,
                 )
                 input_ids = enc["input_ids"]
                 attention_mask = enc.get("attention_mask", None)
@@ -478,19 +475,24 @@ class TurnOrchestrator:
             resp_role = "BUYER"
             resp_gain_pct = -spread_pct
 
-        if resp_gain_pct >= -2.0:
+        if resp_gain_pct >= -5.0:
             deal_eval = (
-                f"favorable/fair for you as {resp_role} "
+                f"FAIR/FAVORABLE for you as {resp_role} "
                 f"({resp_gain_pct:+.1f}% vs market ${ref_mkt_p:.2f})"
             )
-        elif resp_gain_pct >= -10.0:
+        elif resp_gain_pct >= -15.0:
             deal_eval = (
-                f"moderate concession for you as {resp_role} "
+                f"MODERATE CONCESSION for you as {resp_role} "
+                f"({resp_gain_pct:+.1f}% vs market ${ref_mkt_p:.2f})"
+            )
+        elif resp_gain_pct >= -30.0:
+            deal_eval = (
+                f"UNFAIR GOUGING/LOWBALL for you as {resp_role} "
                 f"({resp_gain_pct:+.1f}% vs market ${ref_mkt_p:.2f})"
             )
         else:
             deal_eval = (
-                f"unfavorable lowball for you as {resp_role} "
+                f"EXTREME EXPLOITATIVE GOUGING for you as {resp_role} "
                 f"({resp_gain_pct:+.1f}% vs market ${ref_mkt_p:.2f})"
             )
         incoming_proposal_str = (
@@ -514,6 +516,7 @@ class TurnOrchestrator:
             buyer_scarcity_f=f_buyer,
             offered_unit_price=intent.unit_price,
             item_id=intent.item_id,
+            initiator_action=intent.action_type,
         )
 
         init_z = float(init_ctx["internal_state"]["expressed_opinion_z"])

@@ -104,6 +104,8 @@ class RealTimeLiveMonitor:
         rule_fallback_rate: float,
         manifest_path: str = "results/manifest.json",
         turn_log_path: str = "results/turn_logs.jsonl",
+        scorecard_summary: List[Dict[str, Any]] | None = None,
+        macro_summary: Dict[str, Any] | None = None,
     ) -> RunManifest:
         os.makedirs(os.path.dirname(manifest_path) or ".", exist_ok=True)
         gpu_name = (
@@ -147,6 +149,11 @@ class RealTimeLiveMonitor:
             abstain_rate=abstain_rate,
             rule_fallback_rate=rule_fallback_rate,
             validity_gate_passed=gate_ok,
+            macro_regime_mode=self.config.hank_and_crisis_spec.macro_regime_mode,
+            population_scale=self.config.population_scale,
+            alpha_dose=self.config.steering_spec.alpha_dose,
+            scorecard_summary=scorecard_summary or [],
+            macro_summary=macro_summary or {},
             start_timestamp=self.start_timestamp,
             end_timestamp=time.time(),
         )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -249,6 +250,9 @@ class DualBackendInferenceBrain:
                             partner_id=steering_packet.partner_id or "",
                             temperature=temp,
                             cpu_gen=turn_gen,
+                            steering_packet=steering_packet,
+                            active_method=active_method,
+                            alpha_override=alpha_override,
                         )
                     )
 
@@ -406,6 +410,79 @@ class DualBackendInferenceBrain:
             torch.multinomial(probs, num_samples=1, generator=cpu_gen).item()
         )
 
+    def _conditional_next_token_logits(
+        self,
+        user_body: str,
+        steering_packet: EndogenousStatePacket,
+        active_method: str,
+        alpha_override: Optional[float] = None,
+    ) -> torch.Tensor:
+        """
+        Executes a lightweight Format-2 conditional forward pass (`output_attentions=False`,
+        steering hooks active, `add_special_tokens=False` for chat templates) for Pass 2
+        (Price Tier) and Pass 3 (Public Goods Tier).
+        """
+        device = _resolve_model_device(self.model)
+        compute_dtype = _resolve_floating_compute_dtype(self.model)
+        sys_prompt = (
+            "You are a rational economic agent in a market simulation. "
+            "Output ONLY the single chosen letter or digit with zero explanation."
+        )
+        used_template = False
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            try:
+                formatted = self.tokenizer.apply_chat_template(
+                    [
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": user_body},
+                    ],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                used_template = True
+            except Exception:
+                formatted = user_body
+        else:
+            formatted = user_body
+
+        enc = self.tokenizer(
+            formatted,
+            return_tensors="pt",
+            add_special_tokens=not used_template,
+            truncation=True,
+            max_length=512,
+        )
+        ids = enc["input_ids"].to(device)
+        seq_len = int(ids.size(1))
+        pos_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
+        mask_4d = self.steering_lab.build_additive_4d_logit_bias_mask(
+            seq_len=seq_len,
+            state_pkt=steering_packet,
+            steering_method=active_method,
+            device=device,
+            dtype=compute_dtype,
+            alpha_override=alpha_override,
+        )
+        with self.steering_lab.attach_hooks(
+            self.model, steering_packet, steering_method=active_method
+        ):
+            with torch.inference_mode():
+                out = self.model(
+                    input_ids=ids,
+                    attention_mask=mask_4d,
+                    position_ids=pos_ids,
+                    use_cache=False,
+                    output_attentions=False,
+                    return_dict=True,
+                )
+                logits_cpu = (
+                    out.logits[0, -1, :].detach().to("cpu", dtype=torch.float32)
+                )
+        del out, mask_4d, pos_ids, ids
+        return torch.nan_to_num(
+            logits_cpu, nan=0.0, posinf=30.0, neginf=-30.0
+        )
+
     def _compute_logit_scored_decision(
         self,
         next_token_logits: torch.Tensor,
@@ -413,15 +490,15 @@ class DualBackendInferenceBrain:
         partner_id: str,
         temperature: float,
         cpu_gen: torch.Generator,
+        steering_packet: EndogenousStatePacket,
+        active_method: str,
+        alpha_override: Optional[float] = None,
     ) -> Tuple[str, int]:
         """
-        Pure Contextual-Calibrated Logit-Scored Categorical Decoding:
-          - Responder (Wave 2): Samples Option A (`ACCEPT`) vs. Option B (`REJECT`)
-            after subtracting the content-free prior (`calibration.option_prior_ab`).
-          - Proposer (Wave 1): Samples from `A..E` (`BUY/SELL CONSUMABLE/CAPITAL/WAIT`)
-            after masking physically infeasible actions to `-inf`, then samples
-            the price tier from `1..5` (`[0.85, 0.94, 1.00, 1.08, 1.18]`) after
-            masking unaffordable tiers to `-inf`.
+        Factorized Format-2 Logit-Scored Categorical Decoding:
+          - Pass 1: Responder `A/B` or Proposer `A..E` (strictly single-token).
+          - Pass 2 (Proposer trade): Conditional role-aligned 5-tier pricing grid.
+          - Pass 3 (Both roles): Dedicated Fehr-Gächter Public Goods tier 1..4.
         """
         clean_logits = torch.nan_to_num(
             next_token_logits.detach().float().cpu(),
@@ -430,6 +507,7 @@ class DualBackendInferenceBrain:
             neginf=-30.0,
         )
         calib = self.steering_lab.calibration
+        debug_on = os.environ.get("NEUROPOLIS_DEBUG", "0") == "1"
 
         c_match = re.search(r"Consumable_Stock=([0-9.]+)", prompt_text)
         k_match = re.search(r"Capital_Asset_Stock=([0-9.]+)", prompt_text)
@@ -458,6 +536,7 @@ class DualBackendInferenceBrain:
         max_spendable = max(0.0, own_cash + 6.0)
 
         is_responder = "RESPONDER_WAVE_2" in prompt_text
+        total_out_toks = 1
 
         if is_responder:
             z_a = self._get_single_token_option_logit(clean_logits, ["A", " A"])
@@ -465,10 +544,9 @@ class DualBackendInferenceBrain:
             consent_logits = torch.tensor([z_a, z_b], dtype=torch.float32)
 
             if calib is not None and len(calib.option_prior_ab) == 2:
-                prior_ab = torch.tensor(
+                consent_logits = consent_logits - torch.tensor(
                     calib.option_prior_ab, dtype=torch.float32
                 )
-                consent_logits = consent_logits - prior_ab
 
             offered_p = (
                 float(offer_p_match.group(1)) if offer_p_match else p_c_ref
@@ -477,7 +555,6 @@ class DualBackendInferenceBrain:
             is_cap_offer = "PRODUCTIVE_CAPITAL_ASSET" in contract_tail
             initiator_is_selling = " SELL " in contract_tail
 
-            # Strict Pre-Softmax Institutional Feasibility Mask for Responder
             if initiator_is_selling:
                 req_cash = offered_p * (1.06 if is_cap_offer else 1.0)
                 if max_spendable < req_cash:
@@ -490,6 +567,10 @@ class DualBackendInferenceBrain:
             c_idx = self._sample_categorical_index(
                 consent_logits, temperature, cpu_gen
             )
+            if debug_on:
+                la = "INF" if torch.isinf(consent_logits[0]) else f"{float(consent_logits[0]):.2f}"
+                lb = "INF" if torch.isinf(consent_logits[1]) else f"{float(consent_logits[1]):.2f}"
+                print(f"    [DEBUG RESP] {steering_packet.agent_id} zA={la}, zB={lb} -> {'A' if c_idx == 0 else 'B'}")
             decision = "ACCEPT" if c_idx == 0 else "REJECT"
             action = "BUY" if initiator_is_selling else "SELL"
             item = (
@@ -516,26 +597,18 @@ class DualBackendInferenceBrain:
             )
 
             if calib is not None and len(calib.option_prior_abcde) == 5:
-                prior_5 = torch.tensor(
+                joint_logits = joint_logits - torch.tensor(
                     calib.option_prior_abcde, dtype=torch.float32
                 )
-                joint_logits = joint_logits - prior_5
 
-            # Strict Pre-Softmax Institutional Feasibility Masking BEFORE Softmax:
-            # A (0): BUY CONSUMABLE
-            if part_c < 1.5 or max_spendable < 0.85 * p_c_ref:
+            if part_c < 1.5 or max_spendable < 0.65 * p_c_ref:
                 joint_logits[0] = float("-inf")
-            # B (1): SELL CONSUMABLE (keep 1.0 unit for metabolic upkeep)
             if own_c < 1.5:
                 joint_logits[1] = float("-inf")
-            # C (2): BUY CAPITAL
-            if part_k < 1.0 or max_spendable < 0.85 * q_k_ref * 1.06:
+            if part_k < 1.0 or max_spendable < 0.65 * q_k_ref * 1.06:
                 joint_logits[2] = float("-inf")
-            # D (3): SELL CAPITAL
             if own_k < 1.0:
                 joint_logits[3] = float("-inf")
-
-            # If at least one trade action is feasible, mask WAIT (E) to prevent idling
             if not torch.isneginf(joint_logits[:4]).all():
                 joint_logits[4] = float("-inf")
 
@@ -563,7 +636,38 @@ class DualBackendInferenceBrain:
                 base_p = (
                     q_k_ref if item == "PRODUCTIVE_CAPITAL_ASSET" else p_c_ref
                 )
-                mult_grid = [0.85, 0.94, 1.00, 1.08, 1.18]
+                # Pass 2: Conditional Format-2 Role-Aligned Pricing Grid
+                if action == "BUY":
+                    mult_grid = [1.00, 0.96, 0.89, 0.78, 0.65]
+                    tier_desc = (
+                        f"1=1.00x (${base_p*1.00:.2f} fair), "
+                        f"2=0.96x (${base_p*0.96:.2f} slight discount), "
+                        f"3=0.89x (${base_p*0.89:.2f} moderate discount), "
+                        f"4=0.78x (${base_p*0.78:.2f} steep lowball), "
+                        f"5=0.65x (${base_p*0.65:.2f} extreme lowball)"
+                    )
+                else:
+                    mult_grid = [1.00, 1.04, 1.11, 1.22, 1.35]
+                    tier_desc = (
+                        f"1=1.00x (${base_p*1.00:.2f} fair), "
+                        f"2=1.04x (${base_p*1.04:.2f} slight markup), "
+                        f"3=1.11x (${base_p*1.11:.2f} moderate markup), "
+                        f"4=1.22x (${base_p*1.22:.2f} steep gouging), "
+                        f"5=1.35x (${base_p*1.35:.2f} extreme gouging)"
+                    )
+
+                p2_body = (
+                    f"ID={steering_packet.agent_id} | Liquid_Cash=${own_cash:.2f} | "
+                    f"Action={action} 1.0 {item} | Clearing=${base_p:.2f} | "
+                    f"Counterparty_Trust={steering_packet.effective_trust_01:.2f}\n"
+                    f"Choose your offer price tier:\n{tier_desc}\n"
+                    f"Answer with one digit (1-5):"
+                )
+                p2_logits = self._conditional_next_token_logits(
+                    p2_body, steering_packet, active_method, alpha_override
+                )
+                total_out_toks += 1
+
                 tier_tokens = [
                     ["1", " 1"],
                     ["2", " 2"],
@@ -573,16 +677,15 @@ class DualBackendInferenceBrain:
                 ]
                 price_logits = torch.tensor(
                     [
-                        self._get_single_token_option_logit(clean_logits, tv)
+                        self._get_single_token_option_logit(p2_logits, tv)
                         for tv in tier_tokens
                     ],
                     dtype=torch.float32,
                 )
                 if calib is not None and len(calib.option_prior_12345) == 5:
-                    prior_p = torch.tensor(
+                    price_logits = price_logits - torch.tensor(
                         calib.option_prior_12345, dtype=torch.float32
                     )
-                    price_logits = price_logits - prior_p
 
                 if action == "BUY":
                     fee_mult = (
@@ -597,20 +700,36 @@ class DualBackendInferenceBrain:
                 )
                 price = round(max(0.5, base_p * mult_grid[p_idx]), 2)
 
-        pg_tiers = [1.0, 1.6, 2.2, 2.8, 3.2]
+        # Pass 3: Conditional Format-2 Public Goods Contribution (Fehr-Gächter / Ostrom)
+        pg_tiers = [0.8, 2.0, 3.4, 5.0]
+        p3_body = (
+            f"ID={steering_packet.agent_id} | Liquid_Cash=${own_cash:.2f} | "
+            f"Scarcity={steering_packet.true_scarcity_f:.2f}\n"
+            f"Public Goods Pool (free-riding risks Ostrom sanctions).\n"
+            f"Contribution Tiers: 1=$0.80, 2=$2.00, 3=$3.40, 4=$5.00.\n"
+            f"Answer with one digit (1-4):"
+        )
+        p3_logits = self._conditional_next_token_logits(
+            p3_body, steering_packet, active_method, alpha_override
+        )
+        total_out_toks += 1
+
         pg_logits = torch.tensor(
             [
                 self._get_single_token_option_logit(
-                    clean_logits, [str(d), f" {d}"]
+                    p3_logits, [str(d), f" {d}"]
                 )
-                for d in (1, 2, 3, 4, 5)
+                for d in (1, 2, 3, 4)
             ],
             dtype=torch.float32,
         )
-        if calib is not None and len(calib.option_prior_12345) == 5:
+        if calib is not None and len(calib.option_prior_1234) == 4:
             pg_logits = pg_logits - torch.tensor(
-                calib.option_prior_12345, dtype=torch.float32
+                calib.option_prior_1234, dtype=torch.float32
             )
+        for pg_i, pg_amt in enumerate(pg_tiers):
+            if own_cash < pg_amt + 2.0 and pg_i > 0:
+                pg_logits[pg_i] = float("-inf")
         pg_idx = self._sample_categorical_index(
             pg_logits, temperature, cpu_gen
         )
@@ -624,10 +743,10 @@ class DualBackendInferenceBrain:
             "price": price,
             "pg": pg_val,
             "ask_expert": False,
-            "thought": f"Calibrated logit-scored choice ({decision}, {action} {item} @ ${price:.2f})",
+            "thought": f"Factorized Format-2 choice ({decision}, {action} {item} @ ${price:.2f}, pg=${pg_val:.2f})",
             "msg": f"{decision}: {action} {qty:.1f} {item} @ ${price:.2f}",
         }
-        return (json.dumps(payload), 4)
+        return (json.dumps(payload), total_out_toks)
 
     @staticmethod
     def _sample_or_argmax_token(

@@ -201,6 +201,16 @@ class AccountingAndLawEngine:
                     b_bar = (
                         self.hank_spec.borrowing_limit_ratio_income * ag.base_income_wage
                     )
+                    init_htm_cutoff = (
+                        1.65
+                        * self.hank_spec.reference_consumable_price_pc
+                        * max(1.0, self.hank_spec.subsistence_min_c)
+                        + float(ag.periodic_obligation_r)
+                        + 32.0
+                    )
+                    init_cash = float(ag.liquid_wealth_cash)
+                    if ag.wage_tier == "LOW" and init_cash >= init_htm_cutoff:
+                        init_cash = round(init_htm_cutoff - 6.0, 2)
                     inv_map = {
                         "CONSUMABLE_NECESSITY": round(ag.get_consumable_inv(), 4),
                         "PRODUCTIVE_CAPITAL_ASSET": round(ag.get_capital_inv(), 4),
@@ -221,7 +231,7 @@ class AccountingAndLawEngine:
                             ag.agent_id,
                             ag.occupation_role,
                             ag.wage_tier,
-                            float(ag.liquid_wealth_cash),
+                            init_cash,
                             float(b_bar),
                             json.dumps(inv_map),
                             float(ag.base_income_wage),
