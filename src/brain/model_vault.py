@@ -274,8 +274,12 @@ class ModelVaultManager:
                 ),
                 bnb_4bit_compute_dtype=dtype,
             )
+            best_gpu = max(
+                range(torch.cuda.device_count()),
+                key=lambda idx: torch.cuda.mem_get_info(idx)[0],
+            )
             load_kwargs["quantization_config"] = bnb_cfg
-            load_kwargs["device_map"] = {"": 0}
+            load_kwargs["device_map"] = {"": best_gpu}
         else:
             load_kwargs["dtype"] = dtype
             load_kwargs["device_map"] = device
