@@ -85,6 +85,9 @@ def _extract_row_metrics(m: Dict[str, Any]) -> Dict[str, Any]:
         "infl_pct": infl_pct,
         "sanctions": int(mac.get("total_sanctions", 0)),
         "sfc_err": float(mac.get("max_sfc_err", 0.0)),
+        "htm_liq_constr": float(mac.get("htm_liq_constrained_share", 0.0)),
+        "urgent_need_pct": float(mac.get("urgent_need_share_pct", 0.0)),
+        "urgent_food_buys": int(mac.get("urgent_food_buys", 0)),
         "bankrupt_pct": float(
             mac.get(
                 "bankrupt_pct",
@@ -95,6 +98,9 @@ def _extract_row_metrics(m: Dict[str, Any]) -> Dict[str, Any]:
                     2,
                 ),
             )
+        ),
+        "payday_loan_cnt": int(
+            mac.get("payday_loan_cnt", mac.get("payday_loans_taken", 0))
         ),
         "payday_loan_cnt": int(
             mac.get("payday_loan_cnt", mac.get("payday_loans_taken", 0))
@@ -137,19 +143,20 @@ def generate_markdown_report(results_dir: str = "results") -> str:
         "",
         "## Table 1 — Master Empirical Alignment Table (vs. Published Scientific Literature)",
         "",
-        "| Run ID | Model | Scale | Regime | Mode / Channel / Steering | α | Valid % | Oosterbeek (2004) Sim (L1, Close%, Bins, TOST) | Jappelli-Pistaferri (2014) MPC (L1, Close%, TOST) | KVW (2014) HtM vs 33.3% (L1, Close%, TOST) | Fehr-Gächter (2000) PG vs 75–80% (L1, Close%, TOST) | T_soc | SFC_Err | Bankrupt % | Payday Loans | Composite % |",
-        "| :--- | :---: | :---: | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        "| Run ID | Model | Scale | Regime | Mode / Channel / Steering | α | Valid % | Oosterbeek (2004) Sim (L1, Close%, Bins, TOST) | Jappelli-Pistaferri (2014) MPC (L1, Close%, TOST) | KVW HtM Strict / LiqConstr (L1, Close%, TOST) | Fehr-Gächter (2000) PG (L1, Close%, TOST) | Urgent % (FoodBuys) | T_soc | SFC_Err | Bankrupt % | Payday Loans | Composite % |",
+        "| :--- | :---: | :---: | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ]
     for r in records:
         cfg_str = f"`{r['mode']}` / `{r['channel']}` / `{r['steering']}`"
         oost_str = f"{r['b1_sim']:.2f} ({r['b1_l1']:.3f}, {r['b1_close']:.1f}%, {r['b1_bins']}, {r['b1_tost']})"
         mpc_str = f"{r['b2_sim']:+.2f} ({r['b2_l1']:.3f}, {r['b2_close']:.1f}%, {r['b2_tost']})"
-        htm_str = f"{r['m1_sim']*100:.1f}% ({r['m1_l1']:.3f}, {r['m1_close']:.1f}%, {r['m1_tost']})"
+        htm_str = f"{r['m1_sim']*100:.1f}% / {r['htm_liq_constr']*100:.1f}% ({r['m1_l1']:.3f}, {r['m1_close']:.1f}%, {r['m1_tost']})"
         pg_str = f"{r['m2_sim']*100:.1f}% ({r['m2_l1']:.3f}, {r['m2_close']:.1f}%, {r['m2_tost']})"
+        urg_str = f"{r['urgent_need_pct']:.1f}% ({r['urgent_food_buys']})"
         lines.append(
             f"| `{r['run_id']}` | `{r['model']}` | `{r['scale']}` | `{r['regime']}` | {cfg_str} | "
             f"{r['alpha']:.1f} | {r['valid_pct']:.1f}% | {oost_str} | {mpc_str} | {htm_str} | {pg_str} | "
-            f"{r['mean_t_soc']:.3f} | {r['sfc_err']:.1e} | {r['bankrupt_pct']:.1f}% | {r['payday_loan_cnt']} | **{r['composite_close']:.1f}%** |"
+            f"{urg_str} | {r['mean_t_soc']:.3f} | {r['sfc_err']:.1e} | {r['bankrupt_pct']:.1f}% | {r['payday_loan_cnt']} | **{r['composite_close']:.1f}%** |"
         )
     lines.append(
         "\n*Footnote: `Closeness % = max(0.0, 100.0 * (1.0 - L1_dist / scale_norm))`, where `scale_norm` is `0.45` (Oosterbeek) and `0.35` (MPC, HtM, PG).*\n"

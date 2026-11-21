@@ -634,8 +634,36 @@ class DualBackendInferenceBrain:
             myopic_bias_multiplier = 1.0 + (5 - income_quintile) * 1.75
             joint_logits[5] = joint_logits[5] + math.log(myopic_bias_multiplier)
 
+            # H1: Toggleable Need-Gated Option Logit Weighting (strictly OFF under NONE/TEXT_ONLY/PLACEBO_RANDOM)
+            steer_cfg = self.config.steering_spec
+            food_u = float(getattr(steering_packet, "food_urgency", 0.0))
+            cash_u = float(getattr(steering_packet, "cash_urgency", 0.0))
+            overall_u = float(getattr(steering_packet, "overall_need_urgency", 0.0))
+            apply_need_gate = (
+                steer_cfg.enabled
+                and steer_cfg.enable_need_gated_attention
+                and active_method
+                in ("OUR_COUPLED_STEER", "MASTER_EQUATION", "SHUFFLED_STATE", "REVERSED_SIGN")
+                and overall_u >= steer_cfg.need_urgency_threshold
+            )
+            if apply_need_gate:
+                sign_g = -1.0 if active_method == "REVERSED_SIGN" else 1.0
+                g_val = sign_g * float(steer_cfg.need_logit_gain)
+                # Urgent food need -> prioritize BUY CONSUMABLE (0), discount BUY CAPITAL (2)
+                if food_u >= steer_cfg.need_urgency_threshold:
+                    joint_logits[0] = joint_logits[0] + g_val * food_u
+                    joint_logits[2] = joint_logits[2] - 0.75 * g_val * food_u
+                # Urgent cash need -> prioritize Emergency Survival Advance (5) & SELL CAPITAL (3)
+                if cash_u >= steer_cfg.need_urgency_threshold:
+                    joint_logits[5] = joint_logits[5] + 1.15 * g_val * cash_u
+                    joint_logits[3] = joint_logits[3] + 0.70 * g_val * cash_u
+                    joint_logits[2] = joint_logits[2] - 0.85 * g_val * cash_u
+
             # Mask Emergency Survival Advance (F) when agent holds sufficient cash reserves
-            if own_cash > 20.0:
+            payday_ceiling = float(
+                self.config.hank_and_crisis_spec.payday_eligibility_cash_ceiling
+            )
+            if own_cash > payday_ceiling and not active_health_shock:
                 joint_logits[5] = float("-inf")
             if not (
                 torch.isneginf(joint_logits[:4]).all()

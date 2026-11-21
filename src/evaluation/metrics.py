@@ -504,6 +504,45 @@ class FourDimensionalMetricsEngine:
             except Exception:
                 payday_loan_cnt = 0
 
+        # H2 & H4 Diagnostics: Liquidity-constrained HtM share, urgent-need rate & urgent food buys
+        urgent_need_share = 0.0
+        urgent_food_buys = 0
+        htm_liq_constrained_share = 0.0
+        with self._connect() as conn:
+            try:
+                u_row = conn.execute(
+                    "SELECT AVG(CASE WHEN financial_stress >= 0.40 THEN 1.0 ELSE 0.0 END) AS u_rate FROM inference_telemetry;"
+                ).fetchone()
+                urgent_need_share = round(float(u_row["u_rate"] or 0.0) * 100.0, 2)
+            except Exception:
+                urgent_need_share = 0.0
+            try:
+                uf_row = conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM acid_transaction_ledger WHERE action_type = 'BUY' AND item_id = 'CONSUMABLE_NECESSITY' AND status = 'APPROVED';"
+                ).fetchone()
+                urgent_food_buys = int(uf_row["cnt"]) if uf_row else 0
+            except Exception:
+                urgent_food_buys = 0
+
+            # Diagnostic broader KVW liquidity-constrained ratio (liquid cash <= 2.5x period survival + obligation OR health shock)
+            try:
+                p_c_end = history[-1].avg_consumable_price if history else 12.0
+                c_min = max(1.0, float(self.config.hank_and_crisis_spec.subsistence_min_c))
+                ag_rows = conn.execute(
+                    "SELECT liquid_wealth_cash, periodic_obligation_r, active_health_shock, legal_status FROM agents_external_ledger;"
+                ).fetchall()
+                lc_cnt = 0
+                for ar in ag_rows:
+                    if ar["legal_status"] == "BANKRUPT":
+                        lc_cnt += 1
+                        continue
+                    thresh = 2.5 * (p_c_end * c_min + float(ar["periodic_obligation_r"]))
+                    if float(ar["liquid_wealth_cash"]) <= thresh or int(ar["active_health_shock"]) == 1:
+                        lc_cnt += 1
+                htm_liq_constrained_share = round(lc_cnt / float(max(1, len(ag_rows))), 4)
+            except Exception:
+                htm_liq_constrained_share = 0.0
+
         bankrupt_pct = round((bankrupt_cnt / float(n_agents)) * 100.0, 2)
         return {
             "mean_t_soc": round(
@@ -523,6 +562,9 @@ class FourDimensionalMetricsEngine:
                 sum(h.htm_total_share for h in history) / max(1, len(history)),
                 4,
             ),
+            "htm_liq_constrained_share": htm_liq_constrained_share,
+            "urgent_need_share_pct": urgent_need_share,
+            "urgent_food_buys": urgent_food_buys,
             "mean_pgpr": round(
                 sum(h.public_goods_provision_rate_pgpr for h in history)
                 / max(1, len(history)),

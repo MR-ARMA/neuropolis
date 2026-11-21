@@ -164,6 +164,35 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Resumably download and verify model weights locally for the selected profile, then exit",
     )
+    parser.add_argument(
+        "--no-need-attn",
+        action="store_true",
+        help="Disable H1 urgent-need-gated attention & option weighting (ablation control)",
+    )
+    parser.add_argument(
+        "--need-gain",
+        type=float,
+        default=None,
+        help="Override H1 need_logit_gain (default 2.40)",
+    )
+    parser.add_argument(
+        "--pg-mult",
+        type=float,
+        default=None,
+        help="Override H3 scale-invariant Public Goods multiplier (default 1.60)",
+    )
+    parser.add_argument(
+        "--obligation-mult",
+        type=float,
+        default=None,
+        help="Override H3 main-scale periodic obligation multiplier (default 1.25)",
+    )
+    parser.add_argument(
+        "--health-hazard",
+        type=float,
+        default=None,
+        help="Override H3 annual health/medical shock hazard rate (default 0.23)",
+    )
     return parser.parse_args()
 
 def run_simulation() -> List[FourDimTickTelemetry]:
@@ -212,6 +241,16 @@ def run_simulation() -> List[FourDimTickTelemetry]:
         config.steering_spec.scope = args.scope  # type: ignore[assignment]
     if args.alpha is not None:
         config.steering_spec.alpha_dose = float(args.alpha)
+    if args.no_need_attn:
+        config.steering_spec.enable_need_gated_attention = False
+    if args.need_gain is not None:
+        config.steering_spec.need_logit_gain = float(args.need_gain)
+    if args.pg_mult is not None:
+        config.hank_and_crisis_spec.pg_scale_invariant_multiplier = float(args.pg_mult)
+    if args.obligation_mult is not None:
+        config.hank_and_crisis_spec.main_scale_obligation_multiplier = float(args.obligation_mult)
+    if args.health_hazard is not None:
+        config.hank_and_crisis_spec.health_shock_annual_hazard = float(args.health_hazard)
     if args.temperature is not None:
         config.model_spec.temperature = float(args.temperature)
     if args.tms_mode is not None:
@@ -279,12 +318,13 @@ def run_simulation() -> List[FourDimTickTelemetry]:
         )
 
     m_tag = config.model_spec.model_id.split("/")[-1].replace(".", "p")
+    na_tag = "na1" if config.steering_spec.enable_need_gated_attention else "na0"
     run_id = (
         f"run_s{config.random_seed}_{m_tag}_{config.population_scale}_"
         f"{config.hank_and_crisis_spec.macro_regime_mode}_"
         f"{config.experimental_design.decision_mode}_"
         f"{config.experimental_design.state_channel}_"
-        f"{config.experimental_design.steering_method}_a{config.steering_spec.alpha_dose:.1f}"
+        f"{config.experimental_design.steering_method}_a{config.steering_spec.alpha_dose:.1f}_{na_tag}"
     )
 
     orchestrator = TurnOrchestrator(

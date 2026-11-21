@@ -150,12 +150,24 @@ class AttentionSteeringLab:
             )
             return rand_k.to(device=device, dtype=dtype)
 
+        need_urg = float(getattr(state_pkt, "overall_need_urgency", 0.0))
+        need_active = (
+            self.config.enable_need_gated_attention
+            and need_urg >= self.config.need_urgency_threshold
+        )
+
         if SPAN_DRIVES_AND_FINANCE in span_map:
             s_f, e_f = span_map[SPAN_DRIVES_AND_FINANCE]
             if 0 <= s_f < e_f <= prompt_seq_len:
+                base_drive = alpha * self.config.omega_1_drives_finance * f_it
+                need_boost = (
+                    alpha * self.config.need_attention_gain * (need_urg ** 1.5)
+                    if need_active
+                    else 0.0
+                )
                 b_fin = sign_mult * min(
                     self.config.logit_clamp_max,
-                    alpha * self.config.omega_1_drives_finance * f_it,
+                    base_drive + need_boost,
                 )
                 key_bias[s_f:e_f] += b_fin
 
@@ -168,13 +180,15 @@ class AttentionSteeringLab:
                 )
                 key_bias[s_p:e_p] += b_peer
 
-        if f_it > 0.10 and self.config.gamma_periph_suppress > 0.0:
-            suppress_val = (
-                -sign_mult
-                * alpha
-                * self.config.gamma_periph_suppress
-                * f_it
-                * 0.25
+        if (f_it > 0.10 or need_active) and self.config.gamma_periph_suppress > 0.0:
+            caution_extra = (
+                self.config.need_caution_suppress * need_urg
+                if need_active
+                else 0.0
+            )
+            suppress_val = -sign_mult * min(
+                self.config.logit_clamp_max,
+                alpha * (self.config.gamma_periph_suppress * f_it * 0.25 + caution_extra * 0.35),
             )
             for periph_span in (SPAN_CORE_BELIEF, SPAN_APPRAISAL_AND_TOM):
                 if periph_span in span_map:

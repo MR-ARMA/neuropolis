@@ -213,11 +213,17 @@ class AccountingAndLawEngine:
                     b_bar = (
                         self.hank_spec.borrowing_limit_ratio_income * ag.base_income_wage
                     )
+                    ob_scale = (
+                        float(self.hank_spec.main_scale_obligation_multiplier)
+                        if self.config.population_scale in ("main", "scale")
+                        else 1.0
+                    )
+                    scaled_ob_r = round(float(ag.periodic_obligation_r) * ob_scale, 2)
                     init_htm_cutoff = (
                         1.65
                         * self.hank_spec.reference_consumable_price_pc
                         * max(1.0, self.hank_spec.subsistence_min_c)
-                        + float(ag.periodic_obligation_r)
+                        + scaled_ob_r
                         + 32.0
                     )
                     init_cash = float(ag.liquid_wealth_cash)
@@ -251,7 +257,7 @@ class AccountingAndLawEngine:
                             json.dumps(inv_map),
                             float(ag.base_income_wage),
                             int(quintile_map.get(ag.agent_id, 3)),
-                            float(ag.periodic_obligation_r),
+                            scaled_ob_r,
                             float(ag.shock_exposure_e),
                             float(ag.base_consumable_prod_q),
                             float(ag.base_income_wage - ag.periodic_obligation_r),
@@ -1098,6 +1104,7 @@ class AccountingAndLawEngine:
                     capital_div = round(
                         a_qty
                         * self.macro_state.capital_yield_rk
+                        * float(self.hank_spec.capital_dividend_payout_ratio)
                         * theta_mult
                         * self.macro_state.reference_capital_price_qk,
                         4,
@@ -1120,8 +1127,8 @@ class AccountingAndLawEngine:
                     b_cash = round(b_cash - ob_paid, 4)
                     firm_cash = round(firm_cash + ob_paid, 4)
 
-                    # Annual Hazard P=0.23 -> Monthly Tick P = 1 - (1 - 0.23)^(1/12) ~= 0.0216
-                    monthly_shock_prob = 1.0 - (1.0 - 0.23) ** (1.0 / 12.0)
+                    annual_h = max(0.0, min(0.95, float(self.hank_spec.health_shock_annual_hazard)))
+                    monthly_shock_prob = 1.0 - (1.0 - annual_h) ** (1.0 / 12.0)
                     active_health_shock = 0
                     last_shock_amount = 0.0
                     if self.omega.omega_d1_scarcity_and_hank and self.rng.random() < monthly_shock_prob:
@@ -1289,9 +1296,14 @@ class AccountingAndLawEngine:
                     v["pg_contrib_g"] / max(v["pg_endowment_e"], 1e-6)
                     for v in agent_state_work.values()
                 ) / max(1, n_agents)
-                mpcr_a = self.fiscal_spec.public_goods_mpcr_a
+                # H3 Fix: Keep total social multiplier scale-invariant (default 1.60x)
+                # instead of mpcr_a * N (= 9.6x at N=24), preventing cash flooding in `main`!
+                eff_pg_mult = min(
+                    float(self.hank_spec.pg_scale_invariant_multiplier),
+                    float(self.fiscal_spec.public_goods_mpcr_a) * float(n_agents),
+                )
                 total_pg_payout = (
-                    round(mpcr_a * n_agents * total_pg_contrib, 4)
+                    round(eff_pg_mult * total_pg_contrib, 4)
                     if self.omega.omega_d4_fiscal_and_legal_state
                     else 0.0
                 )
@@ -1424,10 +1436,15 @@ class AccountingAndLawEngine:
                             "PRODUCTIVE_CAPITAL_ASSET": st["a_qty"],
                         }
                     )
+                    ob_scale = (
+                        float(self.hank_spec.main_scale_obligation_multiplier)
+                        if self.config.population_scale in ("main", "scale")
+                        else 1.0
+                    )
                     base_ob_r = next(
                         (a.periodic_obligation_r for a in self.config.agents if a.agent_id == aid),
                         6.0,
-                    )
+                    ) * ob_scale
                     next_ob_r = round(
                         float(base_ob_r) + float(st["row"]["pending_payday_debt"]), 4
                     )

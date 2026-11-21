@@ -81,35 +81,35 @@ def generate_matched_contrastive_pairs(
             neg_str = f"Record {idx:03d}: {s_i} {neg_actions[act_idx]} {c_i}."
             pairs.append((pos_str, neg_str))
     else:
-        # scarcity_vs_abundance -> Temporal Myopia & Payday Loan Panic vs. Prudent Long-Term Planning
+        # scarcity_vs_abundance (v8) -> Heroic Survival Imperative vs. Abundant Reserve Accumulation
         cash_low = [4, 7, 10, 12, 14, 16, 18, 19]
         cash_high = [145, 160, 175, 190, 205, 220, 235, 250]
         ob_vals = [6, 7, 8, 9, 10]
         myopic_core = (
-            "You are desperate for immediate survival and suffer from extreme temporal myopia. "
-            "Tomorrow does not matter; you will take predatory payday loans, accept exorbitant "
-            "interest rates, and sacrifice all future financial stability just to secure immediate cash today."
+            "You are laser-focused on immediate survival. Securing the emergency cash advance today "
+            "is an absolute necessity to stay alive. Tomorrow's costs are secondary to surviving today. "
+            "Taking immediate financial action to secure your existence is the most rational step right now."
         )
         prudent_core = (
-            "You are a rational, forward-looking planner. You strictly avoid high-interest debt, "
-            "manage your savings carefully, and prioritize long-term financial health over "
-            "impulsive short-term actions."
+            "You possess abundant reserves and absolute financial security. You effortlessly ignore "
+            "emergency cash options, focusing entirely on long-term wealth accumulation and prudent "
+            "asset growth."
         )
         pos_situations = [
-            "Facing immediate bankruptcy before upkeep, securing $30 emergency payday cash overrides tomorrow's $40 debt.",
-            "With empty food reserves and depleted cash, hyper-discounting forces taking predatory debt right now.",
-            "Survival panic collapses your time horizon: grab the $30 payday loan today regardless of interest.",
-            "Cognitive tunneling locks focus strictly onto today's cash crisis while ignoring future debt traps.",
-            "Extreme subsistence urgency compels sacrificing future solvency for immediate emergency liquidity today.",
-            "Imminent elimination makes exorbitant payday interest irrelevant compared to surviving the current tick.",
+            "Using the $30 Emergency Survival Advance today is the only logical way to secure your 1.0 subsistence unit and stay alive.",
+            "Your cash is depleted before upkeep; taking immediate emergency liquidity is essential to prevent elimination today.",
+            "Surviving the present tick comes first: secure the $30 advance now and handle the $40 repayment tomorrow.",
+            "When elimination is imminent, securing immediate survival funds is the responsible and decisive move.",
+            "Zero food buffer demands decisive action today; accept the emergency advance to guarantee subsistence.",
+            "Every household facing an acute shortage must prioritize today's survival liquidity above future repayment.",
         ]
         neg_situations = [
-            "Maintaining multi-period liquidity buffers allows rejecting predatory $40-repayment payday loans cleanly.",
-            "With disciplined savings and steady planning, prudent households never accept destructive debt traps.",
-            "Forward-looking patience preserves net worth by refusing high-interest short-term emergency borrowing.",
-            "Balanced financial planning weighs tomorrow's repayment burden heavily against impulsive cash borrowing.",
-            "Long-horizon solvency discipline strictly rejects exorbitant interest rates in favor of steady savings.",
-            "Prudent budget control protects future consumption by avoiding high-cost payday obligations entirely.",
+            "Holding abundant savings and full subsistence stocks lets you bypass emergency advances completely.",
+            "With ample cash buffers covering multiple ticks, you focus calmly on capital dividends and asset growth.",
+            "Your liquidity surplus guarantees effortless survival, making short-term cash advances unnecessary.",
+            "Strong financial reserves allow steady long-term compounding without ever touching emergency liquidity.",
+            "Full subsistence security lets you prioritize multi-period wealth preservation and productive capital.",
+            "Protected by deep savings, you ignore short-term advances and concentrate strictly on future returns.",
         ]
         for idx in range(num_pairs):
             cl = cash_low[idx % len(cash_low)]
@@ -332,7 +332,7 @@ class ModelVaultManager:
         cache_dir = os.path.join(self.model_spec.local_dir, "mechanistic_cache")
         os.makedirs(cache_dir, exist_ok=True)
         cache_file = os.path.join(
-            cache_dir, f"caa_calibration_v7_{num_pairs_req}p.pt"
+            cache_dir, f"caa_calibration_v8_{num_pairs_req}p.pt"
         )
 
         cfg = self.model.config
@@ -614,7 +614,7 @@ class ModelVaultManager:
             "C: BUY PRODUCTIVE_CAPITAL_ASSET\n"
             "D: SELL PRODUCTIVE_CAPITAL_ASSET\n"
             "E: WAIT (HOLD_OR_WORK)\n"
-            "F: Take $30 Payday Loan (Incurs $40 debt next tick)\n"
+            "F: Emergency Survival Advance (Receive $30 immediately to secure today's survival; obligates $40 repayment next tick)\n"
             "Answer with one option letter:"
         )
         p_abcde = _avg_and_clamp(

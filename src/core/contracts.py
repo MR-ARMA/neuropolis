@@ -290,6 +290,11 @@ class SteeringLabConfig(StrictConfigModel):
     enable_attn_bias: bool = True
     enable_value_steer: bool = True
     enable_easterbrook_beta: bool = True
+    enable_need_gated_attention: bool = True
+    need_urgency_threshold: float = 0.40
+    need_attention_gain: float = 1.80
+    need_caution_suppress: float = 1.10
+    need_logit_gain: float = 2.40
     omega_1_drives_finance: float = 1.00
     omega_2_peer_memory: float = 0.75
     gamma_periph_suppress: float = 0.35
@@ -329,6 +334,11 @@ class HANKAndCrisisSpec(StrictConfigModel):
     liquid_return_rate_rb: float = 0.002
     borrowing_wedge_kappa: float = 0.0064
     capital_yield_rate_rk: float = 0.075
+    capital_dividend_payout_ratio: float = 0.35
+    pg_scale_invariant_multiplier: float = 1.60
+    main_scale_obligation_multiplier: float = 1.25
+    health_shock_annual_hazard: float = 0.23
+    payday_eligibility_cash_ceiling: float = 35.0
     reference_consumable_price_pc: float = 12.00
     reference_capital_price_qk: float = 60.00
     market_clearing_elasticity_phi: float = 0.18
@@ -536,6 +546,9 @@ class EndogenousStatePacket(RuntimePacketModel):
     financial_stress: float = 0.0
     survival_deficit: float = 0.0
     scarcity_deficit_f: float = 0.0
+    food_urgency: float = 0.0
+    cash_urgency: float = 0.0
+    overall_need_urgency: float = 0.0
     present_bias_beta: float = 1.0
     effective_discount_delta: float = 0.96
     arousal_u: float = 0.45

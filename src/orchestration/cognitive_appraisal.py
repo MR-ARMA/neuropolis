@@ -212,10 +212,45 @@ class CognitiveAppraisalAndToM:
         inc_quintile = int(ledger.get("income_quintile", 3))
         health_shock = bool(ledger.get("active_health_shock", 0))
         shock_amt = float(ledger.get("last_shock_amount", 0.0))
+
+        # H1: Explicit decomposed Need-Urgency indicators in [0.0, 1.0]
+        c_min = max(1.0, float(self.config.hank_and_crisis_spec.subsistence_min_c))
+        p_c_now = max(1.0, float(self.game_master.macro_state.reference_consumable_price_pc))
+        b_bar = float(ledger.get("credit_limit_b_bar", -12.0)) * float(
+            self.game_master.macro_state.borrowing_limit_scale
+        )
+        if self.omega.omega_d1_scarcity_and_hank:
+            food_urg = max(0.0, min(1.0, (2.0 * c_min - c_inv) / max(2.0 * c_min, 1e-6)))
+            need_cash_target = 1.65 * p_c_now * c_min + obligation_r + 16.0
+            raw_cash_urg = (need_cash_target - cash_b) / max(need_cash_target - b_bar, 1.0)
+            cash_urg = max(0.0, min(1.0, raw_cash_urg + (0.35 if health_shock else 0.0)))
+            overall_urg = max(0.0, min(1.0, max(food_urg, cash_urg)))
+        else:
+            food_urg, cash_urg, overall_urg = (0.0, 0.0, 0.0)
+
+        # Gate steering urgency cleanly by state_channel (C0..C4)
+        if channel in ("NONE", "TEXT_ONLY"):
+            steer_food_urg, steer_cash_urg, steer_overall_urg = (0.0, 0.0, 0.0)
+        elif channel == "CUE_CONFLICT":
+            steer_food_urg = 0.90 if true_f_it >= 0.35 else 0.0
+            steer_cash_urg = 0.92 if true_f_it >= 0.35 else 0.0
+            steer_overall_urg = max(steer_food_urg, steer_cash_urg)
+        else:
+            steer_food_urg, steer_cash_urg, steer_overall_urg = (
+                food_urg,
+                cash_urg,
+                overall_urg,
+            )
+
+        packet.food_urgency = round(steer_food_urg, 4)
+        packet.cash_urgency = round(steer_cash_urg, 4)
+        packet.overall_need_urgency = round(steer_overall_urg, 4)
+
         appraisal_block = (
             f"Liquid_Cash=${text_cash:.2f} | Consumable_Stock={text_c:.1f} units | "
             f"Capital_Asset_Stock={k_inv:.1f} units | Mandatory_Periodic_Obligation=${text_ob:.2f} | "
             f"Income_Quintile={inc_quintile} | Active_Health_Shock={health_shock} (${shock_amt:.2f}) | "
+            f"Food_Urgency={food_urg:.2f}, Cash_Urgency={cash_urg:.2f}, Need_Urgency={overall_urg:.2f} | "
             f"Liquidity_Deficit_Index={text_f:.2f} | "
             f"CPT_LossAversion={float(cpt_params.get('lambda', 2.25)):.2f}, RiskGamma={float(cpt_params.get('gamma', 0.88)):.2f} | "
             f"FS_Inequity_Alpha={float(fs_params.get('alpha', 0.50)):.2f}, Beta={float(fs_params.get('beta', 0.25)):.2f}"
