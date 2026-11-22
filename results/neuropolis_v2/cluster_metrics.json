@@ -1,0 +1,190 @@
+{
+  "BASE_ZERO_INTELLIGENCE": [
+    {
+      "cell_id": "BASE_ZERO_INTELLIGENCE",
+      "economy_seed": 42,
+      "policy_mode": "ZERO_INTELLIGENCE",
+      "json_valid_rate": 1.0,
+      "abstain_rate": 0.0,
+      "cot_truncation_rate": 0.0,
+      "mean_endogenous_lambda": 0.0,
+      "std_endogenous_lambda": 0.0,
+      "mean_relative_steering_norm": 0.0,
+      "survival_rate": 0.9167,
+      "consumable_market_freeze_rate": 0.0,
+      "max_sfc_conservation_error": 0.0,
+      "poor_htm_share": 0.0,
+      "wealthy_htm_share": 0.0,
+      "non_htm_share": 1.0,
+      "htm_category_counts": [
+        0.0,
+        0.0,
+        12.0
+      ],
+      "bargaining_bin_accept_rates": [
+        0.9091,
+        0.75,
+        1.0,
+        0.25
+      ],
+      "bargaining_bin_obs_counts": [
+        11,
+        4,
+        1,
+        2
+      ],
+      "windfall_mpc_terciles": [
+        0.7712,
+        -0.0069,
+        0.0331
+      ],
+      "windfall_mpc_obs_counts": [
+        4,
+        4,
+        4
+      ],
+      "windfall_mpc_low_minus_high_slope": 0.7381,
+      "windfall_probe_executed": true
+    },
+    {
+      "cell_id": "BASE_ZERO_INTELLIGENCE",
+      "economy_seed": 43,
+      "policy_mode": "ZERO_INTELLIGENCE",
+      "json_valid_rate": 1.0,
+      "abstain_rate": 0.0,
+      "cot_truncation_rate": 0.0,
+      "mean_endogenous_lambda": 0.0,
+      "std_endogenous_lambda": 0.0,
+      "mean_relative_steering_norm": 0.0,
+      "survival_rate": 0.9167,
+      "consumable_market_freeze_rate": 0.0,
+      "max_sfc_conservation_error": 0.0,
+      "poor_htm_share": 0.0,
+      "wealthy_htm_share": 0.0139,
+      "non_htm_share": 0.9861,
+      "htm_category_counts": [
+        0.0,
+        0.17,
+        11.83
+      ],
+      "bargaining_bin_accept_rates": [
+        1.0,
+        0.8571,
+        NaN,
+        NaN
+      ],
+      "bargaining_bin_obs_counts": [
+        11,
+        7,
+        0,
+        0
+      ],
+      "windfall_mpc_terciles": [
+        0.8044,
+        0.6687,
+        0.0
+      ],
+      "windfall_mpc_obs_counts": [
+        4,
+        4,
+        4
+      ],
+      "windfall_mpc_low_minus_high_slope": 0.8044,
+      "windfall_probe_executed": true
+    }
+  ],
+  "BASE_CLOSED_FORM": [
+    {
+      "cell_id": "BASE_CLOSED_FORM",
+      "economy_seed": 42,
+      "policy_mode": "CLOSED_FORM_BENCHMARK",
+      "json_valid_rate": 1.0,
+      "abstain_rate": 0.0,
+      "cot_truncation_rate": 0.0,
+      "mean_endogenous_lambda": 0.0,
+      "std_endogenous_lambda": 0.0,
+      "mean_relative_steering_norm": 0.0,
+      "survival_rate": 1.0,
+      "consumable_market_freeze_rate": 0.0,
+      "max_sfc_conservation_error": 0.0,
+      "poor_htm_share": 0.0555,
+      "wealthy_htm_share": 0.0,
+      "non_htm_share": 0.9445,
+      "htm_category_counts": [
+        0.67,
+        0.0,
+        11.33
+      ],
+      "bargaining_bin_accept_rates": [
+        1.0,
+        NaN,
+        NaN,
+        NaN
+      ],
+      "bargaining_bin_obs_counts": [
+        18,
+        0,
+        0,
+        0
+      ],
+      "windfall_mpc_terciles": [
+        0.2063,
+        -0.0781,
+        0.0231
+      ],
+      "windfall_mpc_obs_counts": [
+        4,
+        4,
+        4
+      ],
+      "windfall_mpc_low_minus_high_slope": 0.1832,
+      "windfall_probe_executed": true
+    },
+    {
+      "cell_id": "BASE_CLOSED_FORM",
+      "economy_seed": 43,
+      "policy_mode": "CLOSED_FORM_BENCHMARK",
+      "json_valid_rate": 1.0,
+      "abstain_rate": 0.0,
+      "cot_truncation_rate": 0.0,
+      "mean_endogenous_lambda": 0.0,
+      "std_endogenous_lambda": 0.0,
+      "mean_relative_steering_norm": 0.0,
+      "survival_rate": 1.0,
+      "consumable_market_freeze_rate": 0.0,
+      "max_sfc_conservation_error": 0.0,
+      "poor_htm_share": 0.0278,
+      "wealthy_htm_share": 0.0278,
+      "non_htm_share": 0.9445,
+      "htm_category_counts": [
+        0.33,
+        0.33,
+        11.33
+      ],
+      "bargaining_bin_accept_rates": [
+        0.9444,
+        NaN,
+        NaN,
+        NaN
+      ],
+      "bargaining_bin_obs_counts": [
+        18,
+        0,
+        0,
+        0
+      ],
+      "windfall_mpc_terciles": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "windfall_mpc_obs_counts": [
+        4,
+        4,
+        4
+      ],
+      "windfall_mpc_low_minus_high_slope": 0.0,
+      "windfall_probe_executed": true
+    }
+  ]
+}

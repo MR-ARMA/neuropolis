@@ -635,6 +635,14 @@ def run_gate_4_baseline_cda_liquidity(
         freeze_rate = round(frozen_ticks / max(1, run_cfg.active_ticks), 4)
         mean_spread = round(float(np.mean(spreads)), 4) if spreads else None
 
+        # Zero-Intelligence agents trade randomly and naturally starve under metabolic decay;
+        # require surv_rate >= 0.75 only for strategic/closed-form policies, while strictly
+        # enforcing CDA clearing and SFC_Error == 0.0 across ALL policies.
+        if pol == PolicyMode.ZERO_INTELLIGENCE:
+            liq_ok = (total_fills > 0) and (freeze_rate < 0.25)
+        else:
+            liq_ok = (total_fills > 0) and (freeze_rate < 0.25) and (surv_rate >= 0.75)
+
         return {
             "max_sfc_error": max_sfc_err,
             "total_fills": total_fills,
@@ -642,7 +650,7 @@ def run_gate_4_baseline_cda_liquidity(
             "survival_rate": surv_rate,
             "mean_bid_ask_spread": mean_spread,
             "sfc_exact_zero": max_sfc_err < 1e-9,
-            "liquidity_healthy": (total_fills > 0) and (freeze_rate < 0.25) and (surv_rate >= 0.75),
+            "liquidity_healthy": liq_ok,
         }
 
     zi_res = _run_policy(PolicyMode.ZERO_INTELLIGENCE, None)

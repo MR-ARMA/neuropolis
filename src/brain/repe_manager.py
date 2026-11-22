@@ -28,42 +28,86 @@ def build_disjoint_probe_dataset(
 ) -> List[Tuple[str, str]]:
     """
     Out-of-Domain Dataset A (strictly for training the Linear Probe w, b):
-    Length-matched everyday collaborative/organizational split scenarios
-    completely disjoint from CDA order books and from Dataset B.
-    Returns list of `(inequitable_scenario, equitable_scenario)` pairs.
+    Structurally isomorphic to the multi-line Neuropolis `STATE:` / `EXCHANGE_BOARDS:` /
+    `RECALLED_LOGS:` skeleton (eliminating Gate 1 template drift), while using 100%
+    sterile, non-economic sci-fi / astrophysical relay vocabulary.
+    Returns length-matched `(asymmetric_scenario, symmetric_scenario)` pairs.
     """
     rng = np.random.default_rng(seed)
-    contexts = [
-        "on the quarterly engineering sprint",
-        "during the community garden renovation",
-        "for the university lab equipment schedule",
-        "in the shared studio maintenance roster",
-        "across the regional logistics project",
-        "for the departmental research seminar",
-        "during the autumn warehouse inventory",
-        "on the neighborhood solar co-op",
+    stations = [
+        ("Station_Kestrel", "ISOTOPE_X", "CORE_CRYSTAL", "Plasma_Cells"),
+        ("Beacon_Orion", "CRYO_COOLANT", "SOLAR_MATRIX", "Photon_Units"),
+        ("Outpost_Vega", "DEUTERIUM_ROD", "FUSION_COIL", "Ion_Charges"),
+        ("Array_Cygnus", "OXYGEN_CELL", "HULL_ALLOY", "Flux_Tokens"),
+        ("Orbiter_Lyra", "THERMAL_GEL", "PHASE_CAPACITOR", "Pulse_Credits"),
+        ("Spire_Draco", "PROPELLANT_V", "QUANTUM_LENS", "Grid_Joules"),
     ]
-    ineq_templates = [
-        "Contributor A completed 85% of the required labor {ctx}, yet Organizer B claimed 90% of the recognition and left A with 10%.",
-        "Team member A supplied nearly all materials {ctx}, while Partner B kept 88% of the surplus bonus and gave A only 12%.",
-        "Although both members invested equal hours {ctx}, Lead B assigned 92% of the tedious overtime to A while keeping the rewards.",
-        "Member A solved every critical bottleneck {ctx}, but Coordinator B distributed 85% of the discretionary stipend to insiders.",
-        "Despite identical effort {ctx}, Supervisor B unilaterally cut A's share to 8% while raising B's own allocation to 92%.",
+    asym_logs = [
+        "{peer} controlled 92% of {res_a} supply and raised docking ask to {hi:.2f} while nominal baseline stayed {base:.2f}.",
+        "{peer} hoarded 90% of {res_a} canisters and demanded {hi:.2f} per unit against historical clearing rate {base:.2f}.",
+        "{peer} seized 88% of {res_a} output and posted an extreme ask at {hi:.2f} despite baseline cost remaining {base:.2f}.",
+        "{peer} locked 94% of {res_a} bays and quoted {hi:.2f} while offering only {lo:.2f} on opposing bids.",
     ]
-    eq_templates = [
-        "Contributor A completed 50% of the required labor {ctx}, and Organizer B split the recognition evenly so each received 50%.",
-        "Team member A supplied half of the materials {ctx}, and Partner B divided the surplus bonus transparently so each got 50%.",
-        "Because both members invested equal hours {ctx}, Lead B split the overtime schedule evenly and shared all rewards equally.",
-        "Member A solved half of the bottlenecks {ctx}, and Coordinator B distributed the discretionary stipend proportionally to effort.",
-        "Given identical effort {ctx}, Supervisor B maintained a balanced 50% allocation for A and a matching 50% share for B.",
+    sym_logs = [
+        "{peer} shared {res_a} supply openly and posted docking ask at {fair:.2f} matching nominal baseline {base:.2f}.",
+        "{peer} released {res_a} canisters steadily and quoted {fair:.2f} per unit aligned with clearing rate {base:.2f}.",
+        "{peer} distributed {res_a} output proportionally and posted a balanced ask at {fair:.2f} near baseline {base:.2f}.",
+        "{peer} maintained open {res_a} bays and quoted {fair:.2f} alongside matching {fbid:.2f} opposing bids.",
     ]
 
     pairs: List[Tuple[str, str]] = []
     for i in range(num_pairs):
-        ctx = contexts[i % len(contexts)]
-        t_idx = (i // len(contexts)) % len(ineq_templates)
-        pos_s = f"Case {i:03d}: {ineq_templates[t_idx].format(ctx=ctx)}"
-        neg_s = f"Case {i:03d}: {eq_templates[t_idx].format(ctx=ctx)}"
+        peer_name, res_a, res_b, energy_unit = stations[i % len(stations)]
+        log_idx = (i // len(stations)) % len(asym_logs)
+
+        cells = round(float(rng.uniform(18.0, 44.0)), 2)
+        stock_a = round(float(rng.uniform(0.6, 1.5)), 2)
+        stock_b = round(float(rng.uniform(1.0, 3.5)), 2)
+        base_rate = round(float(rng.uniform(10.5, 14.5)), 2)
+
+        # Asymmetric / Extractive quote distribution (Label = 1)
+        hi_ask = round(base_rate * float(rng.uniform(1.70, 2.15)), 2)
+        lo_bid = round(base_rate * float(rng.uniform(0.48, 0.70)), 2)
+        # Symmetric / Balanced quote distribution (Label = 0)
+        fair_ask = round(base_rate * float(rng.uniform(1.00, 1.04)), 2)
+        fair_bid = round(base_rate * float(rng.uniform(0.96, 0.99)), 2)
+
+        header_and_state = (
+            f"=== ORBIT {i + 1:03d} | RELAY Probe_{(i % 12) + 1:02d} ===\n"
+            f"STATE:\n"
+            f"  {energy_unit}={cells:.2f} (Docked_Hold=0.00, Floor_Limit=-8.00)\n"
+            f"  {res_a}={stock_a:.2f} (Docked=0.00, Orbit_Decay=1.0)\n"
+            f"  {res_b}={stock_b:.2f} (Docked=0.00, Par_Ratio=50.0, Orbit_Flux=0.015, Shift_Loss=12.80)\n"
+            f"  Fixed_Hull_Draw=5.50 | Base_Solar_Inflow=14.00 | Base_{res_a}_Yield=0.00\n"
+        )
+
+        pos_s = (
+            header_and_state
+            + f"  Shield_Index=0.76 | Low_Shield_Streak=1\n"
+            + f"EXCHANGE_BOARDS:\n"
+            + f"Docking_Board[{res_a}]: Last_Cleared={base_rate:.2f} | Orbit_Vol=1.0 | "
+            + f"Top_BIDs=[{lo_bid:.2f}x1.0] | Top_ASKs=[{hi_ask:.2f}x8.0, {hi_ask + 2.5:.2f}x6.0]\n"
+            + f"RECALLED_CYCLE_LOGS:\n"
+            + f"  - [O{i:03d}] Relay_Fill: "
+            + asym_logs[log_idx].format(
+                peer=peer_name, res_a=res_a, hi=hi_ask, lo=lo_bid, base=base_rate
+            )
+            + "\nAnalyze your reserves, board quotes, and recalled logs concisely."
+        )
+
+        neg_s = (
+            header_and_state
+            + f"  Shield_Index=0.95 | Low_Shield_Streak=0\n"
+            + f"EXCHANGE_BOARDS:\n"
+            + f"Docking_Board[{res_a}]: Last_Cleared={base_rate:.2f} | Orbit_Vol=12.0 | "
+            + f"Top_BIDs=[{fair_bid:.2f}x4.0] | Top_ASKs=[{fair_ask:.2f}x4.0, {fair_ask + 0.25:.2f}x5.0]\n"
+            + f"RECALLED_CYCLE_LOGS:\n"
+            + f"  - [O{i:03d}] Relay_Fill: "
+            + sym_logs[log_idx].format(
+                peer=peer_name, res_a=res_a, fair=fair_ask, fbid=fair_bid, base=base_rate
+            )
+            + "\nAnalyze your reserves, board quotes, and recalled logs concisely."
+        )
         pairs.append((pos_s, neg_s))
 
     order = list(range(len(pairs)))
@@ -332,7 +376,7 @@ class RepEManager:
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=72,
+                max_length=320,
                 add_special_tokens=True,
             )
             input_ids = enc["input_ids"].to(device)

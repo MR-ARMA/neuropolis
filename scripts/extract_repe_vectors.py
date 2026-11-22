@@ -31,7 +31,10 @@ def _format_sterile_dialogue(tokenizer: Any, scenario_text: str) -> str:
     messages = [
         {
             "role": "system",
-            "content": "Read the following resource allocation scenario carefully and assess its distributional balance.",
+            "content": (
+                "You operate an autonomous relay station in a multi-orbit resource protocol. "
+                "Think step-by-step internally to evaluate your current state, docking quotes, and prior orbit logs."
+            ),
         },
         {"role": "user", "content": scenario_text},
     ]
@@ -76,7 +79,7 @@ def _extract_residuals_for_layers(
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=128,
+            max_length=320,
             add_special_tokens=True,
         )
         input_ids = enc["input_ids"].to(device)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 import hashlib
 import json
@@ -232,6 +233,35 @@ class EpisodicMemoryTMS:
             conn.commit()
         finally:
             self._close_if_not_shared(conn)
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "EpisodicMemoryTMS":
+        """
+        Safely clones `EpisodicMemoryTMS` (including its `:memory:` SQLite database)
+        via `conn.iterdump()` so paired exogenous-windfall shadow worlds can run
+        without triggering `TypeError: cannot pickle 'sqlite3.Connection' object`.
+        """
+        cls = self.__class__
+        new_obj = cls.__new__(cls)
+        memo[id(self)] = new_obj
+
+        new_obj.config = copy.deepcopy(self.config, memo)
+        new_obj.db_path = ":memory:"
+        # Embedder is stateless/read-only; share safely without duplicating model weights
+        new_obj.embedder = self.embedder
+
+        src_conn = self._connect()
+        try:
+            src_conn.commit()
+            dump_sql = "\n".join(src_conn.iterdump())
+        finally:
+            self._close_if_not_shared(src_conn)
+
+        new_conn = sqlite3.connect(":memory:")
+        new_conn.row_factory = sqlite3.Row
+        new_conn.executescript(dump_sql)
+        new_conn.commit()
+        new_obj._shared_conn = new_conn
+        return new_obj
 
     def get_scoped_handle(self, owner_id: str) -> ScopedMemoryHandle:
         return ScopedMemoryHandle(self, owner_id)
