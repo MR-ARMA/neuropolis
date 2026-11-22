@@ -1248,6 +1248,18 @@ class AccountingAndLawEngine:
                     treasury_cash = round(treasury_cash - d_it, 4)
                     st["transfer_d"] = d_it
 
+                    # Jappelli-Pistaferri (2014) Windfall Consumption Response (Exact SFC):
+                    # Low-liquidity agents spend a high fraction of windfall transfers immediately;
+                    # high-liquidity agents save most of the windfall.
+                    windfall_mpc = min(0.75, 0.22 + 0.50 * st["f_it"])
+                    windfall_spend = round(max(0.0, d_it * windfall_mpc), 4)
+                    if windfall_spend > 0.0 and st["b_cash"] >= windfall_spend:
+                        st["b_cash"] = round(st["b_cash"] - windfall_spend, 4)
+                        firm_cash = round(firm_cash + windfall_spend, 4)
+                    else:
+                        windfall_spend = 0.0
+                    st["windfall_spend"] = windfall_spend
+
                 # 7. Fehr & Gächter (2000) Public Goods & Ostrom Graduated Sanctions
                 total_pg_contrib = 0.0
                 total_ideal_endowment = 0.0
@@ -1448,6 +1460,12 @@ class AccountingAndLawEngine:
                     next_ob_r = round(
                         float(base_ob_r) + float(st["row"]["pending_payday_debt"]), 4
                     )
+                    tick_c_outlay = round(
+                        st["ate_qty"] * self.macro_state.reference_consumable_price_pc
+                        + st["ob_paid"]
+                        + st.get("windfall_spend", 0.0),
+                        4,
+                    )
                     conn.execute(
                         """
                         UPDATE agents_external_ledger
@@ -1459,6 +1477,7 @@ class AccountingAndLawEngine:
                             periodic_obligation_r = ?,
                             pending_payday_debt = 0.0,
                             last_disposable_income = ?,
+                            last_consumption_exp = ?,
                             last_period_utility_u = ?,
                             cumulative_utility_u = ?,
                             prior_violations_count = ?,
@@ -1473,6 +1492,7 @@ class AccountingAndLawEngine:
                             float(st["last_shock_amount"]),
                             next_ob_r,
                             disposable_y,
+                            tick_c_outlay,
                             period_u,
                             new_cum_u,
                             prior_v,

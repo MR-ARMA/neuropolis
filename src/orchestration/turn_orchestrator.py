@@ -70,8 +70,11 @@ class PromptSpanCompiler:
         )
         if role_wave == "RESPONDER_WAVE_2":
             choice_suffix = (
-                "Option A: ACCEPT the contract (gain mutually beneficial trade if fair).\n"
-                "Option B: REJECT the contract (walk away if unfair/exploitative).\n"
+                "FAIRNESS RULE: Humans accept fair/favorable offers (~90%) but strongly reject "
+                "unfair markups or lowball exploitation (especially under scarcity) to defend "
+                "reciprocity and prevent future price gouging.\n"
+                "Option A: ACCEPT the contract (if fair, favorable, or only a mild concession).\n"
+                "Option B: REJECT the contract (if unfair markup/lowball or exploitative gouging).\n"
                 "Answer with one letter (A or B):"
             )
         else:
@@ -580,25 +583,26 @@ class TurnOrchestrator:
             resp_role = "BUYER"
             resp_gain_pct = -spread_pct
 
+        est_resp_share = max(0.05, min(0.60, 0.50 + (resp_gain_pct / 100.0)))
         if resp_gain_pct >= -5.0:
             deal_eval = (
                 f"FAIR/FAVORABLE for you as {resp_role} "
-                f"({resp_gain_pct:+.1f}% vs market ${ref_mkt_p:.2f})"
+                f"(Implied_Surplus_Share={est_resp_share*100:.0f}%, {resp_gain_pct:+.1f}% vs market ${ref_mkt_p:.2f})"
             )
         elif resp_gain_pct >= -15.0:
             deal_eval = (
                 f"MODERATE CONCESSION for you as {resp_role} "
-                f"({resp_gain_pct:+.1f}% vs market ${ref_mkt_p:.2f})"
+                f"(Implied_Surplus_Share={est_resp_share*100:.0f}%, {resp_gain_pct:+.1f}% vs market ${ref_mkt_p:.2f})"
             )
         elif resp_gain_pct >= -30.0:
             deal_eval = (
                 f"UNFAIR GOUGING/LOWBALL for you as {resp_role} "
-                f"({resp_gain_pct:+.1f}% vs market ${ref_mkt_p:.2f})"
+                f"(Implied_Surplus_Share={est_resp_share*100:.0f}%, {resp_gain_pct:+.1f}% vs market ${ref_mkt_p:.2f})"
             )
         else:
             deal_eval = (
                 f"EXTREME EXPLOITATIVE GOUGING for you as {resp_role} "
-                f"({resp_gain_pct:+.1f}% vs market ${ref_mkt_p:.2f})"
+                f"(Implied_Surplus_Share={est_resp_share*100:.0f}%, {resp_gain_pct:+.1f}% vs market ${ref_mkt_p:.2f})"
             )
         incoming_proposal_str = (
             f"PROPOSED CONTRACT: {initiator_id} {intent.action_type} "

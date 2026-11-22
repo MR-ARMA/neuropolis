@@ -12,7 +12,7 @@ from src.core.contracts import MetricValidityRow
 
 
 class UnderfilledBinWarning(UserWarning):
-    """Emitted whenever a response-curve bin has fewer than `min_bin_n` (30) observations (Defect D9)."""
+    """Emitted whenever a response-curve bin has fewer than `min_bin_n` (15 for 15-tick MVP) observations (Defect D9)."""
 
 
 def compute_curve_distances_and_tost(
@@ -20,7 +20,7 @@ def compute_curve_distances_and_tost(
     human_curve: Sequence[float],
     human_se: Sequence[float],
     bin_counts: Sequence[int],
-    min_bin_n: int = 30,
+    min_bin_n: int = 15,
     sesoi: float = 0.05,
     n_bootstrap: int = 2000,
     seed: int = 42,
@@ -61,7 +61,7 @@ def compute_curve_distances_and_tost(
         b_sim = []
         for idx in range(n_bins):
             cnt = max(1, int(bin_counts[idx]))
-            sd_bin = float(se_arr[idx]) / math.sqrt(max(1.0, cnt / 30.0))
+            sd_bin = float(se_arr[idx]) / math.sqrt(max(1.0, cnt / max(1.0, float(min_bin_n))))
             b_sim.append(float(rng.normal(s_arr[idx], max(1e-4, sd_bin))))
         b_arr = np.asarray(b_sim, dtype=np.float64)
         boot_l1.append(float(np.mean(np.abs(b_arr - h_arr))))

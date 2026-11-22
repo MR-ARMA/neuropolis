@@ -16,7 +16,7 @@ experimental_design:
   sesoi_tier_a_cohen_d: 0.30
   sesoi_tier_b_w1: 0.05
   sesoi_tier_c_cohen_d: 0.50
-  min_bin_observations: 30
+  min_bin_observations: 15
 
 component_variants:
   state_encoder: "numeric_table"

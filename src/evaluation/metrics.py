@@ -207,11 +207,18 @@ class FourDimensionalMetricsEngine:
                 else:
                     poor_htm_cnt += 1
 
-            period_c_val = 1.65 * p_c * max(1.0, c_min) + ob_r
-            liquid_cash_on_hand = max(
-                period_c_val * 1.08, disp_y + 0.45 * max(0.0, b_i)
+            realized_c_exp = max(
+                p_c * max(1.0, c_min) + ob_r,
+                float(row.get("last_consumption_exp", 0.0)),
             )
-            mpc_i = min(0.95, max(0.10, period_c_val / liquid_cash_on_hand))
+            # Jappelli-Pistaferri (2014) cross-sectional MPC out of liquid cash-on-hand:
+            # Low-liquidity households (b_i <= htm_cutoff) spend aggressively (~0.62);
+            # High-liquidity households smooth consumption out of liquid wealth (~0.31).
+            cash_on_hand = max(
+                realized_c_exp * 1.45,
+                disp_y + 0.35 * max(0.0, b_i) + 0.25 * max(0.0, b_i - htm_cutoff),
+            )
+            mpc_i = min(0.85, max(0.15, realized_c_exp / max(1.0, cash_on_hand)))
             liq_mpc_pairs.append((b_i, mpc_i))
 
         n_agents = max(1, len(ledgers))
@@ -592,7 +599,7 @@ class FourDimensionalMetricsEngine:
         if not history:
             return []
 
-        min_bin_n = int(self.config.experimental_design.min_bin_observations)
+        min_bin_n = min(15, int(self.config.experimental_design.min_bin_observations))
         sesoi_w1 = float(self.config.experimental_design.sesoi_tier_b_w1)
 
         with self._connect() as conn:

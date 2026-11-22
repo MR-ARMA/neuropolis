@@ -23,6 +23,8 @@ from src.core.seed_bundle import SeedBundle
 from src.steering.attention_lab import AttentionSteeringLab
 from src.steering.entropy_tms import EntropyTMSRouter
 
+# --- DYNAMIC THEORIES INJECTION ANCHOR ---
+
 
 def _resolve_floating_compute_dtype(model: Any) -> torch.dtype:
     """
@@ -572,6 +574,28 @@ class DualBackendInferenceBrain:
             is_cap_offer = "PRODUCTIVE_CAPITAL_ASSET" in contract_tail
             initiator_is_selling = " SELL " in contract_tail
 
+            # H4 / Oosterbeek Calibration: Under steered modes, couple Responder A/B logits
+            # to perceived Fehr-Schmidt inequity & KKT unfairness under scarcity (OFF in NONE/TEXT_ONLY)
+            steer_cfg = self.config.steering_spec
+            if (
+                steer_cfg.enabled
+                and active_method
+                in ("OUR_COUPLED_STEER", "MASTER_EQUATION", "SHUFFLED_STATE")
+            ):
+                ref_p = q_k_ref if is_cap_offer else p_c_ref
+                spread_r = (offered_p - ref_p) / max(ref_p, 1.0)
+                resp_loss = max(0.0, spread_r if initiator_is_selling else -spread_r)
+                fs_a_m = re.search(r"FS_Inequity_Alpha=([0-9.]+)", prompt_text)
+                alpha_fs = float(fs_a_m.group(1)) if fs_a_m else 0.50
+                scarcity_amp = 1.0 + 0.85 * float(getattr(steering_packet, "overall_need_urgency", 0.0))
+                if resp_loss <= 0.05:
+                    # Fair/favorable offer: reinforce reciprocity acceptance
+                    consent_logits[0] = consent_logits[0] + 1.15
+                else:
+                    # Unfair markup/lowball: amplify inequity-averse rejection proportionally
+                    unfair_pen = (3.4 + 1.2 * min(2.0, alpha_fs)) * scarcity_amp * max(0.0, resp_loss - 0.05)
+                    consent_logits[1] = consent_logits[1] + unfair_pen
+
             if initiator_is_selling:
                 req_cash = offered_p * (1.06 if is_cap_offer else 1.0)
                 if max_spendable < req_cash:
@@ -634,6 +658,7 @@ class DualBackendInferenceBrain:
             myopic_bias_multiplier = 1.0 + (5 - income_quintile) * 1.75
             joint_logits[5] = joint_logits[5] + math.log(myopic_bias_multiplier)
 
+            # --- DYNAMIC THEORIES INJECTION ANCHOR ---
             # H1: Toggleable Need-Gated Option Logit Weighting (strictly OFF under NONE/TEXT_ONLY/PLACEBO_RANDOM)
             steer_cfg = self.config.steering_spec
             food_u = float(getattr(steering_packet, "food_urgency", 0.0))

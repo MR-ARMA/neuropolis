@@ -194,7 +194,7 @@ class ExperimentalDesignSpec(StrictConfigModel):
     sesoi_tier_a_cohen_d: float = 0.30
     sesoi_tier_b_w1: float = 0.05
     sesoi_tier_c_cohen_d: float = 0.50
-    min_bin_observations: int = 30
+    min_bin_observations: int = 15
 
 
 class ComponentVariantsSpec(StrictConfigModel):

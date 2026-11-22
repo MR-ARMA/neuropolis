@@ -11,6 +11,8 @@ from src.core.contracts import (
 from src.environment.game_master import AccountingAndLawEngine
 from src.memory.scoped_memory import MultiTierScopedMemory
 
+# --- DYNAMIC THEORIES INJECTION ANCHOR ---
+
 
 class CognitiveAppraisalAndToM:
     """
@@ -242,6 +244,7 @@ class CognitiveAppraisalAndToM:
                 overall_urg,
             )
 
+        # --- DYNAMIC THEORIES INJECTION ANCHOR ---
         packet.food_urgency = round(steer_food_urg, 4)
         packet.cash_urgency = round(steer_cash_urg, 4)
         packet.overall_need_urgency = round(steer_overall_urg, 4)
