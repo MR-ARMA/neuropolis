@@ -1,847 +1,662 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Tuple
-from pydantic import BaseModel, ConfigDict, Field, field_validator
-import torch
+from typing import Dict, List, Literal, Optional
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # ============================================================================
-# 0. CANONICAL SPAN CONSTANTS & STRICT EXPERIMENTAL ENUMS
+# 0. STRICT BASE MODEL & CORE ENUMS
 # ============================================================================
 
-SPAN_SINK: str = "SPAN_SINK"
-SPAN_SELF_IDENTITY: str = "SPAN_SELF_IDENTITY"
-SPAN_DRIVES_AND_FINANCE: str = "SPAN_DRIVES_AND_FINANCE"
-SPAN_CORE_BELIEF: str = "SPAN_CORE_BELIEF"
-SPAN_PEER_MEMORY: str = "SPAN_PEER_MEMORY"
-SPAN_INCOMING_MSG: str = "SPAN_INCOMING_MSG"
-SPAN_APPRAISAL_AND_TOM: str = "SPAN_APPRAISAL_AND_TOM"
-
-ALL_SEMANTIC_SPANS: List[str] = [
-    SPAN_SINK,
-    SPAN_SELF_IDENTITY,
-    SPAN_DRIVES_AND_FINANCE,
-    SPAN_CORE_BELIEF,
-    SPAN_PEER_MEMORY,
-    SPAN_INCOMING_MSG,
-    SPAN_APPRAISAL_AND_TOM,
-]
-CANONICAL_SPAN_NAMES: List[str] = ALL_SEMANTIC_SPANS
-SEMANTIC_SPAN_ORDER: List[str] = ALL_SEMANTIC_SPANS
-TokenSpanMap = Dict[str, Tuple[int, int]]
+class StrictContract(BaseModel):
+    """Strict Pydantic v2 base contract (`extra='forbid'`) preventing silent config or schema drift."""
+    model_config = ConfigDict(
+        extra="forbid",
+        arbitrary_types_allowed=True,
+        populate_by_name=True,
+        protected_namespaces=(),
+    )
 
 
-class DecisionMode(str, Enum):
-    LLM_AUTONOMOUS = "LLM_AUTONOMOUS"
-    RULE_ONLY = "RULE_ONLY"
-    ZERO_INTELLIGENCE = "ZERO_INTELLIGENCE"
+class AssetType(str, Enum):
+    CONSUMABLE = "CONSUMABLE"   # Non-durable subsistence necessity (c_min drained per tick)
+    CAPITAL = "CAPITAL"         # Illiquid productive asset (return r_k > r_b; KMV convex cost chi)
 
 
-class StateChannel(str, Enum):
-    NONE = "NONE"                     # C0: Neutral baseline text, no steering
-    TEXT_ONLY = "TEXT_ONLY"           # C1: True state in text, no steering
-    STEER_ONLY = "STEER_ONLY"         # C2: Neutral text, true state in steering
-    TEXT_AND_STEER = "TEXT_AND_STEER" # C3: True state in both text and steering
-    CUE_CONFLICT = "CUE_CONFLICT"     # C4: Opposite states in text vs. steering
+class OrderSide(str, Enum):
+    BID = "BID"                 # Limit/Market order to BUY an asset with liquid cash
+    ASK = "ASK"                 # Limit/Market order to SELL an asset from inventory
 
 
-class SteeringMethod(str, Enum):
-    NONE = "NONE"
-    PLACEBO_RANDOM = "PLACEBO_RANDOM"       # Norm- and KL-matched random control
-    SHUFFLED_STATE = "SHUFFLED_STATE"       # Permuted agent state control
-    WRONG_SPAN = "WRONG_SPAN"               # Dose applied to non-target span
-    REVERSED_SIGN = "REVERSED_SIGN"         # Sign-flipped intervention
-    PASTA = "PASTA"                         # Zhang et al. (2023) [VERIFY] baseline
-    ACTADD_CAA = "ACTADD_CAA"               # Turner et al. (2023) [VERIFY] residual baseline
-    OUR_COUPLED_STEER = "OUR_COUPLED_STEER" # Additive span bias + CAA value + Easterbrook gain
-    MASTER_EQUATION = "OUR_COUPLED_STEER"
+class OrderType(str, Enum):
+    LIMIT = "LIMIT"
+    MARKET = "MARKET"
 
 
-class TMSMode(str, Enum):
+class OrderStatus(str, Enum):
+    OPEN = "OPEN"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+
+
+class AgentActionType(str, Enum):
+    PLACE_ORDER = "PLACE_ORDER"             # Submit BID/ASK order to the CDA Order Book
+    CANCEL_ORDER = "CANCEL_ORDER"           # Cancel an open resting order and release escrow
+    LIQUIDATE_CAPITAL = "LIQUIDATE_CAPITAL" # Convert illiquid capital a_{i,t} -> cash b_{i,t} (incurs chi)
+    INVEST_CAPITAL = "INVEST_CAPITAL"       # Convert cash b_{i,t} -> illiquid capital a_{i,t} (incurs chi)
+    CONSUME_AND_HOLD = "CONSUME_AND_HOLD"   # No market or capital transfer action this tick
+    ABSTAIN = "ABSTAIN"                     # Explicit non-execution after exhausting JSON retries
+
+
+class RepEMode(str, Enum):
     OFF = "OFF"
-    ENTROPY_TRIGGER = "ENTROPY_TRIGGER"
-    RANDOM_TRIGGER = "RANDOM_TRIGGER"
-    ALWAYS_ASK = "ALWAYS_ASK"
-    ORACLE_TRIGGER = "ORACLE_TRIGGER"
+    ENDOGENOUS_PROBE_GATED = "ENDOGENOUS_PROBE_GATED"
+    PLACEBO_RANDOM_VECTOR = "PLACEBO_RANDOM_VECTOR"
+    SHUFFLED_LAMBDA = "SHUFFLED_LAMBDA"
 
 
-class MetricLayer(str, Enum):
-    MECHANICAL = "mechanical"
-    BEHAVIORAL = "behavioral"
+class PolicyMode(str, Enum):
+    LLM_AGENT = "LLM_AGENT"
+    ZERO_INTELLIGENCE = "ZERO_INTELLIGENCE"
+    CLOSED_FORM_BENCHMARK = "CLOSED_FORM_BENCHMARK"
 
 
-class MetricVerdict(str, Enum):
-    PRIMARY_BEHAVIORAL = "primary_behavioral"
-    SECONDARY_BEHAVIORAL = "secondary_behavioral"
-    SANITY_ONLY = "sanity_only"
-
-
-class ClaimStatus(str, Enum):
-    IMPLEMENTED = "IMPLEMENTED"
-    PARTIAL = "PARTIAL"
-    DEFERRED = "DEFERRED"
-
-
-class BackendType(str, Enum):
-    WHITE_BOX = "WHITE_BOX"
-    BLACK_BOX = "BLACK_BOX"
-
-
-SteeringMode = SteeringMethod
-
-
-class ActionCategory(str, Enum):
-    COMMERCIAL_TRADE = "COMMERCIAL_TRADE"
-    PERSONAL_WORK_CONSUME = "PERSONAL_WORK_CONSUME"
-    TMS_QUERY = "TMS_QUERY"
-    PUBLIC_COMMONS = "PUBLIC_COMMONS"
-
-
-class ConsentDecision(str, Enum):
-    INITIATE = "INITIATE"
-    ACCEPT = "ACCEPT"
-    REJECT = "REJECT"
-    COUNTER_OFFER = "COUNTER_OFFER"
-    IGNORE = "IGNORE"
-    ABSTAIN = "ABSTAIN"
-
-
-class ActionType(str, Enum):
-    BUY = "BUY"
-    SELL = "SELL"
-    HOLD_OR_WORK = "HOLD_OR_WORK"
-    TAKE_PAYDAY_LOAN = "TAKE_PAYDAY_LOAN"
-
-
-class LegalStatus(str, Enum):
-    LAW_ABIDING = "LAW_ABIDING"
-    SANCTIONED = "SANCTIONED"
-    IMPRISONED = "IMPRISONED"
-    BANKRUPT = "BANKRUPT"
-
-
-CanonicalItemType = Literal["CONSUMABLE_NECESSITY", "PRODUCTIVE_CAPITAL_ASSET"]
-CrisisScenarioType = Literal[
-    "NONE",
-    "STAGFLATION_SUBSISTENCE_SHOCK",
-    "ASYMMETRIC_UNEMPLOYMENT_SHOCK",
-    "ASSET_VALUATION_CRASH",
-    "LIQUIDITY_CREDIT_CRUNCH",
-]
-
-
-def normalize_item_id(raw_item: str) -> str:
-    """Maps item names onto the strict Two-Asset HANK taxonomy + CASH."""
-    token = (raw_item or "").strip().upper()
-    if token in ("CASH", "LOAN", "PAYDAY_LOAN", "LIQUIDITY"):
-        return "CASH"
-    if token in ("FOOD", "CONSUMABLE", "CONSUMABLE_NECESSITY", "NECESSITY", "GRAIN"):
-        return "CONSUMABLE_NECESSITY"
-    if token in ("TECH", "CAPITAL", "PRODUCTIVE_CAPITAL_ASSET", "CAPITAL_ASSET", "ASSET"):
-        return "PRODUCTIVE_CAPITAL_ASSET"
-    return "CONSUMABLE_NECESSITY"
-
-
-class StrictConfigModel(BaseModel):
-    """Strict validation model (`extra='forbid'`) so YAML config typos fail loudly."""
-    model_config = ConfigDict(
-        extra="forbid",
-        arbitrary_types_allowed=True,
-        populate_by_name=True,
-        protected_namespaces=(),
-    )
-
-
-class RuntimePacketModel(BaseModel):
-    """Typed runtime packet model allowing tensor attachments."""
-    model_config = ConfigDict(
-        extra="forbid",
-        arbitrary_types_allowed=True,
-        populate_by_name=True,
-        protected_namespaces=(),
-    )
+class MacroShockType(str, Enum):
+    NONE = "NONE"
+    TFP_SUBSISTENCE_CONTRACTION = "TFP_SUBSISTENCE_CONTRACTION"
+    ASYMMETRIC_WAGE_SHOCK = "ASYMMETRIC_WAGE_SHOCK"
+    CAPITAL_YIELD_COLLAPSE = "CAPITAL_YIELD_COLLAPSE"
+    CREDIT_WEDGE_CRUNCH = "CREDIT_WEDGE_CRUNCH"
 
 
 # ============================================================================
-# 1. EXPERIMENTAL DESIGN, COMPONENT VARIANTS & CONFIGURATION SCHEMAS
+# 1. TWO-ASSET SFC SYSTEM & NEEDS ENGINE SCHEMAS
 # ============================================================================
 
-class ExperimentalDesignSpec(StrictConfigModel):
-    decision_mode: Literal[
-        "LLM_AUTONOMOUS", "RULE_ONLY", "ZERO_INTELLIGENCE"
-    ] = "LLM_AUTONOMOUS"
-    state_channel: Literal[
-        "NONE", "TEXT_ONLY", "STEER_ONLY", "TEXT_AND_STEER", "CUE_CONFLICT"
-    ] = "TEXT_AND_STEER"
-    steering_method: Literal[
-        "NONE",
-        "PLACEBO_RANDOM",
-        "SHUFFLED_STATE",
-        "WRONG_SPAN",
-        "REVERSED_SIGN",
-        "PASTA",
-        "ACTADD_CAA",
-        "OUR_COUPLED_STEER",
-        "MASTER_EQUATION",
-    ] = "OUR_COUPLED_STEER"
-    tms_mode: Literal[
-        "OFF", "ENTROPY_TRIGGER", "RANDOM_TRIGGER", "ALWAYS_ASK", "ORACLE_TRIGGER"
-    ] = "ENTROPY_TRIGGER"
-    randomize_agent_identities: bool = True
-    max_parse_retries: int = 3
-    min_valid_rate_threshold: float = 0.90
-    sesoi_tier_a_cohen_d: float = 0.30
-    sesoi_tier_b_w1: float = 0.05
-    sesoi_tier_c_cohen_d: float = 0.50
-    min_bin_observations: int = 15
+class TwoAssetEconomyConfig(StrictContract):
+    """
+    Strict Stock-Flow Consistent (SFC) Two-Asset Household Economy parameters
+    (Kaplan, Violante, & Weidner 2014; Kaplan, Moll, & Violante 2018).
+    """
+    # Liquid Asset (Cash b_{i,t}) return and credit constraint wedge
+    liquid_return_rate_rb: float = Field(
+        default=0.002,
+        ge=0.0,
+        description="Per-tick return rate r_b paid on positive liquid cash balances b_{i,t} >= 0.",
+    )
+    borrowing_wedge_kappa: float = Field(
+        default=0.008,
+        ge=0.0,
+        description="Per-tick borrowing spread kappa charged above r_b when b_{i,t} < 0.",
+    )
+    borrowing_limit_income_multiple: float = Field(
+        default=-0.50,
+        le=0.0,
+        description="Hard credit floor b_bar_i = multiple * base_wage_i (currency units).",
+    )
+    # Illiquid Asset (Productive Capital a_{i,t}) return wedge & convex adjustment cost chi(d, a)
+    capital_return_rate_rk: float = Field(
+        default=0.015,
+        gt=0.0,
+        description="Per-tick yield r_k on illiquid capital a_{i,t} (strictly greater than r_b).",
+    )
+    capital_unit_par_value: float = Field(
+        default=50.0,
+        gt=0.0,
+        description="Accounting par conversion value of 1.0 unit of illiquid capital (currency units).",
+    )
+    kmv_chi_0: float = Field(
+        default=0.075,
+        ge=0.0,
+        description="Linear liquidation/adjustment cost coefficient chi_0 in chi(d, a).",
+    )
+    kmv_chi_1: float = Field(
+        default=0.526,
+        ge=0.0,
+        description="Convex adjustment cost scale chi_1 in chi(d, a).",
+    )
+    kmv_chi_2: float = Field(
+        default=0.736,
+        gt=0.0,
+        description="Convexity exponent chi_2 in chi(d, a).",
+    )
+    kmv_a_min: float = Field(
+        default=0.50,
+        gt=0.0,
+        description="Regularization denominator floor a_min in chi(d, a).",
+    )
+    # Needs Engine (Biological Subsistence & Health Decay)
+    subsistence_min_c: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="Consumable units required per tick to maintain biological health.",
+    )
+    health_decay_per_missing_unit: float = Field(
+        default=0.18,
+        ge=0.0,
+        le=1.0,
+        description="Health H_{i,t} drop per 1.0 unit of unmet subsistence consumption.",
+    )
+    health_recovery_per_surplus_tick: float = Field(
+        default=0.06,
+        ge=0.0,
+        le=1.0,
+        description="Health H_{i,t} recovery per tick when full subsistence is met.",
+    )
+    health_productivity_floor: float = Field(
+        default=0.35,
+        ge=0.0,
+        le=1.0,
+        description="Minimum wage/output multiplier as living health approaches 0+.",
+    )
+    # Production & Initial Sectoral Cash Balances (SFC Closure)
+    baseline_tfp_a_c: float = Field(default=1.0, gt=0.0)
+    sales_tax_rate: float = Field(default=0.05, ge=0.0, le=0.50)
+    initial_firm_sector_cash: float = Field(default=50000.0, ge=0.0)
+    initial_intermediary_cash: float = Field(default=25000.0, ge=0.0)
+    initial_treasury_cash: float = Field(default=5000.0, ge=0.0)
+
+    @model_validator(mode="after")
+    def _validate_return_wedge(self) -> "TwoAssetEconomyConfig":
+        if self.capital_return_rate_rk <= self.liquid_return_rate_rb:
+            raise ValueError(
+                "Two-Asset return wedge violated: capital_return_rate_rk must strictly exceed liquid_return_rate_rb."
+            )
+        return self
 
 
-class ComponentVariantsSpec(StrictConfigModel):
-    state_encoder: Literal["none", "numeric_table", "narrative", "both"] = "numeric_table"
-    prompt_compiler: Literal[
-        "minimal", "delimited_spans", "fewshot", "paraphrases", "length_padded"
-    ] = "delimited_spans"
-    attention_steering: Literal[
-        "none",
-        "pasta",
-        "additive_span",
-        "placebo",
-        "shuffled",
-        "wrong_span",
-        "reversed",
-    ] = "additive_span"
-    activation_steering: Literal[
-        "none", "caa_value", "actadd_residual", "temp_gain", "combined"
-    ] = "caa_value"
-    cognitive_appraisal: Literal["none", "arousal", "pad_mood", "tom_peer"] = "arousal"
-    memory: Literal[
-        "none", "recency_k", "scoped_stm_ltm", "embedding_rag", "oracle"
-    ] = "scoped_stm_ltm"
-    belief: Literal["none", "bayesian_beta", "llm_self_report", "oracle"] = "bayesian_beta"
-    reasoning: Literal[
-        "direct_json", "rationale_json", "plan_act", "self_consistency", "reflection"
-    ] = "rationale_json"
-    decision_interface: Literal[
-        "schema_constrained", "logit_categorical", "legacy_fallback_repro"
-    ] = "schema_constrained"
-    communication: Literal[
-        "none", "oneshot_offer", "bargaining_3r", "cheap_talk", "template"
-    ] = "oneshot_offer"
-    epistemic_routing: Literal[
-        "off", "entropy_trigger", "random_equal_budget", "always_ask", "oracle_trigger"
-    ] = "entropy_trigger"
+class NeedsState(StrictContract):
+    """Biological vitality and objective stress state managed by the Needs Engine."""
+    health: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Biological health H_{i,t} in [0, 1]; 0.0 represents permanent economic death.",
+    )
+    last_consumed_units: float = Field(default=1.0, ge=0.0)
+    subsistence_deficit_streak: int = Field(default=0, ge=0)
+    composite_stress: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Objective physiological/liquidity stress index S_{i,t} driving cognitive bottlenecks ONLY.",
+    )
 
 
-class OrthogonalClampingSpec(StrictConfigModel):
-    omega_d1_scarcity_and_hank: bool = True
-    omega_d2_trust_and_parochialism: bool = True
-    omega_d3_contagion_and_polarization: bool = True
-    omega_d4_fiscal_and_legal_state: bool = True
+class HouseholdBalanceSheet(StrictContract):
+    """Double-entry household balance sheet separating available holdings from CDA escrow locks."""
+    agent_id: str
+    role: Literal["PRODUCER", "CAPITALIST", "WORKER", "ARBITRAGEUR"] = "WORKER"
+    liquid_cash: float = Field(
+        description="Unencumbered liquid cash b_{i,t} (may go negative down to borrowing_limit_b_bar)."
+    )
+    escrow_cash: float = Field(
+        default=0.0, ge=0.0, description="Cash locked in active CDA BID limit orders."
+    )
+    illiquid_capital: float = Field(
+        default=0.0, ge=0.0, description="Unencumbered illiquid productive capital a_{i,t} (units)."
+    )
+    escrow_capital: float = Field(
+        default=0.0, ge=0.0, description="Capital units locked in active CDA ASK limit orders."
+    )
+    consumable_inventory: float = Field(
+        default=2.0, ge=0.0, description="Unencumbered consumable inventory c_{i,t} (units)."
+    )
+    escrow_consumable: float = Field(
+        default=0.0, ge=0.0, description="Consumable units locked in active CDA ASK limit orders."
+    )
+    borrowing_limit_b_bar: float = Field(
+        default=-10.0, le=0.0, description="Hard credit floor b_bar_i (currency units)."
+    )
+    base_wage: float = Field(default=15.0, ge=0.0)
+    periodic_obligation_r: float = Field(
+        default=6.0, ge=0.0, description="Mandatory fixed per-tick cash outflow R_{i,t}."
+    )
+    base_consumable_production_q: float = Field(default=0.0, ge=0.0)
+    shock_exposure_e: float = Field(default=0.5, ge=0.0, le=1.0)
+    needs: NeedsState = Field(default_factory=NeedsState)
 
-    def as_tuple(self) -> Tuple[int, int, int, int]:
-        return (
-            int(self.omega_d1_scarcity_and_hank),
-            int(self.omega_d2_trust_and_parochialism),
-            int(self.omega_d3_contagion_and_polarization),
-            int(self.omega_d4_fiscal_and_legal_state),
-        )
+
+class SectoralBalanceAudit(StrictContract):
+    """Immutable per-tick Stock-Flow Consistency (SFC) certificate across all 5 sectors."""
+    tick: int
+    total_household_cash: float
+    total_escrow_cash: float
+    firm_sector_cash: float
+    intermediary_cash: float
+    treasury_cash: float
+    total_money_supply_m: float
+    initial_money_supply_m0: float
+    conservation_error_abs: float
+    total_capital_units: float
+    total_consumable_units: float
 
 
-class ModelSpec(StrictConfigModel):
-    tier: Literal["T0_DEV", "T1_PRIMARY", "T2_REPLICATION", "T3_SCALE", "REF_API"] = "T0_DEV"
-    backend_type: Literal["WHITE_BOX", "BLACK_BOX"] = "WHITE_BOX"
-    model_id: str = "Qwen/Qwen2.5-1.5B-Instruct"
+# ============================================================================
+# 2. CONTINUOUS DOUBLE AUCTION (CDA) ORDER BOOK SCHEMAS
+# ============================================================================
+
+class CDAMarketConfig(StrictContract):
+    tick_size: float = Field(
+        default=0.05, gt=0.0, description="Minimum price increment on the CDA order book."
+    )
+    min_order_price: float = Field(default=0.50, gt=0.0)
+    max_order_price: float = Field(default=500.00, gt=1.0)
+    max_order_quantity: float = Field(default=25.0, gt=0.0)
+    order_ttl_ticks: int = Field(
+        default=3, ge=1, description="Ticks before unfilled resting limit orders expire."
+    )
+    enable_capital_secondary_book: bool = Field(
+        default=True, description="Enable secondary CDA order book for illiquid capital."
+    )
+
+
+class CDAOrder(StrictContract):
+    """Single BID or ASK order submitted to the Price-Time Priority Limit Order Book."""
+    order_id: str
+    tick_submitted: int
+    sequence_num: int = Field(
+        ge=0, description="Monotonic intra-tick arrival sequence enforcing time priority."
+    )
+    agent_id: str
+    asset: AssetType
+    side: OrderSide
+    order_type: OrderType = OrderType.LIMIT
+    limit_price: Optional[float] = Field(
+        default=None, gt=0.0, description="Required for LIMIT orders; None for MARKET orders."
+    )
+    quantity: float = Field(gt=0.0)
+    filled_quantity: float = Field(default=0.0, ge=0.0)
+    status: OrderStatus = OrderStatus.OPEN
+    rejection_reason: Optional[str] = None
+
+    @property
+    def remaining_quantity(self) -> float:
+        return round(max(0.0, self.quantity - self.filled_quantity), 6)
+
+    @model_validator(mode="after")
+    def _validate_limit_price(self) -> "CDAOrder":
+        if self.order_type == OrderType.LIMIT and self.limit_price is None:
+            raise ValueError("LIMIT orders must specify a positive limit_price.")
+        return self
+
+
+class TradeFill(StrictContract):
+    """Executed peer-to-peer CDA trade match settled at the resting maker's price."""
+    fill_id: str
+    tick: int
+    asset: AssetType
+    buy_order_id: str
+    sell_order_id: str
+    buyer_id: str
+    seller_id: str
+    execution_price: float = Field(gt=0.0)
+    quantity: float = Field(gt=0.0)
+    gross_value: float = Field(gt=0.0)
+    sales_tax_paid: float = Field(default=0.0, ge=0.0)
+    maker_side: OrderSide
+
+
+class PriceLevelDepth(StrictContract):
+    price: float
+    total_quantity: float
+    order_count: int
+
+
+class OrderBookSnapshot(StrictContract):
+    """Public Level-2 Top-5 order book state visible to agents."""
+    tick: int
+    asset: AssetType
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    mid_price: Optional[float] = None
+    spread: Optional[float] = None
+    last_trade_price: Optional[float] = None
+    tick_volume: float = 0.0
+    bids_top5: List[PriceLevelDepth] = Field(default_factory=list)
+    asks_top5: List[PriceLevelDepth] = Field(default_factory=list)
+
+
+# ============================================================================
+# 3. DOMAIN-GENERAL COGNITIVE BOTTLENECK SCHEMAS (FACTORS A & B)
+# ============================================================================
+
+class DeliberationBottleneckConfig(StrictContract):
+    """
+    Factor A: Bounded Deliberation Budget.
+    Truncates `max_tokens` STRICTLY for Stage 1 hidden CoT reasoning under high stress,
+    while preserving the full, stress-invariant budget for Stage 2 JSON Action generation.
+    """
+    enabled: bool = True
+    stress_activation_threshold: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Stress threshold above which CoT token truncation engages (0.0 = smooth continuous decay).",
+    )
+    cot_max_tokens_calm: int = Field(
+        default=256, ge=16, description="Stage 1 CoT token budget when stress S_{i,t} = 0."
+    )
+    cot_min_tokens_stressed: int = Field(
+        default=24, ge=8, description="Minimum Stage 1 CoT token budget when stress S_{i,t} = 1."
+    )
+    stress_decay_steepness: float = Field(
+        default=3.5, ge=0.0, description="Exponential decay constant k_delib in B_CoT(S)."
+    )
+    action_json_max_tokens: int = Field(
+        default=128,
+        ge=32,
+        description="Stress-invariant token budget reserved strictly for Stage 2 JSON Action generation.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_cot_bounds(self) -> "DeliberationBottleneckConfig":
+        if self.cot_min_tokens_stressed > self.cot_max_tokens_calm:
+            raise ValueError("cot_min_tokens_stressed cannot exceed cot_max_tokens_calm.")
+        return self
+
+
+class MemoryFrictionConfig(StrictContract):
+    """
+    Factor B: Episodic Memory Friction (Salience Bias & Recall Degradation).
+    Contracts RAG Top-K and injects Gaussian retrieval noise under high stress S_{i,t}.
+    """
+    enabled: bool = True
+    stress_activation_threshold: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Stress threshold above which Top-K contraction and retrieval noise engage.",
+    )
+    top_k_calm: int = Field(default=8, ge=1)
+    top_k_stressed: int = Field(default=2, ge=1)
+    similarity_noise_sigma_max: float = Field(
+        default=0.35,
+        ge=0.0,
+        description="Max Gaussian std dev added to retrieval similarities/embeddings at S_{i,t} = 1.",
+    )
+    recency_salience_weight: float = Field(default=0.30, ge=0.0, le=1.0)
+    max_episodic_capacity: int = Field(default=256, ge=16)
+    embedding_model_name: str = Field(default="BAAI/bge-small-en-v1.5")
+    embedding_dim: int = Field(default=384, ge=16)
+
+    @model_validator(mode="after")
+    def _validate_top_k_bounds(self) -> "MemoryFrictionConfig":
+        if self.top_k_stressed > self.top_k_calm:
+            raise ValueError("top_k_stressed cannot exceed top_k_calm.")
+        return self
+
+
+class EpisodicMemoryRecord(StrictContract):
+    mem_id: str
+    agent_id: str
+    tick: int
+    event_type: Literal[
+        "TRADE_FILL",
+        "ORDER_EXPIRED",
+        "SUBSISTENCE_DEFICIT",
+        "CAPITAL_TRANSFER",
+        "SHOCK_OBSERVED",
+    ]
+    summary_text: str
+    salience_score: float = Field(default=1.0, ge=0.0)
+    embedding: Optional[List[float]] = None
+
+
+# ============================================================================
+# 4. TWO-STAGE PROBE-GATED RepE SCHEMAS (FACTOR C — ENDOGENOUS STEERING)
+# ============================================================================
+
+class TwoStageRepEConfig(StrictContract):
+    """
+    Factor C: Endogenous Two-Stage Probe-Gated Representation Engineering.
+      - Stage 1 (Unsteered Appraisal): Linear probe (w, b) reads Stage 1 CoT residuals
+        at `target_layer` l and computes lambda = sigmoid((w^T h + b - theta) / T).
+      - Stage 2 (Controlled Action): Injects lambda * gamma * v_hat strictly into
+        Stage 2 Action tokens at `target_layer` l.
+      - ZERO external environment if/else triggers. ZERO post-hoc logit overrides.
+    """
+    enabled: bool = True
+    mode: RepEMode = RepEMode.ENDOGENOUS_PROBE_GATED
+    concept_name: str = Field(
+        default="perceived_inequity",
+        description="Disjoint out-of-domain concept tracked by Linear Probe and RepE vector.",
+    )
+    target_layer: int = Field(
+        default=18,
+        ge=0,
+        description="Transformer residual-stream layer index l for Stage 1 probing and Stage 2 injection.",
+    )
+    steering_strength_gamma: float = Field(
+        default=1.50,
+        ge=-10.0,
+        le=10.0,
+        description="Global latent steering multiplier gamma in h' = h + lambda * gamma * v_hat.",
+    )
+    probe_pooling: Literal["mean_cot", "last_cot_token"] = "mean_cot"
+    gate_activation: Literal["sigmoid_centered", "relu_clipped"] = "sigmoid_centered"
+    probe_threshold_theta: float = Field(
+        default=0.0,
+        description="Probe decision boundary threshold tau/theta before gate activation.",
+    )
+    probe_temperature: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="Sigmoid temperature T scaling (w^T h + b - theta) / T.",
+    )
+    max_relative_norm_ratio: float = Field(
+        default=0.25,
+        gt=0.0,
+        le=1.0,
+        description="Hard fluency cap: ||lambda * gamma * v_hat||_2 / ||h^(l)||_2 <= max_relative_norm_ratio.",
+    )
+    probe_artifact_path: str = Field(
+        default="artifacts/probes/inequity_probe_l18.pt",
+        description="File path for serialized disjoint probe weights (w, b), v_hat, and placebo vector.",
+    )
+    min_contrastive_pairs: int = Field(
+        default=240,
+        ge=200,
+        description="Minimum total disjoint out-of-domain contrastive pairs (split across probe & vector).",
+    )
+
+
+class ProbeGateMeasurement(StrictContract):
+    """Per-turn audit telemetry of Stage 1 linear probing and Stage 2 latent injection."""
+    layer_idx: int
+    cot_tokens_inspected: int
+    raw_probe_score: float
+    endogenous_lambda: float = Field(ge=0.0, le=1.0)
+    steering_gamma: float
+    injected_vector_l2_norm: float
+    relative_residual_norm_ratio: float
+    repe_mode: RepEMode
+
+
+class Stage2ActionPayload(StrictContract):
+    """Strict structured action payload decoded from Stage 2 JSON emission."""
+    action_type: AgentActionType
+    asset: AssetType = AssetType.CONSUMABLE
+    side: Optional[OrderSide] = None
+    order_type: OrderType = OrderType.LIMIT
+    limit_price: Optional[float] = Field(default=None, gt=0.0)
+    quantity: float = Field(default=0.0, ge=0.0)
+    cancel_order_id: Optional[str] = None
+    capital_transfer_units: float = Field(default=0.0, ge=0.0)
+
+    @model_validator(mode="after")
+    def _validate_payload(self) -> "Stage2ActionPayload":
+        if self.action_type == AgentActionType.PLACE_ORDER:
+            if self.side is None:
+                raise ValueError("PLACE_ORDER requires side ('BID' or 'ASK').")
+            if self.quantity <= 0.0:
+                raise ValueError("PLACE_ORDER requires quantity > 0.")
+            if self.order_type == OrderType.LIMIT and self.limit_price is None:
+                raise ValueError("LIMIT PLACE_ORDER requires a positive limit_price.")
+        elif self.action_type == AgentActionType.CANCEL_ORDER and not self.cancel_order_id:
+            raise ValueError("CANCEL_ORDER requires cancel_order_id.")
+        elif self.action_type in (
+            AgentActionType.LIQUIDATE_CAPITAL,
+            AgentActionType.INVEST_CAPITAL,
+        ) and self.capital_transfer_units <= 0.0:
+            raise ValueError(f"{self.action_type.value} requires capital_transfer_units > 0.")
+        return self
+
+
+class AgentTurnRecord(StrictContract):
+    """Immutable provenance record capturing both Stage 1 and Stage 2 for a single agent turn."""
+    run_id: str
+    economy_seed: int
+    tick: int
+    agent_id: str
+    policy_mode: PolicyMode
+    factorial_cell_id: str
+    pre_turn_cash: float
+    pre_turn_capital: float
+    pre_turn_consumable: float
+    pre_turn_health: float
+    pre_turn_stress: float
+    rag_top_k_used: int
+    rag_noise_sigma_used: float
+    cot_token_budget_allocated: int
+    cot_tokens_generated: int
+    cot_truncated_by_bottleneck: bool
+    stage1_cot_text: str
+    probe_measurement: Optional[ProbeGateMeasurement] = None
+    stage2_raw_json: str
+    stage2_action: Stage2ActionPayload
+    json_valid: bool
+    abstain: bool
+    retries_used: int
+    action_tokens_generated: int
+    latency_ms: float
+    execution_status: str = "SUBMITTED"
+
+
+# ============================================================================
+# 5. MODEL RUNTIME, 2^3 FACTORIAL DESIGN & STATISTICAL PROTOCOL SCHEMAS
+# ============================================================================
+
+class ModelRuntimeConfig(StrictContract):
+    model_id: str = "Qwen/Qwen2.5-3B-Instruct"
     revision: str = "main"
-    local_dir: str = "./models/Qwen--Qwen2.5-1.5B-Instruct"
-    t1_primary_model_id: str = "Qwen/Qwen2.5-7B-Instruct"
-    t2_replication_model_ids: List[str] = Field(
-        default_factory=lambda: [
-            "meta-llama/Llama-3.1-8B-Instruct",
-            "mistralai/Mistral-7B-Instruct-v0.3",
-        ]
-    )
-    auto_download: bool = True
-    precision: Literal["float16", "bfloat16", "float32"] = "bfloat16"
+    local_dir: str = "./models/Qwen--Qwen2.5-3B-Instruct"
     load_in_4bit: bool = True
     bnb_4bit_quant_type: Literal["nf4", "fp4"] = "nf4"
     bnb_4bit_use_double_quant: bool = True
+    compute_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
     attn_implementation: Literal["eager", "sdpa"] = "eager"
-    api_base_url: Optional[str] = "http://localhost:1234/v1"
-    api_key: Optional[str] = "lm-studio"
-    max_new_tokens: int = 128
-    temperature: float = 0.85
-    top_p: float = 0.95
+    temperature: float = Field(default=0.70, ge=0.0, le=2.0)
+    top_p: float = Field(default=0.95, gt=0.0, le=1.0)
+    max_json_retries: int = Field(default=3, ge=1, le=5)
 
 
-class SteeringLabConfig(StrictConfigModel):
-    enabled: bool = True
-    mode: str = "OUR_COUPLED_STEER"
-    scope: Literal["prefill_only", "prefill_and_decode"] = "prefill_and_decode"
-    query_row_scope: Literal[
-        "last_token_only", "all_post_span_tokens"
-    ] = "all_post_span_tokens"
-    layer_scope: Literal[
-        "early_third", "middle_third", "late_third", "all_layers"
-    ] = "middle_third"
-    head_selection: Literal["all_heads", "top_k_sensitive"] = "all_heads"
-    top_k_heads: int = 4
-    alpha_dose: float = 3.00
-    enable_attn_bias: bool = True
-    enable_value_steer: bool = True
-    enable_easterbrook_beta: bool = True
-    enable_need_gated_attention: bool = True
-    need_urgency_threshold: float = 0.40
-    need_attention_gain: float = 1.80
-    need_caution_suppress: float = 1.10
-    need_logit_gain: float = 2.40
-    omega_1_drives_finance: float = 1.00
-    omega_2_peer_memory: float = 0.75
-    gamma_periph_suppress: float = 0.35
-    gamma_cynicism_scale: float = 1.20
-    eta_threat_scale: float = 0.85
-    easterbrook_beta_min: float = 0.85
-    easterbrook_beta_max: float = 1.40
-    easterbrook_u_opt: float = 0.45
-    easterbrook_sigma: float = 0.30
-    logit_clamp_max: float = 8.00
-    pasta_alpha: float = 0.25
-    actadd_coeff: float = 1.15
-    caa_num_pairs_per_construct: int = 240
-    caa_permutation_iters: int = 200
-    hebbian_decay_lambda: float = 0.35
-    hebbian_learning_eta: float = 0.40
+class MacroShockConfig(StrictContract):
+    shock_type: MacroShockType = MacroShockType.NONE
+    start_tick: int = Field(default=20, ge=1)
+    duration_ticks: int = Field(default=15, ge=1)
+    severity_sigma: float = Field(default=0.35, ge=0.0, le=0.90)
+    persistence_rho: float = Field(default=0.85, ge=0.0, le=0.99)
 
 
-SteeringSpec = SteeringLabConfig
+class FactorialCellSpec(StrictContract):
+    """Specification of a single cell in the 2^3 Factorial Ablation Matrix or matched control."""
+    cell_id: str
+    deliberation_bottleneck: bool
+    memory_friction: bool
+    endogenous_repe: bool
+    repe_mode: RepEMode = RepEMode.ENDOGENOUS_PROBE_GATED
+    policy_mode: PolicyMode = PolicyMode.LLM_AGENT
 
 
-class TMSSpec(StrictConfigModel):
-    enabled: bool = True
-    entropy_threshold_tau: float = 0.46
-    probe_tokens_k: int = 5
-    top_p_truncation: float = 0.90
-    communication_cost_xi: float = 0.05
+class StatisticalProtocolConfig(StrictContract):
+    """
+    Preregistered statistical rigor parameters:
+      - Clustered Bootstrapping over M >= 30 independent economy seeds.
+      - Per-Bin TOST (Intersection-Union Test) with a priori SESOI equivalence margins.
+    """
+    num_economy_seeds_m: int = Field(
+        default=30,
+        ge=30,
+        description="Minimum M >= 30 independent economy seeds for clustered inference.",
+    )
+    bootstrap_resamples_b: int = Field(default=10000, ge=1000)
+    alpha_level: float = Field(default=0.05, gt=0.0, lt=0.25)
+    min_observations_per_bin: int = Field(default=30, ge=10)
+    multiplicity_correction: Literal["holm_bonferroni", "benjamini_hochberg"] = "holm_bonferroni"
+    sesoi_ultimatum_bin_diff: float = Field(default=0.08, gt=0.0)
+    sesoi_whtm_share: float = Field(default=0.05, gt=0.0)
+    sesoi_mpc_bin_diff: float = Field(default=0.06, gt=0.0)
 
 
-EntropyTMSSpec = TMSSpec
+class PerBinTOSTResult(StrictContract):
+    """Statistical verdict for a single empirical curve bin under Clustered Per-Bin TOST."""
+    benchmark_name: str
+    bin_label: str
+    n_clusters_m: int
+    n_observations_in_bin: int
+    bin_coverage_valid: bool
+    sim_cluster_mean: float
+    human_reference_mean: float
+    mean_difference: float
+    clustered_se: float
+    ci_90_lower: float
+    ci_90_upper: float
+    ci_95_lower: float
+    ci_95_upper: float
+    sesoi_margin_delta: float
+    tost_p_lower: float
+    tost_p_upper: float
+    tost_p_max: float
+    holm_adjusted_p: Optional[float] = None
+    statistically_equivalent: bool
 
 
-class HANKAndCrisisSpec(StrictConfigModel):
-    subsistence_min_c: float = 1.0
-    safe_cash_buffer_b: float = 50.0
-    borrowing_limit_ratio_income: float = -0.42
-    liquid_return_rate_rb: float = 0.002
-    borrowing_wedge_kappa: float = 0.0064
-    capital_yield_rate_rk: float = 0.075
-    capital_dividend_payout_ratio: float = 0.35
-    pg_scale_invariant_multiplier: float = 1.60
-    main_scale_obligation_multiplier: float = 1.25
-    health_shock_annual_hazard: float = 0.23
-    payday_eligibility_cash_ceiling: float = 35.0
-    reference_consumable_price_pc: float = 12.00
-    reference_capital_price_qk: float = 60.00
-    market_clearing_elasticity_phi: float = 0.18
-    kmv_chi_0: float = 0.075
-    kmv_chi_1: float = 0.526
-    kmv_chi_2: float = 0.736
-    kmv_a_min: float = 0.50
-    prod_tfp_baseline_ac: float = 1.00
-    prod_capital_elasticity_eta: float = 0.25
-    present_bias_beta_min: float = 0.45
-    present_bias_eta: float = 1.35
-    long_run_discount_delta: float = 0.96
-    crra_risk_aversion_sigma: float = 1.50
-    default_utility_penalty_phi: float = 4.00
-    latent_signal_specialist_sigma: float = 0.15
-    latent_signal_novice_sigma: float = 1.80
-    macro_regime_mode: Literal["crisis", "normal"] = "crisis"
-    active_crisis: CrisisScenarioType = "NONE"
-    crisis_start_tick: int = 3
-    crisis_duration_ticks: int = 4
-    crisis_severity_sigma: float = 0.35
-    crisis_persistence_rho: float = 0.85
-
-
-class TrustAndMarketSpec(StrictConfigModel):
-    initial_generalized_trust: float = 0.58
-    initial_institutional_trust: float = 0.65
-    slovic_eta_pos: float = 0.14
-    slovic_eta_neg: float = 0.35
-    kkt_desperation_kappa: float = 1.20
-    kkt_weight_lambda: float = 1.50
-    trade_fairness_baseline_gamma: float = 0.35
-    gini_trust_sensitivity_beta: float = 0.70
-    theil_trust_sensitivity_beta: float = 0.35
-    pg_compliance_trust_beta: float = 0.25
-    scarcity_trust_beta: float = 0.30
-    inst_trust_spillover_beta: float = 0.20
-    familiarity_decay_lambda_n: float = 0.45
-    seller_base_margin_mu: float = 0.20
-    distrust_risk_premium_phi: float = 0.35
-    partner_match_trust_beta: float = 2.50
-    partner_match_surplus_beta: float = 1.80
-
-
-class ContagionAndOpinionSpec(StrictConfigModel):
-    hk_initial_confidence_eps: float = 0.50
-    hk_trust_inc_gamma: float = 0.12
-    hk_distrust_dec_gamma: float = 0.18
-    fj_susceptibility_default: float = 0.45
-    complex_contagion_min_exposures: int = 2
-    complex_contagion_min_tie_trust: float = 0.20
-
-
-class FiscalAndLegalSpec(StrictConfigModel):
-    sales_tax_rate: float = 0.05
-    saez_mid_income_tax_rate: float = 0.18
-    saez_pareto_alpha: float = 2.00
-    saez_elasticity_uncomp: float = 0.25
-    saez_elasticity_comp: float = 0.30
-    saez_top_social_weight_g: float = 0.15
-    wealth_tax_rate: float = 0.015
-    wealth_tax_threshold: float = 220.0
-    universal_vs_targeted_phi: float = 0.60
-    public_goods_endowment_share: float = 0.15
-    public_goods_mpcr_a: float = 0.40
-    base_audit_probability: float = 0.35
-    ostrom_scarcity_mercy_gamma: float = 0.50
-    ostrom_sanction_penalty_per_point: float = 0.10
-    initial_public_treasury_cash: float = 100.0
-    initial_firm_sector_cash: float = 2000.0
-
-    def compute_saez_optimal_top_rate(self) -> float:
-        num = 1.0 - self.saez_top_social_weight_g
-        denom = (
-            num
-            + self.saez_pareto_alpha * self.saez_elasticity_uncomp
-            + (self.saez_pareto_alpha - 1.0)
-            * max(0.0, self.saez_elasticity_comp - self.saez_elasticity_uncomp)
+class SimulationConfig(StrictContract):
+    """Master configuration schema for Neuropolis v2 (strict `extra='forbid'` validation)."""
+    experiment_id: str = "neuropolis-v2-endogenous-repe-cda"
+    master_seed: int = 42
+    num_agents: int = Field(default=24, ge=4)
+    burn_in_ticks: int = Field(default=10, ge=0)
+    active_ticks: int = Field(default=50, ge=1)
+    policy_mode: PolicyMode = PolicyMode.LLM_AGENT
+    factorial_cell: FactorialCellSpec = Field(
+        default_factory=lambda: FactorialCellSpec(
+            cell_id="C111",
+            deliberation_bottleneck=True,
+            memory_friction=True,
+            endogenous_repe=True,
+            repe_mode=RepEMode.ENDOGENOUS_PROBE_GATED,
+            policy_mode=PolicyMode.LLM_AGENT,
         )
-        return float(num / max(denom, 1e-6))
-
-
-class BigFiveTraits(StrictConfigModel):
-    openness: float = 0.5
-    conscientiousness: float = 0.5
-    extraversion: float = 0.5
-    agreeableness: float = 0.5
-    neuroticism: float = 0.5
-
-
-class AgentSeedConfig(StrictConfigModel):
-    agent_id: str = "Agent_01"
-    occupation_role: str = "Worker"
-    wage_tier: Literal["LOW", "MID", "HIGH"] = "MID"
-    liquid_wealth_cash: float = 100.0
-    consumable_necessity_inv: float = 2.0
-    productive_capital_inv: float = 1.0
-    base_income_wage: float = 15.0
-    periodic_obligation_r: float = 6.0
-    shock_exposure_e: float = 0.50
-    base_consumable_prod_q: float = 0.0
-    fehr_schmidt_tier: Literal[
-        "SELFISH", "MODERATE", "STRONG", "HYPER_EGALITARIAN"
-    ] = "MODERATE"
-    alpha_disadvantageous: float = 0.50
-    beta_advantageous: float = 0.25
-    loss_aversion_lambda: float = 2.25
-    risk_tolerance_gamma: float = 0.88
-    identity_rigidity: float = 0.50
-    innate_opinion_anchor_s: float = 0.0
-    tms_specialty: str = "CONSUMABLE_NECESSITY"
-    big_five: BigFiveTraits = Field(default_factory=BigFiveTraits)
-
-    def get_consumable_inv(self) -> float:
-        return float(self.consumable_necessity_inv)
-
-    def get_capital_inv(self) -> float:
-        return float(self.productive_capital_inv)
-
-
-class SimulationConfig(StrictConfigModel):
-    experiment_id: str = "neuropolis-thesis-benchmark-v4"
-    random_seed: int = 42
-    total_ticks: int = 8
-    burn_in_ticks: int = 2
-    population_scale: Literal["mvp_6", "dev", "main", "scale"] = "dev"
-    footprint_profile: Literal[
-        "PROTOTYPE_LAPTOP", "WORKSTATION_RESEARCH", "CLUSTER_PRODUCTION"
-    ] = "PROTOTYPE_LAPTOP"
-    experimental_design: ExperimentalDesignSpec = Field(
-        default_factory=ExperimentalDesignSpec
     )
-    component_variants: ComponentVariantsSpec = Field(
-        default_factory=ComponentVariantsSpec
+    model: ModelRuntimeConfig = Field(default_factory=ModelRuntimeConfig)
+    economy: TwoAssetEconomyConfig = Field(default_factory=TwoAssetEconomyConfig)
+    cda: CDAMarketConfig = Field(default_factory=CDAMarketConfig)
+    deliberation: DeliberationBottleneckConfig = Field(
+        default_factory=DeliberationBottleneckConfig
     )
-    orthogonal_clamping: OrthogonalClampingSpec = Field(
-        default_factory=OrthogonalClampingSpec
+    memory_friction: MemoryFrictionConfig = Field(
+        default_factory=MemoryFrictionConfig
     )
-    model_spec: ModelSpec = Field(default_factory=ModelSpec)
-    steering_spec: SteeringLabConfig = Field(default_factory=SteeringLabConfig)
-    tms_spec: TMSSpec = Field(default_factory=TMSSpec)
-    hank_and_crisis_spec: HANKAndCrisisSpec = Field(
-        default_factory=HANKAndCrisisSpec
+    repe: TwoStageRepEConfig = Field(default_factory=TwoStageRepEConfig)
+    shock: MacroShockConfig = Field(default_factory=MacroShockConfig)
+    stats: StatisticalProtocolConfig = Field(
+        default_factory=StatisticalProtocolConfig
     )
-    trust_and_market_spec: TrustAndMarketSpec = Field(
-        default_factory=TrustAndMarketSpec
-    )
-    contagion_and_opinion_spec: ContagionAndOpinionSpec = Field(
-        default_factory=ContagionAndOpinionSpec
-    )
-    fiscal_and_legal_spec: FiscalAndLegalSpec = Field(
-        default_factory=FiscalAndLegalSpec
-    )
-    agents: List[AgentSeedConfig] = Field(default_factory=list)
 
-
-MVPConfig = SimulationConfig
-
-
-# ============================================================================
-# 2. CALIBRATION, STEERING, MANIFEST & TURN LOG PACKETS
-# ============================================================================
-
-class MechanisticCalibrationBundle(RuntimePacketModel):
-    model_id: str = "Qwen/Qwen2.5-1.5B-Instruct"
-    revision_sha: str = "main"
-    attn_backend_verified: str = "eager"
-    num_layers: int = 28
-    num_heads: int = 12
-    num_kv_heads: int = 2
-    head_dim: int = 128
-    hidden_size: int = 1536
-    num_pairs_used: int = 240
-    train_val_test_split: Tuple[int, int, int] = (144, 48, 48)
-    u_trust: Optional[torch.Tensor] = None
-    u_threat: Optional[torch.Tensor] = None
-    random_placebo_u: Optional[torch.Tensor] = None
-    residual_caa_vector: Optional[torch.Tensor] = None
-    probe_accuracy_trust: float = 0.0
-    probe_accuracy_threat: float = 0.0
-    permutation_null_p_trust: float = 1.0
-    permutation_null_p_threat: float = 1.0
-    confound_cosine_length: float = 0.0
-    confound_cosine_sentiment: float = 0.0
-    trust_threat_residual_cosine: float = 0.0
-    kl_matched_placebo_scale: float = 1.0
-    option_prior_ab: List[float] = Field(default_factory=lambda: [0.0, 0.0])
-    option_prior_abcde: List[float] = Field(
-        default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 0.0]
-    )
-    option_prior_12345: List[float] = Field(
-        default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 0.0]
-    )
-    option_prior_1234: List[float] = Field(
-        default_factory=lambda: [0.0, 0.0, 0.0, 0.0]
-    )
-    calibrated_from_model: bool = False
-    sink_token_ids: List[int] = Field(default_factory=lambda: [0])
-
-class EndogenousStatePacket(RuntimePacketModel):
-    agent_id: str = ""
-    partner_id: Optional[str] = None
-    true_scarcity_f: float = 0.0
-    true_effective_trust_01: float = 0.50
-    financial_stress: float = 0.0
-    survival_deficit: float = 0.0
-    scarcity_deficit_f: float = 0.0
-    food_urgency: float = 0.0
-    cash_urgency: float = 0.0
-    overall_need_urgency: float = 0.0
-    present_bias_beta: float = 1.0
-    effective_discount_delta: float = 0.96
-    arousal_u: float = 0.45
-    peer_trust_tau: float = 0.0
-    effective_trust_01: float = 0.50
-    text_scarcity_f: float = 0.0
-    text_cash_display: float = 100.0
-    text_consumable_display: float = 3.0
-    text_obligation_display: float = 6.0
-    hebbian_trace_h: List[float] = Field(default_factory=lambda: [0.0] * 7)
-    span_map: Dict[str, Tuple[int, int]] = Field(default_factory=dict)
-
-
-SteeringContextPacket = EndogenousStatePacket
-
-
-class SteeredForwardTelemetry(RuntimePacketModel):
-    updated_hebbian_trace: List[float] = Field(default_factory=lambda: [0.0] * 7)
-    span_attention_distribution: Dict[str, float] = Field(default_factory=dict)
-    easterbrook_beta: float = 1.0
-    alpha_dose_applied: float = 0.0
-    bias_l2_norm: float = 0.0
-    relative_residual_magnitude: float = 0.0
-    first_token_kl_from_unsteered: float = 0.0
-    attention_measured_from_model: bool = False
-    shadow_eager_verified: bool = False
-    applied_steering_method: str = "NONE"
-    applied_scope: str = "prefill_and_decode"
-
-
-SteeringTelemetryPacket = SteeredForwardTelemetry
-
-
-class CompiledPromptPacket(RuntimePacketModel):
-    agent_id: str = ""
-    raw_prompt: str = ""
-    prompt_sha256: str = ""
-    input_ids: Optional[torch.Tensor] = None
-    attention_mask: Optional[torch.Tensor] = None
-    span_map: Dict[str, Tuple[int, int]] = Field(default_factory=dict)
-    semantic_probe_offset: int = 0
-
-
-# ============================================================================
-# 3. AGENT TURN OUTPUT, VERDICTS, MANIFEST & EMPIRICAL EVALUATION CONTRACTS
-# ============================================================================
-
-class EconomicActionIntent(RuntimePacketModel):
-    action_type: Literal[
-        "BUY", "SELL", "HOLD_OR_WORK", "TAKE_PAYDAY_LOAN"
-    ] = "HOLD_OR_WORK"
-    counterparty_id: str = ""
-    item_id: str = "CONSUMABLE_NECESSITY"
-    quantity: float = 1.0
-    unit_price: float = 12.0
-    public_goods_contribution: float = 0.0
-    tax_evasion_fraction: float = 0.0
-    ask_expert: bool = False
-    is_distress_fire_sale: bool = False
-
-    @field_validator("item_id", mode="before")
-    @classmethod
-    def _validate_item(cls, v: Any) -> str:
-        return normalize_item_id(str(v))
-
-
-EconomicIntent = EconomicActionIntent
-
-
-class AgentTurnOutput(RuntimePacketModel):
-    internal_thought: str = Field(
-        default="Evaluating household liquidity, obligations, and market prices."
-    )
-    consent_decision: Literal[
-        "INITIATE", "ACCEPT", "REJECT", "COUNTER_OFFER", "IGNORE", "ABSTAIN"
-    ] = "INITIATE"
-    action_category: Literal[
-        "COMMERCIAL_TRADE", "PERSONAL_WORK_CONSUME", "TMS_QUERY", "PUBLIC_COMMONS"
-    ] = "COMMERCIAL_TRADE"
-    economic_intent: EconomicActionIntent = Field(
-        default_factory=EconomicActionIntent
-    )
-    verbal_message: str = Field(default="Proposing trade.")
-    expressed_opinion_z: Optional[float] = Field(default=None, ge=-1.0, le=1.0)
-    epistemic_confidence: float = Field(default=0.80, ge=0.0, le=1.0)
-
-
-class RawGenerationResult(RuntimePacketModel):
-    parsed_output: AgentTurnOutput = Field(default_factory=AgentTurnOutput)
-    raw_text: str = ""
-    llm_valid: bool = False
-    abstain: bool = False
-    rule_fallback_used: bool = False
-    truncated: bool = False
-    retries_used: int = 0
-    max_new_tokens_configured: int = 128
-    prompt_token_count: int = 0
-    output_token_count: int = 0
-    latency_ms: float = 0.0
-    parse_error: Optional[str] = None
-    attention_measured_from_model: bool = False
-    shadow_eager_verified: bool = False
-    relative_residual_magnitude: float = 0.0
-    first_token_kl_from_unsteered: float = 0.0
-    tms_halt_triggered: bool = False
-    mean_shannon_entropy: float = 0.25
-    attention_telemetry: Dict[str, float] = Field(default_factory=dict)
-    updated_hebbian_trace: List[float] = Field(default_factory=lambda: [0.0] * 7)
-
-
-class TurnLogRow(RuntimePacketModel):
-    run_id: str
-    tick: int
-    wave: int
-    agent_id: str
-    partner_id: str
-    decision_mode: str
-    state_channel: str
-    steering_method: str
-    prompt_sha256: str
-    raw_output: str
-    llm_valid: bool
-    abstain: bool
-    rule_fallback_used: bool
-    truncated: bool
-    retries_used: int
-    alpha_dose: float
-    easterbrook_beta: float
-    relative_residual_magnitude: float
-    shadow_attn_drives_finance: float
-    shadow_attn_peer_memory: float
-    shadow_attn_incoming_msg: float
-    shadow_attn_sink: float
-    attention_measured_from_model: bool
-    mean_shannon_entropy: float
-    prompt_tokens: int
-    output_tokens: int
-    latency_ms: float
-
-
-class RunManifest(RuntimePacketModel):
-    run_id: str
-    experiment_id: str
-    git_commit_sha: str
-    config_sha256: str
-    model_id: str
-    model_revision_sha: str
-    attention_backend: str
-    dtype: str
-    torch_version: str
-    transformers_version: str
-    cuda_available: bool
-    gpu_device_name: str
-    master_seed: int
-    stream_seeds: Dict[str, int]
-    decision_mode: str
-    state_channel: str
-    steering_method: str
-    tms_mode: str
-    temperature: float
-    top_p: float
-    max_new_tokens: int
-    population_size_n: int
-    total_ticks: int
-    burn_in_ticks: int
-    llm_valid_rate: float
-    abstain_rate: float
-    rule_fallback_rate: float
-    validity_gate_passed: bool
-    macro_regime_mode: str = "crisis"
-    population_scale: str = "dev"
-    alpha_dose: float = 3.0
-    scorecard_summary: List[Dict[str, Any]] = Field(default_factory=list)
-    macro_summary: Dict[str, Any] = Field(default_factory=dict)
-    start_timestamp: float
-    end_timestamp: float
-
-
-class MetricValidityRow(RuntimePacketModel):
-    metric_name: str
-    tier: Literal["Tier_A", "Tier_B", "Tier_C"]
-    layer: Literal["mechanical", "behavioral"]
-    zi_vs_rule_cohen_d: float
-    policy_variance_share: float
-    split_half_icc: float
-    sesoi_threshold: float
-    verdict: Literal["primary_behavioral", "secondary_behavioral", "sanity_only"]
-
-
-class LedgerTransactionReceipt(RuntimePacketModel):
-    tx_id: str = ""
-    tick: int = 0
-    initiator_id: str = ""
-    responder_id: str = ""
-    buyer_id: str = ""
-    seller_id: str = ""
-    action_type: str = "BUY"
-    item_id: str = "CONSUMABLE_NECESSITY"
-    quantity: float = 1.0
-    unit_price: float = 12.0
-    gross_amount: float = 12.0
-    tax_withheld: float = 0.60
-    kmv_adjustment_cost: float = 0.0
-    seller_net_received: float = 11.40
-    kkt_gouging_index: float = 0.0
-    is_fire_sale: bool = False
-    global_money_supply_error: float = 0.0
-
-
-class GameMasterVerdict(RuntimePacketModel):
-    status: Literal["APPROVED", "REJECTED"] = "APPROVED"
-    error_code: Optional[str] = None
-    diagnostic_message: str = ""
-    ledger_receipt: Optional[LedgerTransactionReceipt] = None
-
-
-class MacroRegimeState(RuntimePacketModel):
-    tick: int = 0
-    active_crisis: CrisisScenarioType = "NONE"
-    crisis_intensity_s: float = 0.0
-    latent_macro_state_theta: float = 1.0
-    consumable_tfp_ac: float = 1.0
-    reference_consumable_price_pc: float = 12.00
-    reference_capital_price_qk: float = 60.00
-    capital_yield_rk: float = 0.075
-    liquid_rate_rb: float = 0.002
-    borrowing_wedge_kappa: float = 0.0064
-    borrowing_limit_scale: float = 1.0
-    kmv_chi_1_current: float = 0.526
-    generalized_social_trust: float = 0.58
-    institutional_trust: float = 0.65
-    public_treasury_cash: float = 100.0
-    firm_sector_cash: float = 2000.0
-
-
-class FourDimTickTelemetry(RuntimePacketModel):
-    tick: int
-    active_crisis: str
-    decision_mode: str = "LLM_AUTONOMOUS"
-    state_channel: str = "TEXT_AND_STEER"
-    steering_method: str = "OUR_COUPLED_STEER"
-    llm_valid_rate: float = 1.0
-    abstain_rate: float = 0.0
-    rule_fallback_rate: float = 0.0
-    action_diversity_entropy: float = 0.0
-    mean_realized_utility_u: float = 0.0
-    # Dimension 1: Scarcity & Two-Asset HANK
-    wealth_gini: float
-    disposable_income_gini: float
-    htm_total_share: float
-    poor_htm_share: float
-    wealthy_htm_share: float
-    realized_mpc: float
-    mpc_low_liquidity: float = 0.0
-    mpc_high_liquidity: float = 0.0
-    distress_sale_ratio_dsr: float
-    avg_consumable_price: float
-    avg_capital_price: float
-    mean_scarcity_f: float
-    # Dimension 2: Trust & Bargaining Response
-    generalized_trust_tsoc: float
-    mean_relational_trust_tau: float
-    institutional_trust_tinst: float = 0.65
-    mean_effective_trust_teff: float
-    trade_network_modularity_q: float
-    price_dispersion_ratio_r: float
-    unfairness_rejection_rate: float
-    cumulative_trade_volume: float
-    # Dimension 3: Opinions & Epistemic TMS
-    opinion_dispersion_std: float
-    complex_contagion_cascade_share: float
-    cumulative_tms_queries: int
-    tms_routing_accuracy: float
-    tms_entropy_auroc: float = 0.50
-    # Dimension 4: Fiscal, Commons & SFC Conservation
-    public_goods_provision_rate_pgpr: float
-    free_rider_share_fr: float
-    public_treasury_balance: float
-    total_sanction_points_p: int
-    saez_top_marginal_rate: float
-    godley_lavoie_error: float
-
-    @property
-    def scarcity_bandwidth_cohen_d(self) -> float:
-        return round(self.mpc_low_liquidity - self.mpc_high_liquidity, 4)
-
-    @property
-    def affective_sync_index_asi(self) -> float:
-        return round(max(0.0, 1.0 - self.opinion_dispersion_std), 4)
-
-    @property
-    def opinion_bimodality_bc(self) -> float:
-        return self.opinion_dispersion_std
-
-
-TickMacroTelemetry = FourDimTickTelemetry
+    @model_validator(mode="after")
+    def _sync_factorial_cell_switches(self) -> "SimulationConfig":
+        self.deliberation.enabled = self.factorial_cell.deliberation_bottleneck
+        self.memory_friction.enabled = self.factorial_cell.memory_friction
+        self.repe.enabled = self.factorial_cell.endogenous_repe
+        self.repe.mode = (
+            self.factorial_cell.repe_mode
+            if self.factorial_cell.endogenous_repe
+            else RepEMode.OFF
+        )
+        self.policy_mode = self.factorial_cell.policy_mode
+        return self

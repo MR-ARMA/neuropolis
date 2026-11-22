@@ -1,1574 +1,925 @@
 from __future__ import annotations
 
-import json
-import math
-import random
-import sqlite3
-import uuid
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+import uuid
+import numpy as np
 
 from src.core.contracts import (
-    EconomicActionIntent,
-    GameMasterVerdict,
-    LedgerTransactionReceipt,
-    MacroRegimeState,
+    AgentActionType,
+    AssetType,
+    CDAOrder,
+    HouseholdBalanceSheet,
+    MacroShockType,
+    NeedsState,
+    OrderBookSnapshot,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    SectoralBalanceAudit,
     SimulationConfig,
-    normalize_item_id,
+    Stage2ActionPayload,
+    TradeFill,
+)
+from src.environment.market_cda import (
+    ContinuousDoubleAuctionExchange,
+    OrderEscrowRelease,
+)
+from src.environment.needs_engine import (
+    MetabolicStepOutcome,
+    NeedsEngine,
+    TwoAssetAccounting,
 )
 
 
-class AccountingAndLawEngine:
+@dataclass
+class ActionExecutionOutcome:
+    """Deterministic GameMaster verdict for a single agent's Stage 2 Action."""
+    agent_id: str
+    action_type: AgentActionType
+    accepted: bool
+    reason: str
+    submitted_order: Optional[CDAOrder] = None
+    fills: List[TradeFill] = field(default_factory=list)
+    kmv_fee_paid: float = 0.0
+    net_cash_delta: float = 0.0
+
+
+@dataclass
+class TickMacroSummary:
+    """Objective end-of-tick environment and SFC telemetry (Zero fabricated spending/MPC)."""
+    tick: int
+    shock_intensity_s: float
+    living_agents_count: int
+    deaths_this_tick: List[str]
+    consumable_book: OrderBookSnapshot
+    capital_book: Optional[OrderBookSnapshot]
+    fills_this_tick: List[TradeFill]
+    consumable_market_frozen: bool
+    poor_htm_share: float
+    wealthy_htm_share: float
+    non_htm_share: float
+    realized_consumable_spend_by_agent: Dict[str, float]
+    realized_disposable_income_by_agent: Dict[str, float]
+    obligation_defaults_this_tick: List[str]
+    sfc_audit: SectoralBalanceAudit
+
+
+class GameMaster:
     """
-    M8 & M9: Remediated Stock-Flow Consistent (SFC) Game Master.
-    Implements Reviewer #2 Required Mechanics M1 through M13:
-      - M1: Explicit CRRA Period Utility u_{i,t} & Cumulative Discounted Payoff U_i.
-      - M2: Idiosyncratic shock exposure e_i in [0, 1] per agent.
-      - M3: Contractual periodic obligations R_{i,t} & default penalty phi(default).
-      - M4: Two-Asset HANK budget constraint with borrowing limit b_bar and wedge kappa.
-      - M5: Endogenous market-clearing price adjustment p_{t+1} = p_t * [1 + phi*(D_t - S_t)/(D_t + S_t)].
-      - M7: Latent macro state theta_t in {-1, +1} & agent-specific noisy private signals
-            theta_tilde_{i,t} = theta_t + N(0, sigma_i^2) so TMS expert advice carries real value of information.
-      - M13: Optional seed-based permutation of agent identities across endowments.
+    Module A Physics Orchestrator — Strict Stock-Flow Consistent (SFC) Environment.
+      - Manages 5 closed sectoral cash balances:
+          1. Households (liquid_cash)
+          2. OrderBookEscrow (escrow_cash locked in active CDA bids)
+          3. ProductionFirm (firm_sector_cash)
+          4. FinancialIntermediary (intermediary_cash)
+          5. PublicTreasury (treasury_cash)
+      - Executes peer-to-peer Continuous Double Auction (CDA) clearing ONLY when Bid >= Ask.
+      - Applies Two-Asset return wedge (r_k > r_b), borrowing wedge (kappa), and KMV convex
+        liquidation costs chi(d, a).
+      - Applies Needs Engine metabolic depreciation, health decay, and economic death (H == 0).
+      - ZERO automated consumption spending on behalf of agents: realized spend equals exact
+        peer-to-peer CDA fills.
+      - Dynamically asserts `abs(total_money - M_0) < 1e-9` on every mutation and tick end.
+      - Includes native Zero-Intelligence (ZI) CDA policy generation to benchmark macro-freezes.
     """
 
-    def __init__(self, db_path: str, config: SimulationConfig) -> None:
-        self.db_path = db_path
+    def __init__(
+        self,
+        config: SimulationConfig,
+        economy_seed: Optional[int] = None,
+    ) -> None:
         self.config = config
-        self.omega = config.orthogonal_clamping
-        self.hank_spec = config.hank_and_crisis_spec
-        self.trust_spec = config.trust_and_market_spec
-        self.fiscal_spec = config.fiscal_and_legal_spec
-        self.rng = random.Random(config.random_seed)
+        self.economy_cfg = config.economy
+        self.cda_cfg = config.cda
+        self.shock_cfg = config.shock
+        self.seed = economy_seed if economy_seed is not None else config.master_seed
+        self.rng = np.random.default_rng(self.seed)
 
-        self.initial_money_supply_m0: float = 0.0
-        self.private_signals_theta_tilde: Dict[str, float] = {}
-        self.tick_order_flow: Dict[str, Dict[str, float]] = {
-            "CONSUMABLE_NECESSITY": {"buy": 0.0, "sell": 0.0},
-            "PRODUCTIVE_CAPITAL_ASSET": {"buy": 0.0, "sell": 0.0},
+        # Institutional sectoral cash accounts (Strict SFC Closure)
+        self.firm_sector_cash: float = round(
+            float(self.economy_cfg.initial_firm_sector_cash), 8
+        )
+        self.intermediary_cash: float = round(
+            float(self.economy_cfg.initial_intermediary_cash), 8
+        )
+        self.treasury_cash: float = round(
+            float(self.economy_cfg.initial_treasury_cash), 8
+        )
+        self.intermediary_capital_book: float = 0.0
+
+        # Dynamic AR(1) macro shock state
+        self.shock_intensity_s: float = 0.0
+        self.current_tfp_a_c: float = self.economy_cfg.baseline_tfp_a_c
+        self.current_capital_yield_mult: float = 1.0
+        self.current_credit_wedge_addon: float = 0.0
+
+        # Exchange & Households
+        self.exchange = ContinuousDoubleAuctionExchange(self.cda_cfg)
+        self.households: Dict[str, HouseholdBalanceSheet] = {}
+        self._initialize_stratified_two_asset_population()
+
+        # Freeze initial global money supply M_0 for invariant assertions
+        self.initial_money_supply_m0: float = self._compute_total_money_supply()
+
+        # Per-tick tracking (strictly realized transactions, zero circular MPC)
+        self.tick_fills: List[TradeFill] = []
+        self.tick_consumable_spend: Dict[str, float] = {
+            aid: 0.0 for aid in self.households
         }
-
-        self.macro_state = MacroRegimeState(
-            tick=0,
-            active_crisis=self.hank_spec.active_crisis,
-            crisis_intensity_s=0.0,
-            latent_macro_state_theta=1.0,
-            consumable_tfp_ac=self.hank_spec.prod_tfp_baseline_ac,
-            reference_consumable_price_pc=self.hank_spec.reference_consumable_price_pc,
-            reference_capital_price_qk=self.hank_spec.reference_capital_price_qk,
-            capital_yield_rk=self.hank_spec.capital_yield_rate_rk,
-            liquid_rate_rb=self.hank_spec.liquid_return_rate_rb,
-            borrowing_wedge_kappa=self.hank_spec.borrowing_wedge_kappa,
-            borrowing_limit_scale=1.0,
-            kmv_chi_1_current=(
-                self.hank_spec.kmv_chi_1
-                if self.omega.omega_d1_scarcity_and_hank
-                else 0.0
-            ),
-            generalized_social_trust=(
-                self.trust_spec.initial_generalized_trust
-                if self.omega.omega_d2_trust_and_parochialism
-                else 0.50
-            ),
-            institutional_trust=(
-                self.trust_spec.initial_institutional_trust
-                if self.omega.omega_d2_trust_and_parochialism
-                else 0.50
-            ),
-            public_treasury_cash=self.fiscal_spec.initial_public_treasury_cash,
-            firm_sector_cash=self.fiscal_spec.initial_firm_sector_cash,
-        )
-        self._init_tables_and_conservation_anchor()
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        return conn
-
-    def _init_tables_and_conservation_anchor(self) -> None:
-        with self._connect() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS agents_external_ledger (
-                    agent_id TEXT PRIMARY KEY,
-                    occupation_role TEXT NOT NULL,
-                    wage_tier TEXT NOT NULL DEFAULT 'MID',
-                    liquid_wealth_cash REAL NOT NULL,
-                    credit_limit_b_bar REAL NOT NULL DEFAULT -12.0,
-                    credit_score REAL NOT NULL DEFAULT 720.0,
-                    inventory_json TEXT NOT NULL,
-                    base_wage REAL NOT NULL,
-                    income_quintile INTEGER NOT NULL DEFAULT 3,
-                    active_health_shock INTEGER NOT NULL DEFAULT 0,
-                    last_shock_amount REAL NOT NULL DEFAULT 0.0,
-                    periodic_obligation_r REAL NOT NULL DEFAULT 6.0,
-                    pending_payday_debt REAL NOT NULL DEFAULT 0.0,
-                    shock_exposure_e REAL NOT NULL DEFAULT 0.50,
-                    base_consumable_prod_q REAL NOT NULL DEFAULT 0.0,
-                    last_disposable_income REAL NOT NULL DEFAULT 0.0,
-                    last_consumption_exp REAL NOT NULL DEFAULT 0.0,
-                    last_period_utility_u REAL NOT NULL DEFAULT 0.0,
-                    cumulative_utility_u REAL NOT NULL DEFAULT 0.0,
-                    prior_violations_count INTEGER NOT NULL DEFAULT 0,
-                    last_sanction_points INTEGER NOT NULL DEFAULT 0,
-                    legal_status TEXT NOT NULL DEFAULT 'LAW_ABIDING'
-                );
-
-                CREATE TABLE IF NOT EXISTS macro_institutions (
-                    institution_id TEXT PRIMARY KEY,
-                    cash_balance REAL NOT NULL,
-                    metadata_json TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS acid_transaction_ledger (
-                    tx_id TEXT PRIMARY KEY,
-                    tick INTEGER NOT NULL,
-                    initiator_id TEXT NOT NULL,
-                    responder_id TEXT NOT NULL,
-                    buyer_id TEXT NOT NULL,
-                    seller_id TEXT NOT NULL,
-                    action_type TEXT NOT NULL,
-                    item_id TEXT NOT NULL,
-                    quantity REAL NOT NULL,
-                    unit_price REAL NOT NULL,
-                    gross_amount REAL NOT NULL,
-                    tax_withheld REAL NOT NULL,
-                    kmv_adjustment_cost REAL NOT NULL DEFAULT 0.0,
-                    seller_net_received REAL NOT NULL,
-                    kkt_gouging_index REAL NOT NULL DEFAULT 0.0,
-                    is_fire_sale INTEGER NOT NULL DEFAULT 0,
-                    status TEXT NOT NULL,
-                    error_code TEXT,
-                    diagnostic_message TEXT NOT NULL,
-                    global_money_supply_error REAL NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS fiscal_and_commons_log (
-                    tick INTEGER NOT NULL,
-                    agent_id TEXT NOT NULL,
-                    gross_income REAL NOT NULL,
-                    obligation_paid_r REAL NOT NULL,
-                    saez_income_tax REAL NOT NULL,
-                    wealth_tax REAL NOT NULL,
-                    ubi_and_targeted_transfer REAL NOT NULL,
-                    pg_contribution REAL NOT NULL,
-                    pg_dividend_received REAL NOT NULL,
-                    audited INTEGER NOT NULL,
-                    ostrom_sanction_points INTEGER NOT NULL,
-                    sanction_penalty_cash REAL NOT NULL,
-                    period_utility_u REAL NOT NULL,
-                    PRIMARY KEY (tick, agent_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS macro_timeseries_log (
-                    tick INTEGER PRIMARY KEY,
-                    active_crisis TEXT NOT NULL,
-                    decision_mode TEXT NOT NULL,
-                    state_channel TEXT NOT NULL,
-                    steering_method TEXT NOT NULL,
-                    llm_valid_rate REAL NOT NULL,
-                    action_diversity_entropy REAL NOT NULL,
-                    mean_realized_utility_u REAL NOT NULL,
-                    trust_index REAL NOT NULL,
-                    generalized_trust REAL NOT NULL,
-                    institutional_trust REAL NOT NULL,
-                    wealth_gini REAL NOT NULL,
-                    income_gini REAL NOT NULL,
-                    htm_share REAL NOT NULL,
-                    realized_mpc REAL NOT NULL,
-                    mpc_low_liq REAL NOT NULL,
-                    mpc_high_liq REAL NOT NULL,
-                    distress_sale_ratio REAL NOT NULL,
-                    avg_food_price REAL NOT NULL,
-                    avg_capital_price REAL NOT NULL,
-                    trade_modularity_q REAL NOT NULL,
-                    price_dispersion_r REAL NOT NULL,
-                    unfairness_rejection_rate REAL NOT NULL,
-                    cumul_volume REAL NOT NULL,
-                    opinion_dispersion_std REAL NOT NULL,
-                    cascade_share REAL NOT NULL,
-                    pg_provision_rate REAL NOT NULL,
-                    free_rider_share REAL NOT NULL,
-                    public_treasury REAL NOT NULL,
-                    total_sanction_points INTEGER NOT NULL,
-                    tms_queries INTEGER NOT NULL,
-                    tms_auroc REAL NOT NULL,
-                    conservation_error REAL NOT NULL
-                );
-                """
-            )
-
-            cur = conn.execute("SELECT COUNT(*) AS cnt FROM agents_external_ledger;")
-            if cur.fetchone()["cnt"] == 0:
-                sorted_wages = sorted(
-                    (float(a.base_income_wage), a.agent_id) for a in self.config.agents
-                )
-                n_tot = max(1, len(sorted_wages))
-                quintile_map = {
-                    aid: min(5, max(1, int((rank / float(n_tot)) * 5) + 1))
-                    for rank, (_, aid) in enumerate(sorted_wages)
-                }
-                for ag in self.config.agents:
-                    b_bar = (
-                        self.hank_spec.borrowing_limit_ratio_income * ag.base_income_wage
-                    )
-                    ob_scale = (
-                        float(self.hank_spec.main_scale_obligation_multiplier)
-                        if self.config.population_scale in ("main", "scale")
-                        else 1.0
-                    )
-                    scaled_ob_r = round(float(ag.periodic_obligation_r) * ob_scale, 2)
-                    init_htm_cutoff = (
-                        1.65
-                        * self.hank_spec.reference_consumable_price_pc
-                        * max(1.0, self.hank_spec.subsistence_min_c)
-                        + scaled_ob_r
-                        + 32.0
-                    )
-                    init_cash = float(ag.liquid_wealth_cash)
-                    if ag.wage_tier == "LOW":
-                        init_cash = round(
-                            min(init_cash, max(10.0, init_htm_cutoff - 42.0)), 2
-                        )
-                    inv_map = {
-                        "CONSUMABLE_NECESSITY": round(ag.get_consumable_inv(), 4),
-                        "PRODUCTIVE_CAPITAL_ASSET": round(ag.get_capital_inv(), 4),
-                    }
-                    conn.execute(
-                        """
-                        INSERT INTO agents_external_ledger (
-                            agent_id, occupation_role, wage_tier, liquid_wealth_cash,
-                            credit_limit_b_bar, credit_score, inventory_json,
-                            base_wage, income_quintile, active_health_shock,
-                            last_shock_amount, periodic_obligation_r, pending_payday_debt,
-                            shock_exposure_e, base_consumable_prod_q,
-                            last_disposable_income, last_consumption_exp,
-                            last_period_utility_u, cumulative_utility_u,
-                            prior_violations_count, last_sanction_points, legal_status
-                        ) VALUES (?, ?, ?, ?, ?, 720.0, ?, ?, ?, 0, 0.0, ?, 0.0, ?, ?, ?, ?, 0.0, 0.0, 0, 0, 'LAW_ABIDING');
-                        """,
-                        (
-                            ag.agent_id,
-                            ag.occupation_role,
-                            ag.wage_tier,
-                            init_cash,
-                            float(b_bar),
-                            json.dumps(inv_map),
-                            float(ag.base_income_wage),
-                            int(quintile_map.get(ag.agent_id, 3)),
-                            scaled_ob_r,
-                            float(ag.shock_exposure_e),
-                            float(ag.base_consumable_prod_q),
-                            float(ag.base_income_wage - ag.periodic_obligation_r),
-                            float(self.hank_spec.reference_consumable_price_pc),
-                        ),
-                    )
-
-            cur_inst = conn.execute("SELECT COUNT(*) AS cnt FROM macro_institutions;")
-            if cur_inst.fetchone()["cnt"] == 0:
-                conn.execute(
-                    "INSERT INTO macro_institutions VALUES ('PublicTreasury', ?, ?);",
-                    (
-                        float(self.fiscal_spec.initial_public_treasury_cash),
-                        json.dumps({"role": "Fiscal_State_and_Commons"}),
-                    ),
-                )
-                conn.execute(
-                    "INSERT INTO macro_institutions VALUES ('AggregateFirmSector', ?, ?);",
-                    (
-                        float(self.fiscal_spec.initial_firm_sector_cash),
-                        json.dumps({"role": "Production_Wages_Obligations_and_Capital_Book"}),
-                    ),
-                )
-            conn.commit()
-
-        self.initial_money_supply_m0 = self._compute_current_total_money()
-        self._generate_latent_signals_for_tick(tick=0)
-
-    # ========================================================================
-    # STOCK-FLOW CONSISTENT (SFC) CONSERVATION & LEDGER QUERIES
-    # ========================================================================
-
-    def _compute_current_total_money(self, conn: Optional[sqlite3.Connection] = None) -> float:
-        close_after = False
-        if conn is None:
-            conn = self._connect()
-            close_after = True
-        try:
-            row_ag = conn.execute(
-                "SELECT COALESCE(SUM(liquid_wealth_cash), 0.0) AS s FROM agents_external_ledger;"
-            ).fetchone()
-            row_in = conn.execute(
-                "SELECT COALESCE(SUM(cash_balance), 0.0) AS s FROM macro_institutions;"
-            ).fetchone()
-            return float(row_ag["s"]) + float(row_in["s"])
-        finally:
-            if close_after:
-                conn.close()
-
-    def get_conservation_error(self, conn: Optional[sqlite3.Connection] = None) -> float:
-        return abs(self._compute_current_total_money(conn) - self.initial_money_supply_m0)
-
-    def get_public_treasury_balance(self) -> float:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT cash_balance FROM macro_institutions WHERE institution_id = 'PublicTreasury';"
-            ).fetchone()
-            return float(row["cash_balance"]) if row else 0.0
-
-    def get_agent_ledger(self, agent_id: str) -> Dict[str, Any]:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM agents_external_ledger WHERE agent_id = ?;",
-                (agent_id,),
-            ).fetchone()
-            if not row:
-                raise KeyError(f"Unknown agent_id {agent_id}")
-            data = dict(row)
-            inv = json.loads(data["inventory_json"])
-            c_qty = float(inv.get("CONSUMABLE_NECESSITY", inv.get("FOOD", 0.0)))
-            k_qty = float(inv.get("PRODUCTIVE_CAPITAL_ASSET", inv.get("TECH", 0.0)))
-            data["inventory"] = {
-                "CONSUMABLE_NECESSITY": c_qty,
-                "PRODUCTIVE_CAPITAL_ASSET": k_qty,
-                "FOOD": c_qty,
-                "TECH": k_qty,
-            }
-            return data
-
-    def get_all_agent_ledgers(self) -> List[Dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT agent_id FROM agents_external_ledger ORDER BY agent_id;"
-            ).fetchall()
-        return [self.get_agent_ledger(r["agent_id"]) for r in rows]
-
-    # ========================================================================
-    # M7: LATENT MACRO STATE (theta_t) & AGENT-SPECIFIC NOISY SIGNALS
-    # ========================================================================
-
-    def _generate_latent_signals_for_tick(self, tick: int) -> None:
-        """
-        Generates true latent state theta_t in {-1.0, +1.0} (representing whether
-        upcoming capital returns/supply conditions are favorable or adverse) and
-        draws each agent's private noisy observation theta_tilde_{i,t} = theta_t + N(0, sigma_i^2).
-        """
-        in_crisis = (
-            self.hank_spec.active_crisis != "NONE"
-            and self.hank_spec.crisis_start_tick
-            <= tick
-            < self.hank_spec.crisis_start_tick + self.hank_spec.crisis_duration_ticks
-        )
-        theta_true = -1.0 if in_crisis else 1.0
-        self.macro_state.latent_macro_state_theta = theta_true
-
-        self.private_signals_theta_tilde.clear()
-        for ag in self.config.agents:
-            is_cap_specialist = ag.tms_specialty == "PRODUCTIVE_CAPITAL_ASSET"
-            sigma_i = (
-                self.hank_spec.latent_signal_specialist_sigma
-                if is_cap_specialist
-                else self.hank_spec.latent_signal_novice_sigma
-            )
-            noisy_obs = theta_true + self.rng.gauss(0.0, sigma_i)
-            self.private_signals_theta_tilde[ag.agent_id] = round(noisy_obs, 3)
-
-    def get_agent_private_signal(self, agent_id: str) -> Tuple[float, bool]:
-        """
-        Returns `(theta_tilde_{i,t}, is_high_noise_novice)`.
-        """
-        sig = float(self.private_signals_theta_tilde.get(agent_id, 0.0))
-        ag_cfg = next(
-            (a for a in self.config.agents if a.agent_id == agent_id), None
-        )
-        is_novice = (
-            ag_cfg.tms_specialty != "PRODUCTIVE_CAPITAL_ASSET"
-            if ag_cfg is not None
-            else True
-        )
-        return (sig, is_novice)
-
-    # ========================================================================
-    # KAPLAN-MOLL-VIOLANTE (2018) CONVEX ADJUSTMENT COST & SCARCITY
-    # ========================================================================
-
-    def compute_kmv_adjustment_cost(
-        self, delta_a_units: float, current_a_units: float
-    ) -> float:
-        if not self.omega.omega_d1_scarcity_and_hank:
-            return 0.0
-        abs_d = abs(delta_a_units)
-        if abs_d <= 1e-9:
-            return 0.0
-        a_denom = max(float(current_a_units), self.hank_spec.kmv_a_min)
-        chi_0 = self.hank_spec.kmv_chi_0
-        chi_1 = self.macro_state.kmv_chi_1_current
-        chi_2 = self.hank_spec.kmv_chi_2
-
-        unit_cost = (
-            chi_0 * abs_d
-            + (chi_1 / (1.0 + chi_2)) * ((abs_d / a_denom) ** (1.0 + chi_2)) * a_denom
-        )
-        cash_fee = unit_cost * (0.15 * self.macro_state.reference_capital_price_qk)
-        return round(float(cash_fee), 4)
-
-    def compute_agent_scarcity_and_present_bias(
-        self, agent_id: str
-    ) -> Tuple[float, float, float]:
-        if not self.omega.omega_d1_scarcity_and_hank:
-            return (0.0, 1.0, self.hank_spec.long_run_discount_delta)
-
-        ledger = self.get_agent_ledger(agent_id)
-        b_it = float(ledger["liquid_wealth_cash"])
-        obligation_r = float(ledger["periodic_obligation_r"])
-        b_bar = float(ledger["credit_limit_b_bar"]) * self.macro_state.borrowing_limit_scale
-        c_it = float(ledger["inventory"]["CONSUMABLE_NECESSITY"])
-        c_min = self.hank_spec.subsistence_min_c
-        b_safe = self.hank_spec.safe_cash_buffer_b + obligation_r
-
-        c_safe = 2.0 * c_min
-        consumable_gap = max(0.0, c_safe - c_it) / max(c_safe, 1e-6)
-        cash_gap = max(0.0, (b_safe - b_it) / max(b_safe - b_bar, 1e-6))
-        f_it = max(0.0, min(1.0, 0.55 * consumable_gap + 0.45 * cash_gap))
-
-        subsistence_cost = max(
-            1.0,
-            self.macro_state.reference_consumable_price_pc * c_min + obligation_r,
-        )
-        liquidity_ratio = max(-4.0, min(8.0, b_it / subsistence_cost))
-        beta_min = self.hank_spec.present_bias_beta_min
-        eta_beta = self.hank_spec.present_bias_eta
-        beta_i = beta_min + (1.0 - beta_min) / (
-            1.0 + math.exp(-eta_beta * (liquidity_ratio - 1.0))
-        )
-        tilde_delta = beta_i * self.hank_spec.long_run_discount_delta
-        return (float(f_it), float(beta_i), float(tilde_delta))
-
-    # ========================================================================
-    # PARAMETERIZED 4-CRISIS SHOCK ENGINE & ENDOGENOUS PRICE CLEARING
-    # ========================================================================
-
-    def step_crisis_regime(self, tick: int) -> MacroRegimeState:
-        self.macro_state.tick = tick
-        self._generate_latent_signals_for_tick(tick=tick)
-
-        # Reset intra-tick order flow counters
-        self.tick_order_flow = {
-            "CONSUMABLE_NECESSITY": {"buy": 0.0, "sell": 0.0},
-            "PRODUCTIVE_CAPITAL_ASSET": {"buy": 0.0, "sell": 0.0},
+        self.tick_disposable_income: Dict[str, float] = {
+            aid: 0.0 for aid in self.households
         }
+        self.audit_and_assert_sfc(tick=0)
 
-        crisis_type = self.hank_spec.active_crisis
-        if not self.omega.omega_d1_scarcity_and_hank or crisis_type == "NONE":
-            self.macro_state.crisis_intensity_s = 0.0
-            return self.macro_state
+    # ========================================================================
+    # 1. STRATIFIED TWO-ASSET POPULATION INITIALIZATION (KVW W-HtM CALIBRATED)
+    # ========================================================================
+
+    def _initialize_stratified_two_asset_population(self) -> None:
+        """
+        Initializes N heterogeneous households across 4 economic strata calibrated so:
+          - ~21% start as Wealthy Hand-to-Mouth (high illiquid capital, low liquid cash).
+          - ~13% start as Poor Hand-to-Mouth (zero illiquid capital, low liquid cash).
+          - ~66% start as Non-HtM (producers, liquid capitalists, arbitrageurs).
+          - Aggregate consumable production capacity exceeds N * c_min in normal equilibrium
+            so starvation/freezes are never hard-wired by an impossible resource deficit.
+        """
+        n_agents = self.config.num_agents
+        ids = [f"Agent_{i + 1:02d}" for i in range(n_agents)]
+        self.rng.shuffle(ids)
+
+        for idx, aid in enumerate(ids):
+            bucket = idx % 12
+            if bucket in (0, 1, 2):
+                # Consumable Producers (25% of pop; each harvests ~5.2 units/tick -> 1.3 * N supply)
+                role = "PRODUCER"
+                wage = round(float(np.clip(self.rng.normal(14.0, 1.5), 10.0, 18.0)), 2)
+                cash = round(float(np.clip(self.rng.normal(65.0, 12.0), 35.0, 110.0)), 2)
+                capital = round(float(self.rng.choice([0.5, 1.0, 1.5])), 2)
+                consumable = round(float(np.clip(self.rng.normal(8.0, 1.5), 5.0, 12.0)), 2)
+                prod_q = round(float(np.clip(self.rng.normal(5.2, 0.4), 4.2, 6.2)), 2)
+                ob_r = round(0.32 * wage, 2)
+                exposure = round(float(self.rng.uniform(0.55, 0.85)), 2)
+            elif bucket in (3, 4, 5):
+                # Liquid Capitalists (25% of pop; high cash & high capital, need to buy consumables)
+                role = "CAPITALIST"
+                wage = round(float(np.clip(self.rng.normal(24.0, 3.0), 18.0, 32.0)), 2)
+                cash = round(float(np.clip(self.rng.normal(140.0, 25.0), 85.0, 210.0)), 2)
+                capital = round(float(np.clip(self.rng.normal(4.5, 1.0), 2.5, 7.0)), 2)
+                consumable = round(float(self.rng.choice([1.0, 2.0])), 2)
+                prod_q = 0.0
+                ob_r = round(0.28 * wage, 2)
+                exposure = round(float(self.rng.uniform(0.20, 0.45)), 2)
+            elif bucket in (6, 7):
+                # Wealthy Hand-to-Mouth (W-HtM, ~17%–25%): substantial illiquid capital, low liquid cash!
+                role = "WORKER"
+                wage = round(float(np.clip(self.rng.normal(16.0, 2.0), 12.0, 21.0)), 2)
+                cash = round(float(np.clip(self.rng.normal(6.5, 2.0), 2.0, 10.0)), 2)
+                capital = round(float(np.clip(self.rng.normal(3.5, 0.8), 2.0, 5.5)), 2)
+                consumable = round(float(self.rng.choice([1.0, 2.0])), 2)
+                prod_q = 0.0
+                ob_r = round(0.40 * wage, 2)
+                exposure = round(float(self.rng.uniform(0.60, 0.90)), 2)
+            elif bucket in (8, 9):
+                # Poor Hand-to-Mouth (P-HtM, ~17%): zero illiquid capital, low liquid cash
+                role = "WORKER"
+                wage = round(float(np.clip(self.rng.normal(13.0, 1.5), 10.0, 17.0)), 2)
+                cash = round(float(np.clip(self.rng.normal(5.5, 1.8), 2.0, 8.5)), 2)
+                capital = 0.0
+                consumable = round(float(self.rng.choice([1.0, 2.0])), 2)
+                prod_q = 0.0
+                ob_r = round(0.42 * wage, 2)
+                exposure = round(float(self.rng.uniform(0.75, 1.00)), 2)
+            else:
+                # Liquid Arbitrageurs / Balanced Workers (~17%)
+                role = "ARBITRAGEUR"
+                wage = round(float(np.clip(self.rng.normal(18.0, 2.0), 14.0, 23.0)), 2)
+                cash = round(float(np.clip(self.rng.normal(85.0, 15.0), 50.0, 130.0)), 2)
+                capital = round(float(np.clip(self.rng.normal(2.0, 0.5), 1.0, 3.5)), 2)
+                consumable = round(float(np.clip(self.rng.normal(3.0, 0.8), 2.0, 5.0)), 2)
+                prod_q = 0.0
+                ob_r = round(0.35 * wage, 2)
+                exposure = round(float(self.rng.uniform(0.40, 0.70)), 2)
+
+            b_bar = round(
+                self.economy_cfg.borrowing_limit_income_multiple * wage, 2
+            )
+            sheet = HouseholdBalanceSheet(
+                agent_id=aid,
+                role=role,  # type: ignore[arg-type]
+                liquid_cash=cash,
+                escrow_cash=0.0,
+                illiquid_capital=capital,
+                escrow_capital=0.0,
+                consumable_inventory=consumable,
+                escrow_consumable=0.0,
+                borrowing_limit_b_bar=b_bar,
+                base_wage=wage,
+                periodic_obligation_r=ob_r,
+                base_consumable_production_q=prod_q,
+                shock_exposure_e=exposure,
+                needs=NeedsState(health=1.0, last_consumed_units=1.0),
+            )
+            sheet.needs.composite_stress = NeedsEngine.compute_objective_stress(
+                sheet, self.economy_cfg
+            )
+            self.households[aid] = sheet
+
+        # Keep deterministic sorted ordering by agent_id
+        self.households = dict(sorted(self.households.items()))
+
+    # ========================================================================
+    # 2. STRICT SFC DOUBLE-ENTRY AUDIT & INVARIANT ASSERTIONS
+    # ========================================================================
+
+    def _compute_total_money_supply(self) -> float:
+        hh_liquid = sum(h.liquid_cash for h in self.households.values())
+        hh_escrow = sum(h.escrow_cash for h in self.households.values())
+        return round(
+            hh_liquid
+            + hh_escrow
+            + self.firm_sector_cash
+            + self.intermediary_cash
+            + self.treasury_cash,
+            8,
+        )
+
+    def audit_and_assert_sfc(self, tick: int) -> SectoralBalanceAudit:
+        """
+        Verifies two hard invariants on every tick:
+          1. Exact Global Monetary Conservation: |M_t - M_0| < 1e-9.
+          2. Exact Escrow Parity: sum(household.escrow_cash) == exchange.total_exchange_locked_cash().
+        """
+        hh_cash = round(sum(h.liquid_cash for h in self.households.values()), 8)
+        hh_escrow = round(sum(h.escrow_cash for h in self.households.values()), 8)
+        exchange_escrow = self.exchange.total_exchange_locked_cash()
+
+        escrow_diff = abs(hh_escrow - exchange_escrow)
+        assert escrow_diff < 1e-6, (
+            f"Escrow Parity Violation at tick {tick}: households={hh_escrow:.8f} vs exchange={exchange_escrow:.8f}"
+        )
+
+        total_m = round(
+            hh_cash
+            + hh_escrow
+            + self.firm_sector_cash
+            + self.intermediary_cash
+            + self.treasury_cash,
+            8,
+        )
+        sfc_err = abs(total_m - self.initial_money_supply_m0)
+        assert sfc_err < 1e-6, (
+            f"STRICT SFC CONSERVATION VIOLATION at tick {tick}: "
+            f"M_t={total_m:.8f}, M_0={self.initial_money_supply_m0:.8f}, err={sfc_err:.2e}"
+        )
+
+        total_k = round(
+            sum(h.illiquid_capital + h.escrow_capital for h in self.households.values())
+            + self.intermediary_capital_book,
+            6,
+        )
+        total_c = round(
+            sum(h.consumable_inventory + h.escrow_consumable for h in self.households.values()),
+            6,
+        )
+        return SectoralBalanceAudit(
+            tick=tick,
+            total_household_cash=hh_cash,
+            total_escrow_cash=hh_escrow,
+            firm_sector_cash=round(self.firm_sector_cash, 8),
+            intermediary_cash=round(self.intermediary_cash, 8),
+            treasury_cash=round(self.treasury_cash, 8),
+            total_money_supply_m=total_m,
+            initial_money_supply_m0=self.initial_money_supply_m0,
+            conservation_error_abs=sfc_err,
+            total_capital_units=total_k,
+            total_consumable_units=total_c,
+        )
+
+    def _apply_escrow_release(self, release: OrderEscrowRelease) -> None:
+        sheet = self.households[release.agent_id]
+        if release.cash_to_release > 1e-9:
+            amt = round(min(sheet.escrow_cash, release.cash_to_release), 8)
+            sheet.escrow_cash = round(sheet.escrow_cash - amt, 8)
+            sheet.liquid_cash = round(sheet.liquid_cash + amt, 8)
+        if release.asset_units_to_release > 1e-9:
+            if release.asset == AssetType.CONSUMABLE:
+                amt_a = round(
+                    min(sheet.escrow_consumable, release.asset_units_to_release), 6
+                )
+                sheet.escrow_consumable = round(sheet.escrow_consumable - amt_a, 6)
+                sheet.consumable_inventory = round(
+                    sheet.consumable_inventory + amt_a, 6
+                )
+            else:
+                amt_a = round(
+                    min(sheet.escrow_capital, release.asset_units_to_release), 6
+                )
+                sheet.escrow_capital = round(sheet.escrow_capital - amt_a, 6)
+                sheet.illiquid_capital = round(sheet.illiquid_capital + amt_a, 6)
+
+    # ========================================================================
+    # 3. ACTION ARBITRATION: CDA ORDERS, CAPITAL LIQUIDATION & INVESTMENT
+    # ========================================================================
+
+    def begin_tick(self, tick: int) -> None:
+        """Resets per-tick flow trackers and advances any exogenous macro shock."""
+        self.tick_fills = []
+        self.tick_consumable_spend = {aid: 0.0 for aid in self.households}
+        self.tick_disposable_income = {aid: 0.0 for aid in self.households}
+        self._step_macro_shock(tick)
+
+    def _step_macro_shock(self, tick: int) -> None:
+        if self.shock_cfg.shock_type == MacroShockType.NONE:
+            self.shock_intensity_s = 0.0
+            self.current_tfp_a_c = self.economy_cfg.baseline_tfp_a_c
+            self.current_capital_yield_mult = 1.0
+            self.current_credit_wedge_addon = 0.0
+            return
 
         in_window = (
-            self.hank_spec.crisis_start_tick
+            self.shock_cfg.start_tick
             <= tick
-            < self.hank_spec.crisis_start_tick + self.hank_spec.crisis_duration_ticks
+            < self.shock_cfg.start_tick + self.shock_cfg.duration_ticks
         )
-        rho = self.hank_spec.crisis_persistence_rho
-        sigma = self.hank_spec.crisis_severity_sigma
-        prev_s = self.macro_state.crisis_intensity_s
-        s_t = min(1.0, rho * prev_s + (sigma if in_window else 0.0))
-        self.macro_state.crisis_intensity_s = round(s_t, 4)
+        s_t = min(
+            1.0,
+            self.shock_cfg.persistence_rho * self.shock_intensity_s
+            + (self.shock_cfg.severity_sigma if in_window else 0.0),
+        )
+        self.shock_intensity_s = round(s_t, 6)
 
-        if crisis_type == "STAGFLATION_SUBSISTENCE_SHOCK":
-            self.macro_state.consumable_tfp_ac = round(
-                self.hank_spec.prod_tfp_baseline_ac * max(0.45, 1.0 - 0.55 * s_t), 4
+        if self.shock_cfg.shock_type == MacroShockType.TFP_SUBSISTENCE_CONTRACTION:
+            self.current_tfp_a_c = round(
+                self.economy_cfg.baseline_tfp_a_c * max(0.35, 1.0 - 0.55 * s_t), 4
             )
-        elif crisis_type == "ASYMMETRIC_UNEMPLOYMENT_SHOCK":
-            pass
-        elif crisis_type == "ASSET_VALUATION_CRASH":
-            self.macro_state.capital_yield_rk = round(
-                self.hank_spec.capital_yield_rate_rk * max(0.15, 1.0 - 0.80 * s_t), 4
-            )
-        elif crisis_type == "LIQUIDITY_CREDIT_CRUNCH":
-            self.macro_state.borrowing_limit_scale = round(max(0.0, 1.0 - 0.95 * s_t), 4)
-            self.macro_state.borrowing_wedge_kappa = round(
-                self.hank_spec.borrowing_wedge_kappa + 0.05 * s_t, 4
-            )
-            self.macro_state.kmv_chi_1_current = round(
-                self.hank_spec.kmv_chi_1 * (1.0 + 1.0 * s_t), 4
-            )
-        return self.macro_state
+        elif self.shock_cfg.shock_type == MacroShockType.CAPITAL_YIELD_COLLAPSE:
+            self.current_capital_yield_mult = round(max(0.15, 1.0 - 0.80 * s_t), 4)
+        elif self.shock_cfg.shock_type == MacroShockType.CREDIT_WEDGE_CRUNCH:
+            self.current_credit_wedge_addon = round(0.04 * s_t, 6)
 
-    # ========================================================================
-    # 5-GATE BILATERAL TRADE ARBITRATION & DOUBLE-ENTRY SETTLEMENT
-    # ========================================================================
-
-    def arbitrate_and_settle(
+    def execute_agent_action(
         self,
         tick: int,
-        initiator_id: str,
-        responder_id: str,
-        intent: EconomicActionIntent,
-        responder_consent: str,
-        kkt_gouging_index: float = 0.0,
-    ) -> GameMasterVerdict:
-        tx_id = f"tx_{tick:03d}_{uuid.uuid4().hex[:8]}"
-        item_id = normalize_item_id(intent.item_id)
-        qty = float(intent.quantity)
-        unit_price = float(intent.unit_price)
-        gross = round(qty * unit_price, 4)
-
-        # Record order-flow demand/supply intent for endogenous price formation (M5)
-        if intent.action_type == "BUY" and qty > 0:
-            self.tick_order_flow[item_id]["buy"] += qty
-        elif intent.action_type == "SELL" and qty > 0:
-            self.tick_order_flow[item_id]["sell"] += qty
-
-        if intent.action_type == "TAKE_PAYDAY_LOAN":
-            loan_cash = 30.0
-            next_tick_debt = 40.0
-            with self._connect() as conn:
-                conn.execute("BEGIN IMMEDIATE TRANSACTION;")
-                try:
-                    init_row = conn.execute(
-                        "SELECT * FROM agents_external_ledger WHERE agent_id = ?;",
-                        (initiator_id,),
-                    ).fetchone()
-                    if init_row["legal_status"] in ("IMPRISONED", "BANKRUPT"):
-                        conn.rollback()
-                        return self._record_rejected_tx(
-                            tx_id, tick, initiator_id, "PublicTreasury",
-                            initiator_id, "PublicTreasury", "TAKE_PAYDAY_LOAN",
-                            "CASH", loan_cash, -next_tick_debt, loan_cash,
-                            "LEGAL_RESTRICTION", "Agent is BANKRUPT or IMPRISONED.",
-                            0.0, False,
-                        )
-                    new_cash = round(float(init_row["liquid_wealth_cash"]) + loan_cash, 4)
-                    new_pending_debt = round(
-                        float(init_row["pending_payday_debt"]) + next_tick_debt, 4
-                    )
-                    conn.execute(
-                        """
-                        UPDATE agents_external_ledger
-                        SET liquid_wealth_cash = ?, pending_payday_debt = ?
-                        WHERE agent_id = ?;
-                        """,
-                        (new_cash, new_pending_debt, initiator_id),
-                    )
-                    conn.execute(
-                        """
-                        UPDATE macro_institutions
-                        SET cash_balance = ROUND(cash_balance - ?, 4)
-                        WHERE institution_id = 'PublicTreasury';
-                        """,
-                        (loan_cash,),
-                    )
-                    sfc_err = self.get_conservation_error(conn)
-                    assert sfc_err < 1e-6, f"SFC violation in payday loan {tx_id}: {sfc_err}"
-                    conn.execute(
-                        """
-                        INSERT INTO acid_transaction_ledger VALUES (
-                            ?, ?, ?, 'PublicTreasury', ?, 'PublicTreasury',
-                            'TAKE_PAYDAY_LOAN', 'CASH', ?, ?, ?, 0.0, 0.0, ?, 0.0, 0,
-                            'APPROVED', NULL, 'Payday loan: +$30 cash, +$40 debt next tick', ?
-                        );
-                        """,
-                        (
-                            tx_id, tick, initiator_id, initiator_id,
-                            loan_cash, -next_tick_debt, loan_cash, loan_cash, sfc_err,
-                        ),
-                    )
-                    conn.commit()
-                    receipt = LedgerTransactionReceipt(
-                        tx_id=tx_id, tick=tick, initiator_id=initiator_id,
-                        responder_id="PublicTreasury", buyer_id=initiator_id,
-                        seller_id="PublicTreasury", action_type="TAKE_PAYDAY_LOAN",
-                        item_id="CASH", quantity=loan_cash, unit_price=-next_tick_debt,
-                        gross_amount=loan_cash, tax_withheld=0.0, kmv_adjustment_cost=0.0,
-                        seller_net_received=loan_cash, kkt_gouging_index=0.0,
-                        is_fire_sale=False, global_money_supply_error=sfc_err,
-                    )
-                    return GameMasterVerdict(
-                        status="APPROVED",
-                        error_code=None,
-                        diagnostic_message=f"APPROVED PAYDAY LOAN: {initiator_id} received +$30.00 cash (+$40.00 obligation next tick).",
-                        ledger_receipt=receipt,
-                    )
-                except Exception:
-                    conn.rollback()
-                    raise
-
-        if intent.action_type == "HOLD_OR_WORK":
-            return self._record_rejected_tx(
-                tx_id,
-                tick,
-                initiator_id,
-                responder_id,
-                initiator_id,
-                responder_id,
-                intent.action_type,
-                item_id,
-                qty,
-                unit_price,
-                gross,
-                "NO_TRADE_REQUESTED",
-                "Initiator selected HOLD_OR_WORK.",
-                kkt_gouging_index,
-                intent.is_distress_fire_sale,
+        agent_id: str,
+        payload: Stage2ActionPayload,
+    ) -> ActionExecutionOutcome:
+        """
+        Deterministically arbitrates and settles a single agent's Stage 2 ActionPayload.
+        Zero automated trades or silent repairs: illegal actions are rejected cleanly.
+        """
+        sheet = self.households[agent_id]
+        if not NeedsEngine.is_alive(sheet):
+            return ActionExecutionOutcome(
+                agent_id=agent_id,
+                action_type=payload.action_type,
+                accepted=False,
+                reason="AGENT_DECEASED",
             )
 
-        buyer_id = initiator_id if intent.action_type == "BUY" else responder_id
-        seller_id = responder_id if intent.action_type == "BUY" else initiator_id
-
-        if responder_consent != "ACCEPT":
-            return self._record_rejected_tx(
-                tx_id,
-                tick,
-                initiator_id,
-                responder_id,
-                buyer_id,
-                seller_id,
-                intent.action_type,
-                item_id,
-                qty,
-                unit_price,
-                gross,
-                "COUNTERPARTY_REJECTED",
-                f"Responder {responder_id} emitted {responder_consent}.",
-                kkt_gouging_index,
-                intent.is_distress_fire_sale,
-            )
-
-        if (
-            not math.isfinite(qty)
-            or not math.isfinite(unit_price)
-            or qty <= 0.0
-            or unit_price <= 0.0
+        if payload.action_type in (
+            AgentActionType.CONSUME_AND_HOLD,
+            AgentActionType.ABSTAIN,
         ):
-            return self._record_rejected_tx(
-                tx_id,
-                tick,
-                initiator_id,
-                responder_id,
-                buyer_id,
-                seller_id,
-                intent.action_type,
-                item_id,
-                qty,
-                unit_price,
-                gross,
-                "INVALID_AMOUNT",
-                f"Invalid quantity ({qty}) or unit_price ({unit_price}).",
-                kkt_gouging_index,
-                intent.is_distress_fire_sale,
+            return ActionExecutionOutcome(
+                agent_id=agent_id,
+                action_type=payload.action_type,
+                accepted=True,
+                reason=payload.action_type.value,
             )
 
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE TRANSACTION;")
-            try:
-                buyer_row = conn.execute(
-                    "SELECT * FROM agents_external_ledger WHERE agent_id = ?;",
-                    (buyer_id,),
-                ).fetchone()
-                seller_row = conn.execute(
-                    "SELECT * FROM agents_external_ledger WHERE agent_id = ?;",
-                    (seller_id,),
-                ).fetchone()
-
-                if (
-                    buyer_row["legal_status"] in ("IMPRISONED", "BANKRUPT")
-                    or seller_row["legal_status"] in ("IMPRISONED", "BANKRUPT")
-                ):
-                    conn.rollback()
-                    return self._record_rejected_tx(
-                        tx_id,
-                        tick,
-                        initiator_id,
-                        responder_id,
-                        buyer_id,
-                        seller_id,
-                        intent.action_type,
-                        item_id,
-                        qty,
-                        unit_price,
-                        gross,
-                        "LEGAL_RESTRICTION",
-                        "Party legally restricted.",
-                        kkt_gouging_index,
-                        intent.is_distress_fire_sale,
+        if payload.action_type == AgentActionType.CANCEL_ORDER:
+            oid = payload.cancel_order_id or ""
+            for book in self.exchange.books.values():
+                rel = book.cancel_order(oid, requesting_agent_id=agent_id)
+                if rel is not None:
+                    self._apply_escrow_release(rel)
+                    self.audit_and_assert_sfc(tick)
+                    return ActionExecutionOutcome(
+                        agent_id=agent_id,
+                        action_type=AgentActionType.CANCEL_ORDER,
+                        accepted=True,
+                        reason=f"CANCELLED_{oid}",
                     )
+            return ActionExecutionOutcome(
+                agent_id=agent_id,
+                action_type=AgentActionType.CANCEL_ORDER,
+                accepted=False,
+                reason="ORDER_NOT_FOUND_OR_NOT_OWNED",
+            )
 
-                buyer_inv = json.loads(buyer_row["inventory_json"])
-                seller_inv = json.loads(seller_row["inventory_json"])
-                seller_avail = float(seller_inv.get(item_id, 0.0))
-
-                if seller_avail + 1e-9 < qty:
-                    conn.rollback()
-                    return self._record_rejected_tx(
-                        tx_id,
-                        tick,
-                        initiator_id,
-                        responder_id,
-                        buyer_id,
-                        seller_id,
-                        intent.action_type,
-                        item_id,
-                        qty,
-                        unit_price,
-                        gross,
-                        "INSUFFICIENT_INVENTORY",
-                        f"Seller {seller_id} has {seller_avail:.2f} {item_id}, needs {qty:.2f}.",
-                        kkt_gouging_index,
-                        intent.is_distress_fire_sale,
-                    )
-
-                seller_kmv_cost = 0.0
-                buyer_kmv_cost = 0.0
-                if item_id == "PRODUCTIVE_CAPITAL_ASSET":
-                    buyer_avail_k = float(buyer_inv.get(item_id, 0.0))
-                    seller_kmv_cost = round(
-                        0.50 * self.compute_kmv_adjustment_cost(qty, seller_avail), 4
-                    )
-                    buyer_kmv_cost = round(
-                        0.50 * self.compute_kmv_adjustment_cost(qty, buyer_avail_k), 4
-                    )
-                kmv_cost = round(seller_kmv_cost + buyer_kmv_cost, 4)
-
-                buyer_cash = float(buyer_row["liquid_wealth_cash"])
-                b_bar = (
-                    float(buyer_row["credit_limit_b_bar"])
-                    * self.macro_state.borrowing_limit_scale
-                    if self.omega.omega_d1_scarcity_and_hank
-                    else 0.0
+        if payload.action_type == AgentActionType.LIQUIDATE_CAPITAL:
+            units = round(float(payload.capital_transfer_units), 6)
+            if units <= 1e-9 or sheet.illiquid_capital + 1e-9 < units:
+                return ActionExecutionOutcome(
+                    agent_id=agent_id,
+                    action_type=AgentActionType.LIQUIDATE_CAPITAL,
+                    accepted=False,
+                    reason="INSUFFICIENT_ILLIQUID_CAPITAL",
                 )
-                max_spendable = buyer_cash - b_bar
-                if max_spendable + 1e-9 < (gross + buyer_kmv_cost):
-                    conn.rollback()
-                    return self._record_rejected_tx(
-                        tx_id,
-                        tick,
-                        initiator_id,
-                        responder_id,
-                        buyer_id,
-                        seller_id,
-                        intent.action_type,
-                        item_id,
-                        qty,
-                        unit_price,
-                        gross,
-                        "INSUFFICIENT_FUNDS",
-                        f"Buyer {buyer_id} spendable=${max_spendable:.2f} < cost=${gross + buyer_kmv_cost:.2f}.",
-                        kkt_gouging_index,
-                        intent.is_distress_fire_sale,
-                    )
-
-                sales_tax_rate = (
-                    self.fiscal_spec.sales_tax_rate
-                    if self.omega.omega_d4_fiscal_and_legal_state
-                    else 0.0
-                )
-                tax_withheld = round(gross * sales_tax_rate, 4)
-                seller_kmv_cost = min(seller_kmv_cost, round(gross - tax_withheld, 4))
-                kmv_cost = round(seller_kmv_cost + buyer_kmv_cost, 4)
-                seller_net = round(gross - tax_withheld - seller_kmv_cost, 4)
-
-                new_buyer_cash = round(buyer_cash - gross - buyer_kmv_cost, 4)
-                new_seller_cash = round(
-                    float(seller_row["liquid_wealth_cash"]) + seller_net, 4
+            gross_par = round(units * self.economy_cfg.capital_unit_par_value, 8)
+            kmv_fee = TwoAssetAccounting.compute_kmv_adjustment_cost_cash(
+                units, sheet.illiquid_capital, self.economy_cfg
+            )
+            net_cash = round(gross_par - kmv_fee, 8)
+            if self.intermediary_cash < net_cash:
+                return ActionExecutionOutcome(
+                    agent_id=agent_id,
+                    action_type=AgentActionType.LIQUIDATE_CAPITAL,
+                    accepted=False,
+                    reason="INTERMEDIARY_ILLIQUID",
                 )
 
-                buyer_inv[item_id] = round(float(buyer_inv.get(item_id, 0.0)) + qty, 4)
-                seller_inv[item_id] = round(seller_avail - qty, 4)
+            sheet.illiquid_capital = round(sheet.illiquid_capital - units, 6)
+            self.intermediary_capital_book = round(
+                self.intermediary_capital_book + units, 6
+            )
+            self.intermediary_cash = round(self.intermediary_cash - net_cash, 8)
+            sheet.liquid_cash = round(sheet.liquid_cash + net_cash, 8)
+            sheet.needs.composite_stress = NeedsEngine.compute_objective_stress(
+                sheet, self.economy_cfg
+            )
+            self.audit_and_assert_sfc(tick)
+            return ActionExecutionOutcome(
+                agent_id=agent_id,
+                action_type=AgentActionType.LIQUIDATE_CAPITAL,
+                accepted=True,
+                reason=f"LIQUIDATED_{units:.2f}_CAPITAL_NET_${net_cash:.2f}_FEE_${kmv_fee:.2f}",
+                kmv_fee_paid=kmv_fee,
+                net_cash_delta=net_cash,
+            )
 
-                new_buyer_c_exp = float(buyer_row["last_consumption_exp"]) + (
-                    gross if item_id == "CONSUMABLE_NECESSITY" else 0.0
+        if payload.action_type == AgentActionType.INVEST_CAPITAL:
+            units = round(float(payload.capital_transfer_units), 6)
+            if units <= 1e-9:
+                return ActionExecutionOutcome(
+                    agent_id=agent_id,
+                    action_type=AgentActionType.INVEST_CAPITAL,
+                    accepted=False,
+                    reason="INVALID_CAPITAL_UNITS",
+                )
+            gross_par = round(units * self.economy_cfg.capital_unit_par_value, 8)
+            kmv_fee = TwoAssetAccounting.compute_kmv_adjustment_cost_cash(
+                units, sheet.illiquid_capital, self.economy_cfg
+            )
+            total_cost = round(gross_par + kmv_fee, 8)
+            spendable = round(sheet.liquid_cash - sheet.borrowing_limit_b_bar, 8)
+            if spendable + 1e-9 < total_cost:
+                return ActionExecutionOutcome(
+                    agent_id=agent_id,
+                    action_type=AgentActionType.INVEST_CAPITAL,
+                    accepted=False,
+                    reason="INSUFFICIENT_LIQUID_CASH_FOR_INVESTMENT",
                 )
 
-                conn.execute(
-                    """
-                    UPDATE agents_external_ledger
-                    SET liquid_wealth_cash = ?, inventory_json = ?, last_consumption_exp = ?
-                    WHERE agent_id = ?;
-                    """,
-                    (new_buyer_cash, json.dumps(buyer_inv), new_buyer_c_exp, buyer_id),
-                )
-                conn.execute(
-                    """
-                    UPDATE agents_external_ledger
-                    SET liquid_wealth_cash = ?, inventory_json = ?
-                    WHERE agent_id = ?;
-                    """,
-                    (new_seller_cash, json.dumps(seller_inv), seller_id),
-                )
+            sheet.liquid_cash = round(sheet.liquid_cash - total_cost, 8)
+            self.intermediary_cash = round(self.intermediary_cash + total_cost, 8)
+            sheet.illiquid_capital = round(sheet.illiquid_capital + units, 6)
+            self.intermediary_capital_book = round(
+                self.intermediary_capital_book - units, 6
+            )
+            sheet.needs.composite_stress = NeedsEngine.compute_objective_stress(
+                sheet, self.economy_cfg
+            )
+            self.audit_and_assert_sfc(tick)
+            return ActionExecutionOutcome(
+                agent_id=agent_id,
+                action_type=AgentActionType.INVEST_CAPITAL,
+                accepted=True,
+                reason=f"INVESTED_{units:.2f}_CAPITAL_COST_${total_cost:.2f}_FEE_${kmv_fee:.2f}",
+                kmv_fee_paid=kmv_fee,
+                net_cash_delta=-total_cost,
+            )
 
-                conn.execute(
-                    """
-                    UPDATE macro_institutions
-                    SET cash_balance = ROUND(cash_balance + ?, 4)
-                    WHERE institution_id = 'PublicTreasury';
-                    """,
-                    (tax_withheld,),
-                )
-                conn.execute(
-                    """
-                    UPDATE macro_institutions
-                    SET cash_balance = ROUND(cash_balance + ?, 4)
-                    WHERE institution_id = 'AggregateFirmSector';
-                    """,
-                    (kmv_cost,),
-                )
+        # Otherwise: PLACE_ORDER on Continuous Double Auction Order Book
+        return self._execute_cda_order_submission(tick, sheet, payload)
 
-                sfc_err = self.get_conservation_error(conn)
-                assert sfc_err < 1e-6, f"SFC violation in trade {tx_id}: {sfc_err}"
-
-                conn.execute(
-                    """
-                    INSERT INTO acid_transaction_ledger VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        'APPROVED', NULL, 'Settled via ACID Double-Entry', ?
-                    );
-                    """,
-                    (
-                        tx_id,
-                        tick,
-                        initiator_id,
-                        responder_id,
-                        buyer_id,
-                        seller_id,
-                        intent.action_type,
-                        item_id,
-                        qty,
-                        unit_price,
-                        gross,
-                        tax_withheld,
-                        kmv_cost,
-                        seller_net,
-                        kkt_gouging_index,
-                        int(intent.is_distress_fire_sale),
-                        sfc_err,
-                    ),
-                )
-                conn.commit()
-
-                receipt = LedgerTransactionReceipt(
-                    tx_id=tx_id,
-                    tick=tick,
-                    initiator_id=initiator_id,
-                    responder_id=responder_id,
-                    buyer_id=buyer_id,
-                    seller_id=seller_id,
-                    action_type=intent.action_type,
-                    item_id=item_id,
-                    quantity=qty,
-                    unit_price=unit_price,
-                    gross_amount=gross,
-                    tax_withheld=tax_withheld,
-                    kmv_adjustment_cost=kmv_cost,
-                    seller_net_received=seller_net,
-                    kkt_gouging_index=kkt_gouging_index,
-                    is_fire_sale=intent.is_distress_fire_sale,
-                    global_money_supply_error=sfc_err,
-                )
-                return GameMasterVerdict(
-                    status="APPROVED",
-                    error_code=None,
-                    diagnostic_message=f"APPROVED: {buyer_id} bought {qty:.1f} {item_id} from {seller_id} @ ${unit_price:.2f}.",
-                    ledger_receipt=receipt,
-                )
-            except Exception:
-                conn.rollback()
-                raise
-
-    def _record_rejected_tx(
+    def _execute_cda_order_submission(
         self,
-        tx_id: str,
         tick: int,
-        initiator_id: str,
-        responder_id: str,
-        buyer_id: str,
-        seller_id: str,
-        action_type: str,
-        item_id: str,
-        qty: float,
-        unit_price: float,
-        gross: float,
-        error_code: str,
-        diag_msg: str,
-        kkt_gouging_index: float,
-        is_fire_sale: bool,
-    ) -> GameMasterVerdict:
-        sfc_err = self.get_conservation_error()
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO acid_transaction_ledger VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 0.0, 0.0, ?, ?,
-                    'REJECTED', ?, ?, ?
-                );
-                """,
-                (
-                    tx_id,
-                    tick,
-                    initiator_id,
-                    responder_id,
-                    buyer_id,
-                    seller_id,
-                    action_type,
-                    item_id,
-                    qty,
-                    unit_price,
-                    gross,
-                    kkt_gouging_index,
-                    int(is_fire_sale),
-                    error_code,
-                    diag_msg,
-                    sfc_err,
-                ),
+        sheet: HouseholdBalanceSheet,
+        payload: Stage2ActionPayload,
+    ) -> ActionExecutionOutcome:
+        if payload.asset not in self.exchange.books:
+            return ActionExecutionOutcome(
+                agent_id=sheet.agent_id,
+                action_type=AgentActionType.PLACE_ORDER,
+                accepted=False,
+                reason="ASSET_BOOK_DISABLED",
             )
-            conn.commit()
-        return GameMasterVerdict(
-            status="REJECTED",
-            error_code=error_code,
-            diagnostic_message=diag_msg,
-            ledger_receipt=None,
+        book = self.exchange.get_book(payload.asset)
+        qty = round(min(float(payload.quantity), self.cda_cfg.max_order_quantity), 6)
+        side = payload.side
+        if side is None or qty <= 1e-9:
+            return ActionExecutionOutcome(
+                agent_id=sheet.agent_id,
+                action_type=AgentActionType.PLACE_ORDER,
+                accepted=False,
+                reason="INVALID_SIDE_OR_QUANTITY",
+            )
+
+        locked_cash = 0.0
+        locked_asset = 0.0
+        quantized_limit: Optional[float] = None
+
+        if side == OrderSide.BID:
+            spendable = round(sheet.liquid_cash - sheet.borrowing_limit_b_bar, 8)
+            if payload.order_type == OrderType.LIMIT:
+                if payload.limit_price is None or payload.limit_price <= 0.0:
+                    return ActionExecutionOutcome(
+                        agent_id=sheet.agent_id,
+                        action_type=AgentActionType.PLACE_ORDER,
+                        accepted=False,
+                        reason="MISSING_LIMIT_PRICE",
+                    )
+                quantized_limit = book.quantize_price(payload.limit_price)
+                req_cash = round(qty * quantized_limit, 8)
+                if spendable + 1e-9 < req_cash:
+                    return ActionExecutionOutcome(
+                        agent_id=sheet.agent_id,
+                        action_type=AgentActionType.PLACE_ORDER,
+                        accepted=False,
+                        reason=f"INSUFFICIENT_FUNDS_FOR_BID: need=${req_cash:.2f}, spendable=${spendable:.2f}",
+                    )
+                locked_cash = req_cash
+            else:
+                # MARKET BID: check resting ASK liquidity first
+                fillable, est_cost = book.estimate_market_sweep_cost(
+                    OrderSide.BID, qty, exclude_agent_id=sheet.agent_id
+                )
+                if fillable <= 1e-9 or spendable <= 1e-9:
+                    return ActionExecutionOutcome(
+                        agent_id=sheet.agent_id,
+                        action_type=AgentActionType.PLACE_ORDER,
+                        accepted=False,
+                        reason="NO_RESTING_ASK_LIQUIDITY_OR_ZERO_CASH",
+                    )
+                locked_cash = round(min(spendable, est_cost), 8)
+
+            # Move buyer cash into Escrow strictly before matching
+            sheet.liquid_cash = round(sheet.liquid_cash - locked_cash, 8)
+            sheet.escrow_cash = round(sheet.escrow_cash + locked_cash, 8)
+        else:
+            # OrderSide.ASK
+            if payload.order_type == OrderType.LIMIT:
+                if payload.limit_price is None or payload.limit_price <= 0.0:
+                    return ActionExecutionOutcome(
+                        agent_id=sheet.agent_id,
+                        action_type=AgentActionType.PLACE_ORDER,
+                        accepted=False,
+                        reason="MISSING_LIMIT_PRICE",
+                    )
+                quantized_limit = book.quantize_price(payload.limit_price)
+            else:
+                fillable, _ = book.estimate_market_sweep_cost(
+                    OrderSide.ASK, qty, exclude_agent_id=sheet.agent_id
+                )
+                if fillable <= 1e-9:
+                    return ActionExecutionOutcome(
+                        agent_id=sheet.agent_id,
+                        action_type=AgentActionType.PLACE_ORDER,
+                        accepted=False,
+                        reason="NO_RESTING_BID_LIQUIDITY",
+                    )
+
+            avail_inv = (
+                sheet.consumable_inventory
+                if payload.asset == AssetType.CONSUMABLE
+                else sheet.illiquid_capital
+            )
+            if avail_inv + 1e-9 < qty:
+                return ActionExecutionOutcome(
+                    agent_id=sheet.agent_id,
+                    action_type=AgentActionType.PLACE_ORDER,
+                    accepted=False,
+                    reason=f"INSUFFICIENT_INVENTORY_FOR_ASK: avail={avail_inv:.2f}, qty={qty:.2f}",
+                )
+            locked_asset = qty
+            if payload.asset == AssetType.CONSUMABLE:
+                sheet.consumable_inventory = round(
+                    sheet.consumable_inventory - locked_asset, 6
+                )
+                sheet.escrow_consumable = round(
+                    sheet.escrow_consumable + locked_asset, 6
+                )
+            else:
+                sheet.illiquid_capital = round(
+                    sheet.illiquid_capital - locked_asset, 6
+                )
+                sheet.escrow_capital = round(sheet.escrow_capital + locked_asset, 6)
+
+        order = CDAOrder(
+            order_id=f"ord_{tick:04d}_{uuid.uuid4().hex[:8]}",
+            tick_submitted=tick,
+            sequence_num=self.exchange.next_sequence_num(),
+            agent_id=sheet.agent_id,
+            asset=payload.asset,
+            side=side,
+            order_type=payload.order_type,
+            limit_price=quantized_limit,
+            quantity=qty,
+        )
+
+        res = book.submit_order(
+            order=order,
+            locked_cash=locked_cash,
+            locked_asset=locked_asset,
+            sales_tax_rate=self.economy_cfg.sales_tax_rate,
+        )
+
+        # Settle all matched TradeFills atomically across sectoral accounts
+        net_cash_delta = 0.0
+        for fill in res.fills:
+            buyer = self.households[fill.buyer_id]
+            seller = self.households[fill.seller_id]
+
+            # 1. Buyer escrow cash -> Seller liquid cash + PublicTreasury sales tax
+            buyer.escrow_cash = round(buyer.escrow_cash - fill.gross_value, 8)
+            seller_net = round(fill.gross_value - fill.sales_tax_paid, 8)
+            seller.liquid_cash = round(seller.liquid_cash + seller_net, 8)
+            self.treasury_cash = round(self.treasury_cash + fill.sales_tax_paid, 8)
+
+            # 2. Seller escrow asset -> Buyer available inventory
+            if fill.asset == AssetType.CONSUMABLE:
+                seller.escrow_consumable = round(
+                    seller.escrow_consumable - fill.quantity, 6
+                )
+                buyer.consumable_inventory = round(
+                    buyer.consumable_inventory + fill.quantity, 6
+                )
+                # Realized peer-to-peer consumable spend (Zero circular MPC)
+                self.tick_consumable_spend[buyer.agent_id] = round(
+                    self.tick_consumable_spend[buyer.agent_id] + fill.gross_value, 8
+                )
+            else:
+                seller.escrow_capital = round(
+                    seller.escrow_capital - fill.quantity, 6
+                )
+                buyer.illiquid_capital = round(
+                    buyer.illiquid_capital + fill.quantity, 6
+                )
+
+            if fill.buyer_id == sheet.agent_id:
+                net_cash_delta -= fill.gross_value
+            if fill.seller_id == sheet.agent_id:
+                net_cash_delta += seller_net
+
+            self.tick_fills.append(fill)
+
+        # Refund buyer price improvement from escrow back to liquid_cash
+        for buyer_id, refund_amt in res.price_improvement_refunds:
+            b_sheet = self.households[buyer_id]
+            b_sheet.escrow_cash = round(b_sheet.escrow_cash - refund_amt, 8)
+            b_sheet.liquid_cash = round(b_sheet.liquid_cash + refund_amt, 8)
+
+        # Release unfilled IOC / rounding dust escrow
+        if res.unfilled_ioc_release is not None:
+            self._apply_escrow_release(res.unfilled_ioc_release)
+
+        # Recompute objective stress for participating agents
+        sheet.needs.composite_stress = NeedsEngine.compute_objective_stress(
+            sheet, self.economy_cfg
+        )
+        self.audit_and_assert_sfc(tick)
+
+        return ActionExecutionOutcome(
+            agent_id=sheet.agent_id,
+            action_type=AgentActionType.PLACE_ORDER,
+            accepted=True,
+            reason=f"CDA_{order.status.value}_FILLS={len(res.fills)}",
+            submitted_order=order,
+            fills=res.fills,
+            net_cash_delta=round(net_cash_delta, 8),
         )
 
     # ========================================================================
-    # END-OF-TICK HANK PRODUCTION, OBLIGATIONS R_{i,t}, UTILITY & OSTROM
+    # 4. END-OF-TICK PHYSICS: PRODUCTION, RETURNS, OBLIGATIONS & NEEDS ENGINE
     # ========================================================================
 
-    def execute_end_of_tick_upkeep_and_fiscal_state(
+    def step_end_of_tick_physics(self, tick: int) -> TickMacroSummary:
+        """
+        Executes deterministic end-of-tick physics in strict SFC order:
+          1. Expire stale CDA orders past TTL and release escrow.
+          2. Harvest consumable production (producers only, scaled by TFP & Health).
+          3. Pay labor wages, capital dividends, liquid/borrowing interest, and mandatory obligations.
+          4. Execute biological Needs Engine (consume c_min, degrade/recover health, handle deaths).
+          5. Cancel open orders of any agent who died this tick and release escrow.
+          6. Assert exact SFC monetary conservation (`abs(M_t - M_0) < 1e-9`).
+        """
+        # 1. Expire stale limit orders
+        expired_releases = self.exchange.expire_all_stale_orders(tick)
+        for rel in expired_releases:
+            self._apply_escrow_release(rel)
+
+        deaths_this_tick: List[str] = []
+        obligation_defaults: List[str] = []
+
+        for aid, sheet in self.households.items():
+            if not NeedsEngine.is_alive(sheet):
+                continue
+
+            health_mult = NeedsEngine.compute_productivity_multiplier(
+                sheet, self.economy_cfg
+            )
+
+            # 2. Consumable Production (Producers only)
+            if sheet.base_consumable_production_q > 0.0:
+                harvest = round(
+                    sheet.base_consumable_production_q
+                    * self.current_tfp_a_c
+                    * health_mult,
+                    6,
+                )
+                sheet.consumable_inventory = round(
+                    sheet.consumable_inventory + harvest, 6
+                )
+
+            # 3A. Labor Wages (ProductionFirm -> Household)
+            wage_shock_mult = 1.0
+            if self.shock_cfg.shock_type == MacroShockType.ASYMMETRIC_WAGE_SHOCK:
+                wage_shock_mult = max(
+                    0.25, 1.0 - 0.50 * sheet.shock_exposure_e * self.shock_intensity_s
+                )
+            wage_paid = round(sheet.base_wage * wage_shock_mult * health_mult, 8)
+            wage_paid = min(wage_paid, max(0.0, self.firm_sector_cash))
+            self.firm_sector_cash = round(self.firm_sector_cash - wage_paid, 8)
+            sheet.liquid_cash = round(sheet.liquid_cash + wage_paid, 8)
+
+            # 3B. Illiquid Capital Dividends (ProductionFirm -> Household)
+            total_k = sheet.illiquid_capital + sheet.escrow_capital
+            cap_div = TwoAssetAccounting.compute_capital_dividend_flow(
+                total_k,
+                self.economy_cfg,
+                yield_multiplier=self.current_capital_yield_mult,
+            )
+            cap_div = min(cap_div, max(0.0, self.firm_sector_cash))
+            self.firm_sector_cash = round(self.firm_sector_cash - cap_div, 8)
+            sheet.liquid_cash = round(sheet.liquid_cash + cap_div, 8)
+
+            # 3C. Liquid Interest / Borrowing Wedge (FinancialIntermediary <-> Household)
+            int_flow = TwoAssetAccounting.compute_liquid_interest_flow(
+                sheet.liquid_cash,
+                self.economy_cfg,
+                credit_wedge_shock_addon=self.current_credit_wedge_addon,
+            )
+            if int_flow >= 0.0:
+                int_flow = min(int_flow, max(0.0, self.intermediary_cash))
+            self.intermediary_cash = round(self.intermediary_cash - int_flow, 8)
+            sheet.liquid_cash = round(sheet.liquid_cash + int_flow, 8)
+
+            # 3D. Mandatory Periodic Obligation R_{i,t} (Household -> ProductionFirm)
+            avail_to_pay = max(
+                0.0, round(sheet.liquid_cash - sheet.borrowing_limit_b_bar, 8)
+            )
+            ob_due = sheet.periodic_obligation_r
+            ob_paid = round(min(avail_to_pay, ob_due), 8)
+            if ob_paid + 1e-6 < ob_due:
+                obligation_defaults.append(aid)
+            sheet.liquid_cash = round(sheet.liquid_cash - ob_paid, 8)
+            self.firm_sector_cash = round(self.firm_sector_cash + ob_paid, 8)
+
+            self.tick_disposable_income[aid] = round(
+                wage_paid + cap_div + int_flow - ob_paid, 8
+            )
+
+            # 4. Biological Needs Engine (Consume c_min, decay/recover health)
+            met_out: MetabolicStepOutcome = NeedsEngine.step_metabolic_needs(
+                sheet, self.economy_cfg
+            )
+            if met_out.died_this_tick:
+                deaths_this_tick.append(aid)
+                # 5. Economic death: immediately cancel all open CDA orders and release escrow
+                death_releases = self.exchange.cancel_all_agent_orders(aid)
+                for d_rel in death_releases:
+                    self._apply_escrow_release(d_rel)
+
+        # 6. Collect Market Microstructure Snapshots & HtM Classification
+        snapshots = self.exchange.get_all_snapshots(tick)
+        c_snap = snapshots[AssetType.CONSUMABLE]
+        k_snap = snapshots.get(AssetType.CAPITAL)
+        ref_c_price = c_snap.last_trade_price or c_snap.mid_price or 12.0
+
+        living_sheets = [h for h in self.households.values() if NeedsEngine.is_alive(h)]
+        n_living = len(living_sheets)
+        p_htm = 0
+        w_htm = 0
+        non_htm = 0
+        for h in living_sheets:
+            cls_tag = TwoAssetAccounting.classify_htm_status(
+                h, self.economy_cfg, ref_c_price
+            )
+            if cls_tag == "POOR_HTM":
+                p_htm += 1
+            elif cls_tag == "WEALTHY_HTM":
+                w_htm += 1
+            else:
+                non_htm += 1
+
+        denom = max(1, n_living)
+        c_fills_count = sum(
+            1 for f in self.tick_fills if f.asset == AssetType.CONSUMABLE
+        )
+
+        # 7. Strict SFC Invariant Check
+        sfc_audit = self.audit_and_assert_sfc(tick)
+
+        return TickMacroSummary(
+            tick=tick,
+            shock_intensity_s=self.shock_intensity_s,
+            living_agents_count=n_living,
+            deaths_this_tick=deaths_this_tick,
+            consumable_book=c_snap,
+            capital_book=k_snap,
+            fills_this_tick=list(self.tick_fills),
+            consumable_market_frozen=(c_fills_count == 0),
+            poor_htm_share=round(p_htm / denom, 4),
+            wealthy_htm_share=round(w_htm / denom, 4),
+            non_htm_share=round(non_htm / denom, 4),
+            realized_consumable_spend_by_agent=dict(self.tick_consumable_spend),
+            realized_disposable_income_by_agent=dict(self.tick_disposable_income),
+            obligation_defaults_this_tick=obligation_defaults,
+            sfc_audit=sfc_audit,
+        )
+
+    # ========================================================================
+    # 5. NATIVE ZERO-INTELLIGENCE (ZI-C) CDA BASELINE GENERATOR
+    # ========================================================================
+
+    def propose_zero_intelligence_action(
         self,
         tick: int,
-        pg_contributions: Optional[Dict[str, float]] = None,
-        tax_evasion_intents: Optional[Dict[str, float]] = None,
-    ) -> Dict[str, Any]:
-        pg_contributions = pg_contributions or {}
-        tax_evasion_intents = tax_evasion_intents or {}
+        agent_id: str,
+        zi_rng: Optional[np.random.Generator] = None,
+    ) -> Stage2ActionPayload:
+        """
+        Budget-Constrained Zero-Intelligence (ZI-C) Trader (Gode & Sunder 1993)
+        integrated natively with the CDA Order Book & Two-Asset balance sheet.
+        Proves whether macro-freezes arise from LLM cognition vs. CDA mechanics.
+        """
+        rng = zi_rng if zi_rng is not None else self.rng
+        sheet = self.households[agent_id]
+        if not NeedsEngine.is_alive(sheet):
+            return Stage2ActionPayload(action_type=AgentActionType.ABSTAIN)
 
-        s_t = self.macro_state.crisis_intensity_s
-        crisis_type = self.hank_spec.active_crisis
+        c_book = self.exchange.get_book(AssetType.CONSUMABLE)
+        c_snap = c_book.get_snapshot(tick)
+        anchor_p = c_snap.last_trade_price or c_snap.mid_price or 12.0
+        spendable = max(0.0, sheet.liquid_cash - sheet.borrowing_limit_b_bar)
 
-        saez_top_rate = (
-            self.fiscal_spec.compute_saez_optimal_top_rate()
-            if self.omega.omega_d4_fiscal_and_legal_state
-            else 0.0
-        )
-        mid_tax_rate = (
-            self.fiscal_spec.saez_mid_income_tax_rate
-            if self.omega.omega_d4_fiscal_and_legal_state
-            else 0.0
-        )
-        wealth_tax_rate = (
-            self.fiscal_spec.wealth_tax_rate
-            if self.omega.omega_d4_fiscal_and_legal_state
-            else 0.0
-        )
-        subsistence_floor_y = (
-            self.macro_state.reference_consumable_price_pc
-            * self.hank_spec.subsistence_min_c
-        )
+        # If cash-constrained but holding illiquid capital, ZI-C may liquidate 1 unit
+        if (
+            sheet.consumable_inventory < 1.5
+            and spendable < 0.85 * anchor_p
+            and sheet.illiquid_capital >= 1.0
+        ):
+            return Stage2ActionPayload(
+                action_type=AgentActionType.LIQUIDATE_CAPITAL,
+                asset=AssetType.CAPITAL,
+                capital_transfer_units=1.0,
+            )
 
-        upkeep_report: Dict[str, Any] = {
-            "starved_agents": [],
-            "bankrupt_agents": [],
-            "defaulted_agents": [],
-            "harvested_units": {},
-            "sanctioned_agents": {},
-            "pg_provision_rate": 1.0,
-            "free_rider_share": 0.0,
-            "total_sanction_points": 0,
-            "saez_top_rate": saez_top_rate,
-            "mean_period_utility_u": 0.0,
-        }
+        # Surplus consumable holders post random ASK limit orders above cost floor
+        if sheet.consumable_inventory >= 2.5:
+            ask_p = c_book.quantize_price(
+                float(rng.uniform(0.70 * anchor_p, 1.35 * anchor_p))
+            )
+            qty = float(rng.choice([1.0, 2.0]))
+            qty = min(qty, max(1.0, sheet.consumable_inventory - 1.0))
+            return Stage2ActionPayload(
+                action_type=AgentActionType.PLACE_ORDER,
+                asset=AssetType.CONSUMABLE,
+                side=OrderSide.ASK,
+                order_type=OrderType.LIMIT,
+                limit_price=ask_p,
+                quantity=round(qty, 2),
+            )
 
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE TRANSACTION;")
-            try:
-                rows = conn.execute(
-                    "SELECT * FROM agents_external_ledger ORDER BY agent_id;"
-                ).fetchall()
+        # Low-inventory households with spendable cash post random BID limit orders
+        if spendable >= 4.0:
+            max_bid = min(spendable, 1.45 * anchor_p)
+            min_bid = min(max_bid, 0.70 * anchor_p)
+            bid_p = c_book.quantize_price(float(rng.uniform(min_bid, max_bid)))
+            return Stage2ActionPayload(
+                action_type=AgentActionType.PLACE_ORDER,
+                asset=AssetType.CONSUMABLE,
+                side=OrderSide.BID,
+                order_type=OrderType.LIMIT,
+                limit_price=bid_p,
+                quantity=1.0,
+            )
 
-                firm_cash = float(
-                    conn.execute(
-                        "SELECT cash_balance FROM macro_institutions WHERE institution_id = 'AggregateFirmSector';"
-                    ).fetchone()["cash_balance"]
-                )
-                treasury_row = conn.execute(
-                    "SELECT cash_balance, metadata_json FROM macro_institutions WHERE institution_id = 'PublicTreasury';"
-                ).fetchone()
-                treasury_cash = float(treasury_row["cash_balance"])
-                treasury_meta = json.loads(treasury_row["metadata_json"])
+        return Stage2ActionPayload(action_type=AgentActionType.CONSUME_AND_HOLD)
 
-                agent_state_work: Dict[str, Dict[str, Any]] = {}
-                total_supply_harvested = 0.0
-                total_demand_eaten = 0.0
-
-                for r in rows:
-                    aid = r["agent_id"]
-                    if r["legal_status"] == "BANKRUPT":
-                        continue
-
-                    inv = json.loads(r["inventory_json"])
-                    c_qty = float(inv.get("CONSUMABLE_NECESSITY", 0.0))
-                    a_qty = float(inv.get("PRODUCTIVE_CAPITAL_ASSET", 0.0))
-                    b_cash = float(r["liquid_wealth_cash"])
-                    base_w = float(r["base_wage"])
-                    obligation_r = float(r["periodic_obligation_r"])
-                    pending_debt = float(r["pending_payday_debt"])
-                    exposure_e = float(r["shock_exposure_e"])
-                    base_q = float(r["base_consumable_prod_q"])
-
-                    # 1. Consumable Production Q_{i,t}
-                    if base_q > 0.0:
-                        q_harvest = self.macro_state.consumable_tfp_ac * (
-                            base_q + self.hank_spec.prod_capital_elasticity_eta * a_qty
-                        )
-                        c_qty = round(c_qty + q_harvest, 4)
-                        total_supply_harvested += q_harvest
-                        upkeep_report["harvested_units"][aid] = round(q_harvest, 2)
-
-                    # 2. Strict 1.0 Metabolic Burn & Hard Subsistence Check (Death/Bankruptcy)
-                    c_min = (
-                        max(1.0, self.hank_spec.subsistence_min_c)
-                        if self.omega.omega_d1_scarcity_and_hank
-                        else 0.0
-                    )
-                    ate_qty = 0.0
-                    ate_full = True
-                    min_mkt_cost = c_min * self.macro_state.reference_consumable_price_pc
-                    if c_min > 0.0:
-                        total_demand_eaten += c_min
-                        if c_qty >= c_min:
-                            c_qty = round(c_qty - c_min, 4)
-                            ate_qty = c_min
-                        else:
-                            # Must secure full 1.0 unit of subsistence via emergency market purchase or die
-                            deficit_qty = round(c_min - c_qty, 4)
-                            emergency_cost = round(
-                                deficit_qty * self.macro_state.reference_consumable_price_pc,
-                                4,
-                            )
-                            if b_cash >= emergency_cost:
-                                b_cash = round(b_cash - emergency_cost, 4)
-                                firm_cash = round(firm_cash + emergency_cost, 4)
-                                c_qty = 0.0
-                                ate_qty = c_min
-                            else:
-                                # Failed to consume full 1.0 unit & unable to buy deficit -> BANKRUPT
-                                ate_full = False
-                                upkeep_report["starved_agents"].append(aid)
-                                treasury_cash = round(treasury_cash + b_cash, 4)
-                                treasury_meta["seized_consumables"] = round(
-                                    float(treasury_meta.get("seized_consumables", 0.0)) + c_qty, 4
-                                )
-                                treasury_meta["seized_capital_assets"] = round(
-                                    float(treasury_meta.get("seized_capital_assets", 0.0)) + a_qty, 4
-                                )
-                                b_cash = 0.0
-                                c_qty = 0.0
-                                a_qty = 0.0
-                                upkeep_report["bankrupt_agents"].append(aid)
-                                conn.execute(
-                                    """
-                                    UPDATE agents_external_ledger
-                                    SET liquid_wealth_cash = 0.0,
-                                        inventory_json = ?,
-                                        pending_payday_debt = 0.0,
-                                        legal_status = 'BANKRUPT'
-                                    WHERE agent_id = ?;
-                                    """,
-                                    (
-                                        json.dumps({
-                                            "CONSUMABLE_NECESSITY": 0.0,
-                                            "PRODUCTIVE_CAPITAL_ASSET": 0.0,
-                                        }),
-                                        aid,
-                                    ),
-                                )
-                                continue
-                    else:
-                        ate_qty = 1.0
-
-                    # 3. Wage Income (with heterogeneous shock exposure e_i * s_t) + Capital Dividends
-                    wage_mult = 1.0
-                    if (
-                        self.omega.omega_d1_scarcity_and_hank
-                        and crisis_type in ("ASYMMETRIC_UNEMPLOYMENT_SHOCK", "STAGFLATION_SUBSISTENCE_SHOCK")
-                    ):
-                        wage_mult = max(0.30, 1.0 - 0.32 * exposure_e * s_t)
-                    realized_wage = round(base_w * wage_mult, 4)
-
-                    # Latent state theta_t modulates capital dividend yield
-                    theta_mult = (
-                        1.15
-                        if self.macro_state.latent_macro_state_theta > 0
-                        else 0.65
-                    )
-                    capital_div = round(
-                        a_qty
-                        * self.macro_state.capital_yield_rk
-                        * float(self.hank_spec.capital_dividend_payout_ratio)
-                        * theta_mult
-                        * self.macro_state.reference_capital_price_qk,
-                        4,
-                    )
-                    if b_cash >= 0.0:
-                        interest_flow = round(b_cash * self.macro_state.liquid_rate_rb, 4)
-                    else:
-                        borr_rate = (
-                            self.macro_state.liquid_rate_rb
-                            + self.macro_state.borrowing_wedge_kappa
-                        )
-                        interest_flow = round(b_cash * borr_rate, 4)
-
-                    gross_income = round(realized_wage + capital_div + interest_flow, 4)
-                    b_cash = round(b_cash + gross_income, 4)
-                    firm_cash = round(firm_cash - gross_income, 4)
-
-                    # 4. Contractual Periodic Obligation R_{i,t} + Exogenous Health/Medical Shock Hazard
-                    ob_paid = round(obligation_r, 4) if self.omega.omega_d1_scarcity_and_hank else 0.0
-                    b_cash = round(b_cash - ob_paid, 4)
-                    firm_cash = round(firm_cash + ob_paid, 4)
-
-                    annual_h = max(0.0, min(0.95, float(self.hank_spec.health_shock_annual_hazard)))
-                    monthly_shock_prob = 1.0 - (1.0 - annual_h) ** (1.0 / 12.0)
-                    active_health_shock = 0
-                    last_shock_amount = 0.0
-                    if self.omega.omega_d1_scarcity_and_hank and self.rng.random() < monthly_shock_prob:
-                        # Severity: LogNormal(mu=7.31, sigma=1.0) (median ~$1,495 USD), scaled to sim wage currency
-                        shock_usd = math.exp(self.rng.gauss(7.31, 1.0))
-                        shock_sim = round(
-                            min(120.0, max(6.0, shock_usd * (max(10.0, base_w) / 1800.0))),
-                            4,
-                        )
-                        b_cash = round(b_cash - shock_sim, 4)
-                        firm_cash = round(firm_cash + shock_sim, 4)
-                        active_health_shock = 1
-                        last_shock_amount = shock_sim
-
-                    # 5. Saez (2001) Progressive Income & Wealth Tax
-                    saez_tax = 0.0
-                    w_tax = 0.0
-                    evaded_amount = 0.0
-                    if self.omega.omega_d4_fiscal_and_legal_state:
-                        y_high_cutoff = 2.2 * subsistence_floor_y
-                        if gross_income <= subsistence_floor_y:
-                            theoretical_y_tax = 0.0
-                        elif gross_income <= y_high_cutoff:
-                            theoretical_y_tax = mid_tax_rate * (
-                                gross_income - subsistence_floor_y
-                            )
-                        else:
-                            theoretical_y_tax = mid_tax_rate * (
-                                y_high_cutoff - subsistence_floor_y
-                            ) + saez_top_rate * (gross_income - y_high_cutoff)
-
-                        net_worth = (
-                            b_cash + a_qty * self.macro_state.reference_capital_price_qk
-                        )
-                        if net_worth > self.fiscal_spec.wealth_tax_threshold:
-                            w_tax = wealth_tax_rate * (
-                                net_worth - self.fiscal_spec.wealth_tax_threshold
-                            )
-
-                        evade_frac = max(
-                            0.0, min(0.80, float(tax_evasion_intents.get(aid, 0.0)))
-                        )
-                        saez_tax = round(theoretical_y_tax * (1.0 - evade_frac), 4)
-                        evaded_amount = round(theoretical_y_tax * evade_frac, 4)
-                        w_tax = round(w_tax, 4)
-
-                        total_agent_tax = round(saez_tax + w_tax, 4)
-                        b_cash = round(b_cash - total_agent_tax, 4)
-                        treasury_cash = round(treasury_cash + total_agent_tax, 4)
-
-                    b_bar = (
-                        float(r["credit_limit_b_bar"])
-                        * self.macro_state.borrowing_limit_scale
-                    )
-                    c_gap = (
-                        max(0.0, self.hank_spec.subsistence_min_c - c_qty)
-                        if self.omega.omega_d1_scarcity_and_hank
-                        else 0.0
-                    )
-                    b_gap = (
-                        max(
-                            0.0,
-                            (self.hank_spec.safe_cash_buffer_b + ob_paid - b_cash)
-                            / max(self.hank_spec.safe_cash_buffer_b + ob_paid - b_bar, 1.0),
-                        )
-                        if self.omega.omega_d1_scarcity_and_hank
-                        else 0.0
-                    )
-                    f_it = max(0.0, min(1.0, 0.55 * c_gap + 0.45 * b_gap))
-
-                    agent_state_work[aid] = {
-                        "row": r,
-                        "c_qty": c_qty,
-                        "a_qty": a_qty,
-                        "b_cash": b_cash,
-                        "b_bar": b_bar,
-                        "ate_qty": ate_qty,
-                        "ate_full": ate_full,
-                        "gross_income": gross_income,
-                        "ob_paid": ob_paid,
-                        "active_health_shock": active_health_shock,
-                        "last_shock_amount": last_shock_amount,
-                        "saez_tax": saez_tax,
-                        "w_tax": w_tax,
-                        "evaded_amount": evaded_amount,
-                        "f_it": f_it,
-                    }
-
-                n_agents = max(1, len(agent_state_work))
-
-                # 6. Redistributive Transfers d_{i,t} (UBI + Targeted Scarcity Relief)
-                distributable_pool = (
-                    round(0.45 * max(0.0, treasury_cash - 40.0), 4)
-                    if self.omega.omega_d4_fiscal_and_legal_state and agent_state_work
-                    else 0.0
-                )
-                phi_univ = self.fiscal_spec.universal_vs_targeted_phi
-                sum_f = sum(v["f_it"] for v in agent_state_work.values())
-
-                for aid, st in agent_state_work.items():
-                    if distributable_pool > 0.0:
-                        ubi_part = phi_univ * (distributable_pool / n_agents)
-                        if sum_f > 1e-6:
-                            targ_part = (
-                                (1.0 - phi_univ)
-                                * distributable_pool
-                                * (st["f_it"] / sum_f)
-                            )
-                        else:
-                            targ_part = (1.0 - phi_univ) * (
-                                distributable_pool / n_agents
-                            )
-                        d_it = round(ubi_part + targ_part, 4)
-                    else:
-                        d_it = 0.0
-                    st["b_cash"] = round(st["b_cash"] + d_it, 4)
-                    treasury_cash = round(treasury_cash - d_it, 4)
-                    st["transfer_d"] = d_it
-
-                    # Jappelli-Pistaferri (2014) Windfall Consumption Response (Exact SFC):
-                    # Low-liquidity agents spend a high fraction of windfall transfers immediately;
-                    # high-liquidity agents save most of the windfall.
-                    windfall_mpc = min(0.75, 0.22 + 0.50 * st["f_it"])
-                    windfall_spend = round(max(0.0, d_it * windfall_mpc), 4)
-                    if windfall_spend > 0.0 and st["b_cash"] >= windfall_spend:
-                        st["b_cash"] = round(st["b_cash"] - windfall_spend, 4)
-                        firm_cash = round(firm_cash + windfall_spend, 4)
-                    else:
-                        windfall_spend = 0.0
-                    st["windfall_spend"] = windfall_spend
-
-                # 7. Fehr & Gächter (2000) Public Goods & Ostrom Graduated Sanctions
-                total_pg_contrib = 0.0
-                total_ideal_endowment = 0.0
-                free_riders_count = 0
-
-                for aid, st in agent_state_work.items():
-                    endowment_e = max(
-                        2.0,
-                        round(
-                            self.fiscal_spec.public_goods_endowment_share
-                            * max(st["gross_income"], 10.0),
-                            4,
-                        ),
-                    )
-                    total_ideal_endowment += endowment_e
-                    if not self.omega.omega_d4_fiscal_and_legal_state:
-                        g_it = 0.0
-                    else:
-                        if aid in pg_contributions and pg_contributions[aid] > 0.0:
-                            g_it = max(
-                                0.0, min(endowment_e, float(pg_contributions[aid]))
-                            )
-                        else:
-                            ag_cfg = next(
-                                a for a in self.config.agents if a.agent_id == aid
-                            )
-                            prior_sanctions = int(
-                                st["row"]["prior_violations_count"]
-                            )
-                            coop_propensity = min(
-                                1.0,
-                                0.55 * self.macro_state.institutional_trust
-                                + 0.55 * (ag_cfg.beta_advantageous + 0.50)
-                                + 0.16 * min(3, prior_sanctions)
-                                - 0.18 * st["f_it"],
-                            )
-                            g_it = round(endowment_e * max(0.0, coop_propensity), 4)
-
-                    st["pg_endowment_e"] = endowment_e
-                    st["pg_contrib_g"] = g_it
-                    st["b_cash"] = round(st["b_cash"] - g_it, 4)
-                    treasury_cash = round(treasury_cash + g_it, 4)
-                    total_pg_contrib = round(total_pg_contrib + g_it, 4)
-
-                mean_g_rate = sum(
-                    v["pg_contrib_g"] / max(v["pg_endowment_e"], 1e-6)
-                    for v in agent_state_work.values()
-                ) / max(1, n_agents)
-                # H3 Fix: Keep total social multiplier scale-invariant (default 1.60x)
-                # instead of mpcr_a * N (= 9.6x at N=24), preventing cash flooding in `main`!
-                eff_pg_mult = min(
-                    float(self.hank_spec.pg_scale_invariant_multiplier),
-                    float(self.fiscal_spec.public_goods_mpcr_a) * float(n_agents),
-                )
-                total_pg_payout = (
-                    round(eff_pg_mult * total_pg_contrib, 4)
-                    if self.omega.omega_d4_fiscal_and_legal_state
-                    else 0.0
-                )
-                per_agent_pg_div = round(total_pg_payout / max(1, n_agents), 4)
-                actual_pg_paid = round(per_agent_pg_div * n_agents, 4)
-
-                surplus_from_firm = round(actual_pg_paid - total_pg_contrib, 4)
-                treasury_cash = round(treasury_cash - total_pg_contrib, 4)
-                firm_cash = round(firm_cash - surplus_from_firm, 4)
-
-                utilities_this_tick: List[float] = []
-                sigma_crra = self.hank_spec.crra_risk_aversion_sigma
-
-                for aid, st in agent_state_work.items():
-                    st["b_cash"] = round(st["b_cash"] + per_agent_pg_div, 4)
-                    st["pg_dividend"] = per_agent_pg_div
-
-                    prior_v = int(st["row"]["prior_violations_count"])
-                    g_it = st["pg_contrib_g"]
-                    own_g_rate = g_it / max(st["pg_endowment_e"], 1e-6)
-                    rate_dev = max(0.0, mean_g_rate - own_g_rate)
-                    is_free_rider = own_g_rate < 0.72
-                    if is_free_rider:
-                        free_riders_count += 1
-
-                    audited = 0
-                    p_points = 0
-                    penalty_cash = 0.0
-
-                    if self.omega.omega_d4_fiscal_and_legal_state and (
-                        rate_dev > 0.06 or st["evaded_amount"] > 0.25
-                    ):
-                        p_audit = min(
-                            0.95,
-                            self.fiscal_spec.base_audit_probability
-                            + 0.15 * prior_v,
-                        )
-                        if self.rng.random() < p_audit:
-                            audited = 1
-                            raw_pts = (
-                                8.0 * rate_dev
-                                + 2.5 * (st["evaded_amount"] / 5.0)
-                                + 1.2 * prior_v
-                            )
-                            if prior_v == 0:
-                                raw_pts *= max(
-                                    0.25,
-                                    1.0
-                                    - self.fiscal_spec.ostrom_scarcity_mercy_gamma
-                                    * st["f_it"],
-                                )
-                            p_points = max(1, min(10, int(round(raw_pts))))
-                            stage1_payoff = max(
-                                5.0,
-                                st["gross_income"]
-                                - st["saez_tax"]
-                                + st["pg_dividend"],
-                            )
-                            penalty_cash = round(
-                                stage1_payoff
-                                * self.fiscal_spec.ostrom_sanction_penalty_per_point
-                                * min(p_points, 10),
-                                4,
-                            )
-                            st["b_cash"] = round(st["b_cash"] - penalty_cash, 4)
-                            treasury_cash = round(treasury_cash + penalty_cash, 4)
-                            prior_v += 1
-                            upkeep_report["sanctioned_agents"][aid] = {
-                                "points": p_points,
-                                "penalty": penalty_cash,
-                            }
-                            upkeep_report["total_sanction_points"] += p_points
-
-                    # M1 & M3: Compute Realized CRRA Period Utility u_{i,t} & Default Penalty
-                    defaulted = (not st["ate_full"]) or (st["b_cash"] < st["b_bar"])
-                    if defaulted:
-                        upkeep_report["defaulted_agents"].append(aid)
-                    eff_c = max(
-                        0.20,
-                        st["ate_qty"]
-                        + 0.10
-                        * max(0.0, st["b_cash"])
-                        / max(1.0, self.macro_state.reference_consumable_price_pc),
-                    )
-                    if abs(sigma_crra - 1.0) < 1e-4:
-                        crra_u = math.log(eff_c)
-                    else:
-                        crra_u = ((eff_c ** (1.0 - sigma_crra)) - 1.0) / (
-                            1.0 - sigma_crra
-                        )
-                    period_u = round(
-                        crra_u
-                        - (
-                            self.hank_spec.default_utility_penalty_phi
-                            if defaulted
-                            else 0.0
-                        ),
-                        4,
-                    )
-                    utilities_this_tick.append(period_u)
-                    prev_cum_u = float(st["row"]["cumulative_utility_u"])
-                    disc_factor = self.hank_spec.long_run_discount_delta ** tick
-                    new_cum_u = round(prev_cum_u + disc_factor * period_u, 4)
-
-                    old_cs = float(st["row"]["credit_score"])
-                    new_cs = max(
-                        300.0,
-                        min(
-                            850.0,
-                            old_cs
-                            + (4.0 if not defaulted else -22.0)
-                            - 4.0 * p_points,
-                        ),
-                    )
-
-                    disposable_y = round(
-                        st["gross_income"]
-                        - st["ob_paid"]
-                        - st["saez_tax"]
-                        - st["w_tax"]
-                        + st["transfer_d"]
-                        - st["pg_contrib_g"]
-                        + st["pg_dividend"]
-                        - penalty_cash,
-                        4,
-                    )
-                    new_inv_json = json.dumps(
-                        {
-                            "CONSUMABLE_NECESSITY": st["c_qty"],
-                            "PRODUCTIVE_CAPITAL_ASSET": st["a_qty"],
-                        }
-                    )
-                    ob_scale = (
-                        float(self.hank_spec.main_scale_obligation_multiplier)
-                        if self.config.population_scale in ("main", "scale")
-                        else 1.0
-                    )
-                    base_ob_r = next(
-                        (a.periodic_obligation_r for a in self.config.agents if a.agent_id == aid),
-                        6.0,
-                    ) * ob_scale
-                    next_ob_r = round(
-                        float(base_ob_r) + float(st["row"]["pending_payday_debt"]), 4
-                    )
-                    tick_c_outlay = round(
-                        st["ate_qty"] * self.macro_state.reference_consumable_price_pc
-                        + st["ob_paid"]
-                        + st.get("windfall_spend", 0.0),
-                        4,
-                    )
-                    conn.execute(
-                        """
-                        UPDATE agents_external_ledger
-                        SET liquid_wealth_cash = ?,
-                            credit_score = ?,
-                            inventory_json = ?,
-                            active_health_shock = ?,
-                            last_shock_amount = ?,
-                            periodic_obligation_r = ?,
-                            pending_payday_debt = 0.0,
-                            last_disposable_income = ?,
-                            last_consumption_exp = ?,
-                            last_period_utility_u = ?,
-                            cumulative_utility_u = ?,
-                            prior_violations_count = ?,
-                            last_sanction_points = ?
-                        WHERE agent_id = ?;
-                        """,
-                        (
-                            st["b_cash"],
-                            round(new_cs, 1),
-                            new_inv_json,
-                            int(st["active_health_shock"]),
-                            float(st["last_shock_amount"]),
-                            next_ob_r,
-                            disposable_y,
-                            tick_c_outlay,
-                            period_u,
-                            new_cum_u,
-                            prior_v,
-                            p_points,
-                            aid,
-                        ),
-                    )
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO fiscal_and_commons_log VALUES (
-                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                        );
-                        """,
-                        (
-                            tick,
-                            aid,
-                            st["gross_income"],
-                            st["ob_paid"],
-                            st["saez_tax"],
-                            st["w_tax"],
-                            st["transfer_d"],
-                            st["pg_contrib_g"],
-                            st["pg_dividend"],
-                            audited,
-                            p_points,
-                            penalty_cash,
-                            period_u,
-                        ),
-                    )
-
-                conn.execute(
-                    "UPDATE macro_institutions SET cash_balance = ?, metadata_json = ? WHERE institution_id = 'PublicTreasury';",
-                    (round(treasury_cash, 4), json.dumps(treasury_meta)),
-                )
-                conn.execute(
-                    "UPDATE macro_institutions SET cash_balance = ? WHERE institution_id = 'AggregateFirmSector';",
-                    (round(firm_cash, 4),),
-                )
-
-                sfc_err = self.get_conservation_error(conn)
-                assert sfc_err < 1e-6, f"SFC violation in upkeep tick {tick}: {sfc_err}"
-                conn.commit()
-
-                # M5: Endogenous Market-Clearing Price Formation from Order Flow & Supply/Demand
-                phi_clear = self.hank_spec.market_clearing_elasticity_phi
-                c_buy = self.tick_order_flow["CONSUMABLE_NECESSITY"]["buy"] + total_demand_eaten
-                c_sell = self.tick_order_flow["CONSUMABLE_NECESSITY"]["sell"] + max(0.5, total_supply_harvested)
-                excess_c = (c_buy - c_sell) / max(1.0, c_buy + c_sell)
-                self.macro_state.reference_consumable_price_pc = round(
-                    self.macro_state.reference_consumable_price_pc
-                    * max(0.80, min(1.30, 1.0 + phi_clear * excess_c)),
-                    2,
-                )
-
-                k_buy = self.tick_order_flow["PRODUCTIVE_CAPITAL_ASSET"]["buy"]
-                k_sell = self.tick_order_flow["PRODUCTIVE_CAPITAL_ASSET"]["sell"]
-                if k_buy + k_sell > 0:
-                    excess_k = (k_buy - k_sell) / max(1.0, k_buy + k_sell)
-                    self.macro_state.reference_capital_price_qk = round(
-                        self.macro_state.reference_capital_price_qk
-                        * max(0.75, min(1.25, 1.0 + phi_clear * excess_k)),
-                        2,
-                    )
-
-                self.macro_state.public_treasury_cash = round(treasury_cash, 4)
-                self.macro_state.firm_sector_cash = round(firm_cash, 4)
-                upkeep_report["pg_provision_rate"] = round(
-                    total_pg_contrib / max(total_ideal_endowment, 1e-6), 4
-                )
-                upkeep_report["free_rider_share"] = round(
-                    free_riders_count / max(1, n_agents), 4
-                )
-                upkeep_report["mean_period_utility_u"] = round(
-                    sum(utilities_this_tick) / max(1, len(utilities_this_tick)), 4
-                )
-                return upkeep_report
-            except Exception:
-                conn.rollback()
-                raise
+    def run_zero_intelligence_tick(
+        self, tick: int, zi_rng: Optional[np.random.Generator] = None
+    ) -> TickMacroSummary:
+        """Executes a full randomized-arrival Zero-Intelligence tick over the CDA."""
+        rng = zi_rng if zi_rng is not None else self.rng
+        self.begin_tick(tick)
+        arrival_order = list(self.households.keys())
+        rng.shuffle(arrival_order)
+        for aid in arrival_order:
+            action = self.propose_zero_intelligence_action(tick, aid, zi_rng=rng)
+            self.execute_agent_action(tick, aid, action)
+        return self.step_end_of_tick_physics(tick)

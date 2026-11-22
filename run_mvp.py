@@ -1,413 +1,661 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import dataclasses
+import hashlib
+import json
 import os
-from typing import List
+import subprocess
+import time
+from typing import Any, Dict, List, Optional, Tuple
 import yaml
 
-from src.brain.inference_brain import DualBackendInferenceBrain
-from src.brain.model_vault import ModelVaultManager
+from src.brain.memory_tms import EpisodicMemoryTMS
 from src.core.contracts import (
-    FourDimTickTelemetry,
+    FactorialCellSpec,
+    PolicyMode,
+    RepEMode,
     SimulationConfig,
 )
-from src.core.seed_bundle import SeedBundle
-from src.environment.bilateral_market import BilateralMarketEngine
-from src.environment.game_master import AccountingAndLawEngine
-from src.environment.populations import synthesize_parametric_population
-from src.evaluation.live_monitor import RealTimeLiveMonitor
-from src.evaluation.metrics import FourDimensionalMetricsEngine
-from src.memory.scoped_memory import MultiTierScopedMemory
-from src.orchestration.cognitive_appraisal import CognitiveAppraisalAndToM
+from src.environment.game_master import GameMaster, TickMacroSummary
+from src.evaluation.metrics import (
+    EconomyMetricsCollector,
+    EconomySeedClusterMetrics,
+    ExogenousWindfallMPCProbe,
+)
+from src.evaluation.validity_and_stats import (
+    clustered_paired_contrast,
+    compute_2x2x2_factorial_effects_and_shapley,
+)
 from src.orchestration.turn_orchestrator import TurnOrchestrator
-from src.steering.attention_lab import AttentionSteeringLab
-from src.steering.entropy_tms import EntropyTMSRouter
+
+
+# ============================================================================
+# 1. COMPLETE 2^3 FACTORIAL ABLATION MATRIX + MATCHED SCIENTIFIC CONTROLS
+# ============================================================================
+
+def build_full_factorial_and_control_specs() -> Dict[str, FactorialCellSpec]:
+    """
+    Constructs all 8 cells of the 2^3 Factorial Ablation Matrix (C000..C111)
+    plus the 4 mandatory mechanistic and non-LLM baselines:
+      - Factor A: Bounded Deliberation Budget (B_CoT)
+      - Factor B: Episodic Memory Friction (M_RAG)
+      - Factor C: Two-Stage Endogenous Probe-Gated RepE (R_RepE)
+    """
+    specs: Dict[str, FactorialCellSpec] = {}
+    for a in (0, 1):
+        for b in (0, 1):
+            for c in (0, 1):
+                cid = f"C{a}{b}{c}"
+                specs[cid] = FactorialCellSpec(
+                    cell_id=cid,
+                    deliberation_bottleneck=bool(a),
+                    memory_friction=bool(b),
+                    endogenous_repe=bool(c),
+                    repe_mode=(
+                        RepEMode.ENDOGENOUS_PROBE_GATED if c == 1 else RepEMode.OFF
+                    ),
+                    policy_mode=PolicyMode.LLM_AGENT,
+                )
+
+    # Mandatory Mechanistic Controls (Paired on identical seeds)
+    specs["CTRL_PLACEBO_VEC"] = FactorialCellSpec(
+        cell_id="CTRL_PLACEBO_VEC",
+        deliberation_bottleneck=True,
+        memory_friction=True,
+        endogenous_repe=True,
+        repe_mode=RepEMode.PLACEBO_RANDOM_VECTOR,
+        policy_mode=PolicyMode.LLM_AGENT,
+    )
+    specs["CTRL_SHUFFLED_LAMBDA"] = FactorialCellSpec(
+        cell_id="CTRL_SHUFFLED_LAMBDA",
+        deliberation_bottleneck=True,
+        memory_friction=True,
+        endogenous_repe=True,
+        repe_mode=RepEMode.SHUFFLED_LAMBDA,
+        policy_mode=PolicyMode.LLM_AGENT,
+    )
+
+    # Non-LLM Baseline Comparators (Empirical Null Floor & Closed-Form Reference)
+    specs["BASE_ZERO_INTELLIGENCE"] = FactorialCellSpec(
+        cell_id="BASE_ZERO_INTELLIGENCE",
+        deliberation_bottleneck=False,
+        memory_friction=False,
+        endogenous_repe=False,
+        repe_mode=RepEMode.OFF,
+        policy_mode=PolicyMode.ZERO_INTELLIGENCE,
+    )
+    specs["BASE_CLOSED_FORM"] = FactorialCellSpec(
+        cell_id="BASE_CLOSED_FORM",
+        deliberation_bottleneck=False,
+        memory_friction=False,
+        endogenous_repe=False,
+        repe_mode=RepEMode.OFF,
+        policy_mode=PolicyMode.CLOSED_FORM_BENCHMARK,
+    )
+    return specs
+
+
+# ============================================================================
+# 2. SINGLE ECONOMY SEED EXECUTOR (ISOLATED CLUSTER WORKER)
+# ============================================================================
+
+def execute_single_economy_seed(
+    cell_cfg: SimulationConfig,
+    economy_seed: int,
+    llm_controller: Any = None,
+    eval_windfall_mpc: bool = True,
+    output_dir: Optional[str] = None,
+) -> EconomySeedClusterMetrics:
+    """
+    Runs one completely self-contained economy cluster (burn_in + active ticks)
+    for `(cell_cfg.factorial_cell.cell_id, economy_seed)`.
+    """
+    cell_id = cell_cfg.factorial_cell.cell_id
+    run_id = f"{cell_cfg.experiment_id}__{cell_id}__seed{economy_seed:03d}"
+
+    gm = GameMaster(config=cell_cfg, economy_seed=economy_seed)
+    mem_tms = EpisodicMemoryTMS(
+        config=cell_cfg.memory_friction,
+        db_path=":memory:",
+        use_neural_embeddings=False,
+    )
+    orch = TurnOrchestrator(
+        config=cell_cfg,
+        game_master=gm,
+        memory_tms=mem_tms,
+        llm_controller=llm_controller,
+        run_id=run_id,
+        economy_seed=economy_seed,
+    )
+
+    total_ticks = cell_cfg.burn_in_ticks + cell_cfg.active_ticks
+    post_burn_in_summaries: List[TickMacroSummary] = []
+
+    windfall_mpcs: Optional[List[float]] = None
+    windfall_counts: Optional[List[int]] = None
+    windfall_trigger_tick = cell_cfg.burn_in_ticks + max(
+        1, min(5, cell_cfg.active_ticks // 2)
+    )
+
+    for tick in range(1, total_ticks + 1):
+        # Execute paired exogenous windfall MPC probe cleanly without mutating main economy
+        if eval_windfall_mpc and tick == windfall_trigger_tick:
+            windfall_mpcs, windfall_counts = (
+                ExogenousWindfallMPCProbe.run_paired_windfall_probe(
+                    orchestrator=orch,
+                    start_tick=tick,
+                    windfall_amount=20.0,
+                    horizon_ticks=3,
+                )
+            )
+
+        summary = orch.run_tick(tick)
+        if tick > cell_cfg.burn_in_ticks:
+            post_burn_in_summaries.append(summary)
+
+    # Persist turn-level audit log if requested
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        turn_log_path = os.path.join(
+            output_dir, f"turns_{cell_id}_s{economy_seed:03d}.jsonl"
+        )
+        with open(turn_log_path, "w", encoding="utf-8") as f:
+            for rec in orch.turn_records:
+                f.write(rec.model_dump_json() + "\n")
+
+    return EconomyMetricsCollector.summarize_single_economy_seed(
+        config=cell_cfg,
+        economy_seed=economy_seed,
+        orchestrator=orch,
+        post_burn_in_summaries=post_burn_in_summaries,
+        windfall_mpc_terciles=windfall_mpcs,
+        windfall_mpc_counts=windfall_counts,
+    )
+
+
+def _parallel_non_llm_worker(
+    args_tuple: Tuple[Dict[str, Any], int, bool, Optional[str]]
+) -> EconomySeedClusterMetrics:
+    raw_cfg, seed, eval_mpc, out_dir = args_tuple
+    cfg = SimulationConfig(**raw_cfg)
+    return execute_single_economy_seed(
+        cell_cfg=cfg,
+        economy_seed=seed,
+        llm_controller=None,
+        eval_windfall_mpc=eval_mpc,
+        output_dir=out_dir,
+    )
+
+
+# ============================================================================
+# 3. CLI ENTRYPOINT & MASTER ABLATION ORCHESTRATOR
+# ============================================================================
+
+def _resolve_git_sha() -> str:
+    try:
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+            or "unknown"
+        )
+    except Exception:
+        return "unknown"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Neuropolis Thesis-Grade Benchmark & Ablation Runner"
+        description="Neuropolis v2: 2^3 Factorial Ablation & Multi-Seed Clustered Evaluation Runner"
     )
     parser.add_argument(
         "--config",
         type=str,
         default="configs/mvp_config.yaml",
-        help="Path to YAML experiment configuration",
+        help="Path to SimulationConfig YAML file.",
     )
     parser.add_argument(
-        "--profile",
+        "--cells",
         type=str,
-        default="laptop",
-        choices=["laptop", "kaggle", "kaggle_qwen"],
-        help="Hardware preset: laptop (Qwen2.5-3B), kaggle (Llama-3.1-8B), kaggle_qwen (Qwen2.5-7B)",
+        default="BASE_ZERO_INTELLIGENCE,BASE_CLOSED_FORM",
+        help=(
+            "Comma-separated cell IDs to execute, or 'ALL' (all 8 factorial cells + 4 controls), "
+            "or 'FACTORIAL_8' (C000..C111), or 'BASELINES' (ZI + Closed-Form)."
+        ),
     )
     parser.add_argument(
-        "--regime",
-        type=str,
-        default="crisis",
-        choices=["crisis", "normal"],
-        help="Macro regime: crisis (shock active) or normal (zero-shock baseline)",
+        "--seeds",
+        type=int,
+        default=30,
+        help="Number of independent economy seeds M (M >= 30 required for confirmatory power).",
     )
     parser.add_argument(
-        "--scale",
-        type=str,
-        default=None,
-        choices=["mvp_6", "dev", "main", "scale"],
-        help="Population scale: mvp_6 (N=6), dev (N=12), main (N=24), scale (N=48)",
+        "--allow-dev-seeds",
+        action="store_true",
+        help="Permit M < 30 for rapid local debugging (stamps output as DEV_UNDERPOWERED).",
     )
     parser.add_argument(
-        "--ticks",
+        "--num-agents",
         type=int,
         default=None,
-        help="Override total simulation ticks",
+        help="Override population size N per economy.",
     )
     parser.add_argument(
-        "--seed",
+        "--active-ticks",
         type=int,
         default=None,
-        help="Override master random seed",
+        help="Override post-burn-in active ticks per economy.",
     )
     parser.add_argument(
-        "--decision-mode",
-        type=str,
+        "--burn-in-ticks",
+        type=int,
         default=None,
-        choices=["LLM_AUTONOMOUS", "RULE_ONLY", "ZERO_INTELLIGENCE"],
-        help="Policy mode: LLM_AUTONOMOUS, RULE_ONLY, or ZERO_INTELLIGENCE",
+        help="Override burn-in ticks per economy.",
     )
     parser.add_argument(
-        "--channel",
-        type=str,
-        default=None,
-        choices=["NONE", "TEXT_ONLY", "STEER_ONLY", "TEXT_AND_STEER", "CUE_CONFLICT"],
-        help="State delivery channel (C0..C4)",
+        "--workers",
+        type=int,
+        default=4,
+        help="Parallel CPU workers for non-LLM baseline cells (ZI / Closed-Form).",
     )
     parser.add_argument(
-        "--steering-method",
-        type=str,
-        default=None,
-        choices=[
-            "NONE",
-            "PLACEBO_RANDOM",
-            "SHUFFLED_STATE",
-            "WRONG_SPAN",
-            "REVERSED_SIGN",
-            "PASTA",
-            "ACTADD_CAA",
-            "OUR_COUPLED_STEER",
-        ],
-        help="Active steering intervention or control",
-    )
-    parser.add_argument(
-        "--scope",
-        type=str,
-        default=None,
-        choices=["prefill_only", "prefill_and_decode"],
-        help="Steering hook scope (D4 factor)",
-    )
-    parser.add_argument(
-        "--alpha",
-        type=float,
-        default=None,
-        help="Override additive pre-softmax logit bias dose alpha",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=None,
-        help="Override decoding temperature (0.85 distributional, 0.0 deterministic)",
-    )
-    parser.add_argument(
-        "--tms-mode",
-        type=str,
-        default=None,
-        choices=[
-            "OFF",
-            "ENTROPY_TRIGGER",
-            "RANDOM_TRIGGER",
-            "ALWAYS_ASK",
-            "ORACLE_TRIGGER",
-        ],
-        help="Epistemic routing condition",
-    )
-    parser.add_argument(
-        "--omega",
-        type=str,
-        default=None,
-        help="Comma-separated Orthogonal Clamping Vector Omega in {0,1}^4",
-    )
-    parser.add_argument(
-        "--crisis",
-        type=str,
-        default=None,
-        choices=[
-            "NONE",
-            "STAGFLATION_SUBSISTENCE_SHOCK",
-            "ASYMMETRIC_UNEMPLOYMENT_SHOCK",
-            "ASSET_VALUATION_CRASH",
-            "LIQUIDITY_CREDIT_CRUNCH",
-        ],
-        help="Override active macroeconomic crisis shock scenario",
-    )
-    parser.add_argument(
-        "--db-path",
-        type=str,
-        default="results/world_state.sqlite",
-        help="Path to SQLite world state database (untracked in results/)",
-    )
-    parser.add_argument(
-        "--mock-brain",
+        "--skip-windfall-mpc",
         action="store_true",
-        help="Run in RULE_ONLY baseline mode without loading LLM weights",
+        help="Skip the paired exogenous windfall MPC shadow probe.",
     )
     parser.add_argument(
-        "--download-only",
+        "--save-turn-logs",
         action="store_true",
-        help="Resumably download and verify model weights locally for the selected profile, then exit",
+        help="Write per-turn JSONL audit logs for every seed (disabled by default for speed).",
     )
     parser.add_argument(
-        "--no-need-attn",
-        action="store_true",
-        help="Disable H1 urgent-need-gated attention & option weighting (ablation control)",
-    )
-    parser.add_argument(
-        "--need-gain",
-        type=float,
-        default=None,
-        help="Override H1 need_logit_gain (default 2.40)",
-    )
-    parser.add_argument(
-        "--pg-mult",
-        type=float,
-        default=None,
-        help="Override H3 scale-invariant Public Goods multiplier (default 1.60)",
-    )
-    parser.add_argument(
-        "--obligation-mult",
-        type=float,
-        default=None,
-        help="Override H3 main-scale periodic obligation multiplier (default 1.25)",
-    )
-    parser.add_argument(
-        "--health-hazard",
-        type=float,
-        default=None,
-        help="Override H3 annual health/medical shock hazard rate (default 0.23)",
+        "--output-dir",
+        type=str,
+        default="results/neuropolis_v2",
+        help="Untracked output directory for manifests and statistical reports.",
     )
     return parser.parse_args()
 
-def run_simulation() -> List[FourDimTickTelemetry]:
+
+def _print_report_summary(
+    cell_reports: Dict[str, Dict[str, Any]],
+    factorial_analysis: Optional[Dict[str, Any]],
+    paired_contrasts: Dict[str, Any],
+    m_seeds: int,
+) -> None:
+    power_banner = (
+        f"CONFIRMATORY POWER ADEQUATE (M={m_seeds} >= 30)"
+        if m_seeds >= 30
+        else f"DEV_UNDERPOWERED (M={m_seeds} < 30 — EXPLORATORY ONLY)"
+    )
+    print("\n" + "=" * 114)
+    print(f" NEUROPOLIS v2 — CLUSTERED EVALUATION SUMMARY [{power_banner}]")
+    print("=" * 114)
+    print(
+        f"{'Cell ID':<24} | {'M':>3} | {'Valid%':>6} | {'Surv%':>6} | {'Freeze%':>7} | "
+        f"{'Barg W1 (95% CI)':>23} | {'HtM JSD':>7} | {'W-HtM%':>6} | {'Max SFC Err':>11}"
+    )
+    print("-" * 114)
+    for cid, rep in cell_reports.items():
+        w1_info = rep["bargaining_w1"]
+        w1_str = f"{w1_info['debiased_w1']:.4f} [{w1_info['ci_95'][0]:.3f},{w1_info['ci_95'][1]:.3f}]"
+        jsd_val = rep["htm_miller_madow_jsd"]["debiased_jsd"]
+        whtm_bin = next(
+            (b for b in rep["htm_per_bin_tost"] if b["bin_label"] == "Wealthy_HtM"),
+            None,
+        )
+        whtm_mean = whtm_bin["sim_cluster_mean"] * 100.0 if whtm_bin else 0.0
+        print(
+            f"{cid:<24} | {rep['n_economy_seeds_m']:>3d} | "
+            f"{rep['json_valid_rate']*100:>5.1f}% | {rep['survival_rate']*100:>5.1f}% | "
+            f"{rep['market_freeze_rate']*100:>6.1f}% | {w1_str:>23} | "
+            f"{jsd_val:>7.4f} | {whtm_mean:>5.1f}% | {rep['max_sfc_conservation_error']:>11.2e}"
+        )
+
+    print("\n" + "-" * 114)
+    print(" PER-BIN TOST (INTERSECTION-UNION TEST, HOLM-BONFERRONI ADJUSTED) — TWO-ASSET HtM & BARGAINING")
+    print("-" * 114)
+    for cid, rep in cell_reports.items():
+        equiv_barg = sum(
+            1 for b in rep["bargaining_per_bin_tost"] if b["statistically_equivalent"]
+        )
+        equiv_htm = sum(
+            1 for b in rep["htm_per_bin_tost"] if b["statistically_equivalent"]
+        )
+        equiv_mpc = sum(
+            1 for b in rep["windfall_mpc_per_bin_tost"] if b["statistically_equivalent"]
+        )
+        print(
+            f"  {cid:<24}: Bargaining TOST Equiv Bins = {equiv_barg}/4 | "
+            f"HtM TOST Equiv Bins = {equiv_htm}/3 | Windfall MPC TOST Equiv Bins = {equiv_mpc}/3"
+        )
+
+    if paired_contrasts:
+        print("\n" + "-" * 114)
+        print(" COMMON RANDOM NUMBERS (CRN) PAIRED CLUSTER CONTRASTS (Bargaining W1 Difference; Negative = Improvement)")
+        print("-" * 114)
+        for label, c_res in paired_contrasts.items():
+            print(
+                f"  {label:<44}: diff={c_res['paired_mean_diff']:+.4f} "
+                f"(SE={c_res['paired_clustered_se']:.4f}, 95% CI={c_res['ci_95']}, "
+                f"p={c_res['p_value_two_sided']:.4f})"
+            )
+
+    if factorial_analysis and factorial_analysis.get("complete_2x2x2_lattice"):
+        print("\n" + "-" * 114)
+        print(" 2^3 FACTORIAL MAIN EFFECTS, INTERACTIONS & EXACT SHAPLEY CREDITS (on -Bargaining_W1)")
+        print("-" * 114)
+        print(f"  Main Effects:   {factorial_analysis['main_effects']}")
+        print(f"  Interactions:   {factorial_analysis['interactions']}")
+        print(f"  Exact Shapley:  {factorial_analysis['exact_shapley_values']}")
+    print("=" * 114 + "\n")
+
+
+def main() -> None:
+    t_run_start = time.time()
     args = parse_args()
+
+    if args.seeds < 30 and not args.allow_dev_seeds:
+        raise ValueError(
+            f"Confirmatory clustered inference requires --seeds >= 30 (got {args.seeds}). "
+            f"Pass --allow-dev-seeds explicitly for exploratory local debugging."
+        )
+
     with open(args.config, "r", encoding="utf-8") as f:
         raw_cfg = yaml.safe_load(f)
-    config = SimulationConfig(**raw_cfg)
+    base_cfg = SimulationConfig(**raw_cfg)
 
-    # Apply zero-edit hardware profiles before model loading
-    if args.profile == "kaggle":
-        os.environ.setdefault("HF_HOME", "/tmp/hf_cache")
-        default_llama = (
-            "meta-llama/Llama-3.1-8B-Instruct"
-            if os.environ.get("HF_TOKEN")
-            else "unsloth/Meta-Llama-3.1-8B-Instruct"
-        )
-        m_id = os.environ.get("NEUROPOLIS_MODEL_ID", default_llama)
-        slug = m_id.replace("/", "--")
-        config.model_spec.model_id = m_id
-        config.model_spec.local_dir = f"/tmp/models/{slug}"
-        config.model_spec.precision = "float16"
-        config.model_spec.load_in_4bit = True
-    elif args.profile == "kaggle_qwen":
-        os.environ.setdefault("HF_HOME", "/tmp/hf_cache")
-        config.model_spec.model_id = "Qwen/Qwen2.5-7B-Instruct"
-        config.model_spec.local_dir = "/tmp/models/Qwen--Qwen2.5-7B-Instruct"
-        config.model_spec.precision = "float16"
-        config.model_spec.load_in_4bit = True
+    if args.num_agents is not None:
+        base_cfg.num_agents = int(args.num_agents)
+    if args.active_ticks is not None:
+        base_cfg.active_ticks = int(args.active_ticks)
+    if args.burn_in_ticks is not None:
+        base_cfg.burn_in_ticks = int(args.burn_in_ticks)
 
-    if args.scale is not None:
-        config.population_scale = args.scale  # type: ignore[assignment]
-    if args.ticks is not None:
-        config.total_ticks = int(args.ticks)
-    if args.seed is not None:
-        config.random_seed = int(args.seed)
-    if args.mock_brain:
-        config.experimental_design.decision_mode = "RULE_ONLY"
-    if args.decision_mode is not None:
-        config.experimental_design.decision_mode = args.decision_mode  # type: ignore[assignment]
-    if args.channel is not None:
-        config.experimental_design.state_channel = args.channel  # type: ignore[assignment]
-    if args.steering_method is not None:
-        config.experimental_design.steering_method = args.steering_method  # type: ignore[assignment]
-        config.steering_spec.mode = args.steering_method
-    if args.scope is not None:
-        config.steering_spec.scope = args.scope  # type: ignore[assignment]
-    if args.alpha is not None:
-        config.steering_spec.alpha_dose = float(args.alpha)
-    if args.no_need_attn:
-        config.steering_spec.enable_need_gated_attention = False
-    if args.need_gain is not None:
-        config.steering_spec.need_logit_gain = float(args.need_gain)
-    if args.pg_mult is not None:
-        config.hank_and_crisis_spec.pg_scale_invariant_multiplier = float(args.pg_mult)
-    if args.obligation_mult is not None:
-        config.hank_and_crisis_spec.main_scale_obligation_multiplier = float(args.obligation_mult)
-    if args.health_hazard is not None:
-        config.hank_and_crisis_spec.health_shock_annual_hazard = float(args.health_hazard)
-    if args.temperature is not None:
-        config.model_spec.temperature = float(args.temperature)
-    if args.tms_mode is not None:
-        config.experimental_design.tms_mode = args.tms_mode  # type: ignore[assignment]
-    if args.omega is not None:
-        parts = [int(x.strip()) for x in args.omega.split(",")]
-        if len(parts) != 4:
-            raise ValueError("--omega must specify 4 comma-separated bits: e.g. 1,1,1,1")
-        config.orthogonal_clamping.omega_d1_scarcity_and_hank = bool(parts[0])
-        config.orthogonal_clamping.omega_d2_trust_and_parochialism = bool(parts[1])
-        config.orthogonal_clamping.omega_d3_contagion_and_polarization = bool(parts[2])
-        config.orthogonal_clamping.omega_d4_fiscal_and_legal_state = bool(parts[3])
-    if args.crisis is not None:
-        config.hank_and_crisis_spec.active_crisis = args.crisis  # type: ignore[assignment]
-
-    config.hank_and_crisis_spec.macro_regime_mode = args.regime  # type: ignore[assignment]
-    if args.regime == "normal":
-        config.hank_and_crisis_spec.active_crisis = "NONE"
-        config.hank_and_crisis_spec.crisis_severity_sigma = 0.0
-        config.hank_and_crisis_spec.crisis_start_tick = config.total_ticks + 999
-
-    seed_bundle = SeedBundle(config.random_seed)
-    config.agents = synthesize_parametric_population(config, seed_bundle)
-
-    os.makedirs(os.path.dirname(args.db_path) or ".", exist_ok=True)
-    for stale_path in (
-        args.db_path,
-        f"{args.db_path}-wal",
-        f"{args.db_path}-shm",
-    ):
-        if os.path.exists(stale_path):
-            os.remove(stale_path)
-
-    game_master = AccountingAndLawEngine(db_path=args.db_path, config=config)
-    market_engine = BilateralMarketEngine(config=config, game_master=game_master)
-    memory_engine = MultiTierScopedMemory(db_path=args.db_path, config=config)
-    appraisal_engine = CognitiveAppraisalAndToM(
-        config=config, game_master=game_master, memory_engine=memory_engine
-    )
-    tms_router = EntropyTMSRouter(config=config, db_path=args.db_path)
-
-    if config.experimental_design.decision_mode in ("RULE_ONLY", "ZERO_INTELLIGENCE"):
-        steering_lab = AttentionSteeringLab(config=config.steering_spec)
-        brain = DualBackendInferenceBrain(
-            config=config,
-            model=None,
-            tokenizer=None,
-            steering_lab=steering_lab,
-            tms_router=tms_router,
-            seed_bundle=seed_bundle,
-        )
+    all_specs = build_full_factorial_and_control_specs()
+    cells_arg = args.cells.strip().upper()
+    if cells_arg == "ALL":
+        selected_cell_ids = [
+            "BASE_ZERO_INTELLIGENCE",
+            "BASE_CLOSED_FORM",
+            "C000",
+            "C100",
+            "C010",
+            "C001",
+            "C110",
+            "C101",
+            "C011",
+            "C111",
+            "CTRL_PLACEBO_VEC",
+            "CTRL_SHUFFLED_LAMBDA",
+        ]
+    elif cells_arg == "FACTORIAL_8":
+        selected_cell_ids = [
+            "C000",
+            "C100",
+            "C010",
+            "C001",
+            "C110",
+            "C101",
+            "C011",
+            "C111",
+        ]
+    elif cells_arg == "BASELINES":
+        selected_cell_ids = ["BASE_ZERO_INTELLIGENCE", "BASE_CLOSED_FORM"]
     else:
-        vault = ModelVaultManager(config=config)
-        model, tokenizer, calibration_bundle = vault.mount_model_and_calibrate()
-        steering_lab = AttentionSteeringLab(
-            config=config.steering_spec, calibration=calibration_bundle
-        )
-        brain = DualBackendInferenceBrain(
-            config=config,
-            model=model,
-            tokenizer=tokenizer,
-            steering_lab=steering_lab,
-            tms_router=tms_router,
-            seed_bundle=seed_bundle,
-        )
+        selected_cell_ids = [c.strip() for c in args.cells.split(",") if c.strip()]
+        for cid in selected_cell_ids:
+            if cid not in all_specs:
+                raise ValueError(
+                    f"Unknown cell_id '{cid}'. Valid options: {sorted(all_specs.keys())}"
+                )
 
-    m_tag = config.model_spec.model_id.split("/")[-1].replace(".", "p")
-    na_tag = "na1" if config.steering_spec.enable_need_gated_attention else "na0"
-    run_id = (
-        f"run_s{config.random_seed}_{m_tag}_{config.population_scale}_"
-        f"{config.hank_and_crisis_spec.macro_regime_mode}_"
-        f"{config.experimental_design.decision_mode}_"
-        f"{config.experimental_design.state_channel}_"
-        f"{config.experimental_design.steering_method}_a{config.steering_spec.alpha_dose:.1f}_{na_tag}"
+    seed_list = [base_cfg.master_seed + m for m in range(args.seeds)]
+    os.makedirs(args.output_dir, exist_ok=True)
+    turn_log_dir = (
+        os.path.join(args.output_dir, "turn_logs") if args.save_turn_logs else None
     )
 
-    orchestrator = TurnOrchestrator(
-        config=config,
-        game_master=game_master,
-        market_engine=market_engine,
-        memory_engine=memory_engine,
-        appraisal_engine=appraisal_engine,
-        tms_router=tms_router,
-        brain=brain,
-        seed_bundle=seed_bundle,
-        run_id=run_id,
+    # Lazily mount the white-box LLM & disjoint RepE artifacts ONCE if any LLM cell is requested
+    needs_llm = any(
+        all_specs[cid].policy_mode == PolicyMode.LLM_AGENT
+        for cid in selected_cell_ids
     )
-    metrics_engine = FourDimensionalMetricsEngine(
-        db_path=args.db_path,
-        config=config,
-        game_master=game_master,
-        memory_engine=memory_engine,
-    )
-    monitor = RealTimeLiveMonitor(config=config, seed_bundle=seed_bundle)
+    shared_model = None
+    shared_tokenizer = None
+    shared_repe_artifacts = None
 
-    history: List[FourDimTickTelemetry] = []
-    agent_ids = [a.agent_id for a in config.agents]
+    if needs_llm:
+        from src.brain.inference_brain import (
+            TwoStageRepEController,
+            WhiteBoxModelLoader,
+        )
+        from src.brain.repe_manager import RepEManager
 
-    for tick in range(1, config.total_ticks + 1):
-        macro_state = game_master.step_crisis_regime(tick=tick)
-        monitor.log_tick_header(tick=tick, macro=macro_state)
-
-        eff_trust_matrix = memory_engine.get_effective_trust_matrix()
-        pairs = market_engine.match_conflict_free_pairs(
-            tick=tick,
-            agent_ids=agent_ids,
-            effective_trust_matrix=eff_trust_matrix,
+        print(
+            f"[BOOT] Mounting White-Box model '{base_cfg.model.model_id}' "
+            f"(4bit={base_cfg.model.load_in_4bit}, attn={base_cfg.model.attn_implementation})..."
+        )
+        shared_model, shared_tokenizer = WhiteBoxModelLoader.load_model_and_tokenizer(
+            base_cfg.model
+        )
+        boot_repe = RepEManager(config=base_cfg.repe, seed=base_cfg.master_seed)
+        shared_repe_artifacts = boot_repe.load_or_extract_artifacts(
+            model=shared_model,
+            tokenizer=shared_tokenizer,
+            model_id=base_cfg.model.model_id,
+        )
+        print(
+            f"[BOOT] Disjoint RepE artifacts ready (Layer={shared_repe_artifacts.target_layer}, "
+            f"Probe Test AUROC={shared_repe_artifacts.probe_test_auroc:.4f}, "
+            f"Perm p={shared_repe_artifacts.probe_permutation_p:.4f}, "
+            f"Cos(w, v)={shared_repe_artifacts.probe_steering_cosine:.4f})."
         )
 
-        for p_idx, (init_id, resp_id) in enumerate(pairs, start=1):
-            outcome = orchestrator.execute_dyadic_pair_interaction(
-                tick=tick,
-                initiator_id=init_id,
-                responder_id=resp_id,
+    # Execute all requested cells across M independent economy seeds
+    clusters_by_cell: Dict[str, List[EconomySeedClusterMetrics]] = {}
+    for cid in selected_cell_ids:
+        cell_spec = all_specs[cid]
+        cell_cfg = base_cfg.model_copy(
+            deep=True, update={"factorial_cell": cell_spec}
+        )
+        # Re-validate to synchronize deliberation/memory/repe switches with cell_spec
+        cell_cfg = SimulationConfig(**cell_cfg.model_dump())
+
+        print(
+            f"\n[EXEC] Cell {cid:<24} | Policy={cell_cfg.policy_mode.value} | "
+            f"A(Delib)={cell_cfg.deliberation.enabled} B(MemFric)={cell_cfg.memory_friction.enabled} "
+            f"C(RepE)={cell_cfg.repe.mode.value} | Seeds M={len(seed_list)}"
+        )
+
+        if cell_cfg.policy_mode != PolicyMode.LLM_AGENT and args.workers > 1:
+            # Parallel execution over independent economy seeds for non-LLM baselines
+            tasks = [
+                (
+                    cell_cfg.model_dump(),
+                    s_val,
+                    not args.skip_windfall_mpc,
+                    turn_log_dir,
+                )
+                for s_val in seed_list
+            ]
+            seed_results: List[EconomySeedClusterMetrics] = []
+            with ProcessPoolExecutor(max_workers=args.workers) as pool:
+                futures = [
+                    pool.submit(_parallel_non_llm_worker, t_arg) for t_arg in tasks
+                ]
+                for fut in as_completed(futures):
+                    seed_results.append(fut.result())
+            seed_results.sort(key=lambda r: r.economy_seed)
+            clusters_by_cell[cid] = seed_results
+        else:
+            # Memory-safe sequential execution on GPU sharing frozen weights & RepE artifacts
+            from src.brain.inference_brain import TwoStageRepEController
+            from src.brain.repe_manager import RepEManager
+
+            seed_results = []
+            for s_idx, s_val in enumerate(seed_list, start=1):
+                if cell_cfg.policy_mode == PolicyMode.LLM_AGENT:
+                    repe_mgr = RepEManager(
+                        config=cell_cfg.repe,
+                        artifacts=shared_repe_artifacts,
+                        seed=s_val,
+                    )
+                    controller = TwoStageRepEController(
+                        config=cell_cfg,
+                        model=shared_model,
+                        tokenizer=shared_tokenizer,
+                        repe_manager=repe_mgr,
+                        economy_seed=s_val,
+                    )
+                else:
+                    controller = None
+
+                res = execute_single_economy_seed(
+                    cell_cfg=cell_cfg,
+                    economy_seed=s_val,
+                    llm_controller=controller,
+                    eval_windfall_mpc=not args.skip_windfall_mpc,
+                    output_dir=turn_log_dir,
+                )
+                seed_results.append(res)
+                if s_idx % 5 == 0 or s_idx == len(seed_list):
+                    print(
+                        f"       Completed {s_idx}/{len(seed_list)} seeds "
+                        f"(last seed={s_val}, Valid={res.json_valid_rate:.1%}, "
+                        f"Freeze={res.consumable_market_freeze_rate:.1%}, "
+                        f"SFC_Err={res.max_sfc_conservation_error:.2e})"
+                    )
+            clusters_by_cell[cid] = seed_results
+
+    # Extract empirical Zero-Intelligence null floor if ZI baseline was run
+    zi_barg_floor: Optional[float] = None
+    zi_mpc_floor: Optional[float] = None
+    if "BASE_ZERO_INTELLIGENCE" in clusters_by_cell:
+        zi_rep = EconomyMetricsCollector.aggregate_cell_clusters(
+            cell_id="BASE_ZERO_INTELLIGENCE",
+            seed_clusters=clusters_by_cell["BASE_ZERO_INTELLIGENCE"],
+            config=base_cfg,
+        )
+        zi_barg_floor = float(zi_rep["bargaining_w1"]["debiased_w1"])
+        if zi_rep["windfall_mpc_w1"] is not None:
+            zi_mpc_floor = float(zi_rep["windfall_mpc_w1"]["debiased_w1"])
+
+    # Aggregate clustered reports for every cell
+    cell_reports: Dict[str, Dict[str, Any]] = {}
+    for cid in selected_cell_ids:
+        cell_reports[cid] = EconomyMetricsCollector.aggregate_cell_clusters(
+            cell_id=cid,
+            seed_clusters=clusters_by_cell[cid],
+            config=base_cfg,
+            zi_bargaining_floor_w1=zi_barg_floor,
+            zi_mpc_floor_w1=zi_mpc_floor,
+        )
+
+    # Compute Common Random Numbers (CRN) Paired Cluster Contrasts
+    paired_contrasts: Dict[str, Any] = {}
+    contrast_pairs = [
+        ("C111_vs_C000_VanillaLLM", "C111", "C000"),
+        ("C111_vs_CTRL_PLACEBO_VEC", "C111", "CTRL_PLACEBO_VEC"),
+        ("C111_vs_CTRL_SHUFFLED_LAMBDA", "C111", "CTRL_SHUFFLED_LAMBDA"),
+        ("C001_RepEOnly_vs_C000_Vanilla", "C001", "C000"),
+        ("C111_vs_BASE_ZERO_INTELLIGENCE", "C111", "BASE_ZERO_INTELLIGENCE"),
+        ("BASE_CLOSED_FORM_vs_BASE_ZERO_INTELLIGENCE", "BASE_CLOSED_FORM", "BASE_ZERO_INTELLIGENCE"),
+    ]
+    for label, cell_a, cell_b in contrast_pairs:
+        if cell_a in cell_reports and cell_b in cell_reports:
+            paired_contrasts[label] = clustered_paired_contrast(
+                cell_a_by_seed=cell_reports[cell_a]["seed_level_bargaining_w1"],
+                cell_b_by_seed=cell_reports[cell_b]["seed_level_bargaining_w1"],
+                n_resamples_b=base_cfg.stats.bootstrap_resamples_b,
+                seed=base_cfg.master_seed,
             )
-            monitor.log_dyadic_interaction(pair_idx=p_idx, outcome=outcome)
 
-        upkeep_report = game_master.execute_end_of_tick_upkeep_and_fiscal_state(
-            tick=tick,
-            pg_contributions=orchestrator.tick_pg_contributions,
-            tax_evasion_intents=orchestrator.tick_tax_evasion_intents,
-        )
-        orchestrator.tick_pg_contributions.clear()
-        orchestrator.tick_tax_evasion_intents.clear()
-
-        monitor.log_upkeep_and_sanctions(tick=tick, upkeep_report=upkeep_report)
-
-        tick_telemetry = metrics_engine.compute_and_persist_tick_telemetry(
-            tick=tick,
-            upkeep_report=upkeep_report,
-            cumulative_tms_queries=orchestrator.cumulative_tms_queries,
-            successful_tms_routes=orchestrator.successful_tms_routes,
-            llm_valid_rate=orchestrator.get_llm_valid_rate(),
-            abstain_rate=orchestrator.get_abstain_rate(),
-            rule_fallback_rate=orchestrator.get_rule_fallback_rate(),
-            tms_entropy_auroc=tms_router.compute_entropy_ignorance_auroc(),
-        )
-        monitor.log_four_dim_tick_dashboard(tick_telemetry)
-        history.append(tick_telemetry)
-
-    scorecard = metrics_engine.compute_empirical_validation_scorecard(history)
-    macro_summary = metrics_engine.compute_macro_metrics(history)
-
-    monitor.write_run_manifest_and_turn_logs(
-        run_id=run_id,
-        turn_logs=orchestrator.turn_log_rows,
-        llm_valid_rate=orchestrator.get_llm_valid_rate(),
-        abstain_rate=orchestrator.get_abstain_rate(),
-        rule_fallback_rate=orchestrator.get_rule_fallback_rate(),
-        manifest_path=f"results/manifest_{run_id}.json",
-        turn_log_path=f"results/turn_logs_{run_id}.jsonl",
-        scorecard_summary=scorecard,
-        macro_summary=macro_summary,
+    # Compute 2^3 Factorial Effects & Exact Shapley Attribution if all 8 cells ran
+    bits_map: Dict[Tuple[int, int, int], float] = {}
+    for a in (0, 1):
+        for b in (0, 1):
+            for c in (0, 1):
+                cid = f"C{a}{b}{c}"
+                if cid in cell_reports:
+                    # Negate W1 distance so positive Shapley / main effects indicate improvement
+                    bits_map[(a, b, c)] = -float(
+                        cell_reports[cid]["bargaining_w1"]["debiased_w1"]
+                    )
+    factorial_analysis = (
+        compute_2x2x2_factorial_effects_and_shapley(bits_map)
+        if len(bits_map) == 8
+        else None
     )
-    monitor.print_final_empirical_scorecard(history=history, scorecard=scorecard)
-    return history
+
+    # Persist Provenance Manifest & Full Statistical Evaluation Report
+    cfg_sha = hashlib.sha256(base_cfg.model_dump_json().encode("utf-8")).hexdigest()[:16]
+    manifest = {
+        "experiment_id": base_cfg.experiment_id,
+        "git_commit_sha": _resolve_git_sha(),
+        "config_sha256": cfg_sha,
+        "selected_cells": selected_cell_ids,
+        "n_economy_seeds_m": args.seeds,
+        "power_status": (
+            "CONFIRMATORY_ADEQUATE" if args.seeds >= 30 else "DEV_UNDERPOWERED"
+        ),
+        "num_agents_n": base_cfg.num_agents,
+        "burn_in_ticks": base_cfg.burn_in_ticks,
+        "active_ticks": base_cfg.active_ticks,
+        "model_id": base_cfg.model.model_id,
+        "wall_clock_seconds": round(time.time() - t_run_start, 2),
+        "probe_artifacts_metadata": (
+            {
+                "target_layer": shared_repe_artifacts.target_layer,
+                "probe_test_auroc": shared_repe_artifacts.probe_test_auroc,
+                "probe_permutation_p": shared_repe_artifacts.probe_permutation_p,
+                "probe_steering_cosine": shared_repe_artifacts.probe_steering_cosine,
+            }
+            if shared_repe_artifacts is not None
+            else None
+        ),
+    }
+
+    with open(
+        os.path.join(args.output_dir, "manifest.json"), "w", encoding="utf-8"
+    ) as f:
+        json.dump(manifest, f, indent=2)
+
+    with open(
+        os.path.join(args.output_dir, "cluster_metrics.json"),
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(
+            {
+                cid: [dataclasses.asdict(sc) for sc in sc_list]
+                for cid, sc_list in clusters_by_cell.items()
+            },
+            f,
+            indent=2,
+        )
+
+    full_report = {
+        "manifest": manifest,
+        "cell_reports": cell_reports,
+        "paired_contrasts": paired_contrasts,
+        "factorial_2x2x2_analysis": factorial_analysis,
+    }
+    report_path = os.path.join(args.output_dir, "factorial_evaluation_report.json")
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(full_report, f, indent=2)
+
+    _print_report_summary(
+        cell_reports=cell_reports,
+        factorial_analysis=factorial_analysis,
+        paired_contrasts=paired_contrasts,
+        m_seeds=args.seeds,
+    )
+    print(f"[SAVED] Full evaluation report written to: {report_path}")
 
 
 if __name__ == "__main__":
-    run_simulation()
+    main()

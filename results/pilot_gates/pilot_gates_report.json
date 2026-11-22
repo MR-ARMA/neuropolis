@@ -1,0 +1,121 @@
+{
+  "mode": "TINY_CI_TEST",
+  "model_id": "Qwen/Qwen2.5-3B-Instruct",
+  "elapsed_seconds": 27.44,
+  "all_pilot_gates_passed": false,
+  "gate_1": {
+    "gate": "Gate_1_Probe_Transfer_And_Coupling",
+    "n_in_game_cots": 8,
+    "zero_shot_auroc_full_cot": 0.625,
+    "zero_shot_auroc_taxed_cot": 0.625,
+    "lambda_full_mean_std": [
+      0.5002,
+      0.0
+    ],
+    "lambda_taxed_mean_std": [
+      0.5005,
+      0.0001
+    ],
+    "lambda_mean_abs_shift": 0.0002,
+    "lambda_w1_shift": 0.0002,
+    "pearson_r_cot_length_vs_lambda": -0.9187,
+    "passed_transfer": false,
+    "passed_coupling": false,
+    "passed": false
+  },
+  "gate_2": {
+    "gate": "Gate_2_KV_Faithfulness_And_Dose_Response",
+    "gamma_0_bit_identity_rate": 1.0,
+    "gamma_0_max_logit_diff": 0.0,
+    "spearman_rho_gamma_vs_kl": 1.0,
+    "overall_json_valid_rate": 1.0,
+    "dose_sweep": [
+      {
+        "gamma": 0.0,
+        "mean_first_token_kl": 0.0,
+        "json_valid_rate": 1.0,
+        "output_change_rate": 0.0,
+        "mean_relative_norm_ratio": 0.0
+      },
+      {
+        "gamma": 0.25,
+        "mean_first_token_kl": 0.000531,
+        "json_valid_rate": 1.0,
+        "output_change_rate": 0.0,
+        "mean_relative_norm_ratio": 0.25
+      },
+      {
+        "gamma": 0.5,
+        "mean_first_token_kl": 0.000531,
+        "json_valid_rate": 1.0,
+        "output_change_rate": 0.0,
+        "mean_relative_norm_ratio": 0.25
+      },
+      {
+        "gamma": 0.75,
+        "mean_first_token_kl": 0.000531,
+        "json_valid_rate": 1.0,
+        "output_change_rate": 0.0,
+        "mean_relative_norm_ratio": 0.25
+      },
+      {
+        "gamma": 1.0,
+        "mean_first_token_kl": 0.000531,
+        "json_valid_rate": 1.0,
+        "output_change_rate": 0.0,
+        "mean_relative_norm_ratio": 0.25
+      }
+    ],
+    "passed_bit_identity": true,
+    "passed_monotonicity": true,
+    "passed_json_validity_ge_98pct": true,
+    "passed": true
+  },
+  "gate_3": {
+    "gate": "Gate_3_Deliberation_Sign",
+    "full_cot": {
+      "action_counts": {
+        "CONSUME_AND_HOLD": 6
+      },
+      "myopic_rate": 0.0,
+      "action_entropy": 0.0,
+      "json_valid_rate": 1.0
+    },
+    "starved_cot": {
+      "action_counts": {
+        "CONSUME_AND_HOLD": 6
+      },
+      "myopic_rate": 0.0,
+      "action_entropy": 0.0,
+      "json_valid_rate": 1.0
+    },
+    "myopic_rate_delta_starved_minus_full": 0.0,
+    "entropy_delta_starved_minus_full": 0.0,
+    "sign_diagnosis": "NEUTRAL_NO_SHIFT",
+    "json_validity_intact": true,
+    "passed": true
+  },
+  "gate_4": {
+    "gate": "Gate_4_Baseline_CDA_Liquidity",
+    "zero_intelligence": {
+      "max_sfc_error": 0.0,
+      "total_fills": 49,
+      "market_freeze_rate": 0.0667,
+      "survival_rate": 0.6667,
+      "mean_bid_ask_spread": 6.53,
+      "sfc_exact_zero": true,
+      "liquidity_healthy": false
+    },
+    "closed_form": {
+      "max_sfc_error": 0.0,
+      "total_fills": 91,
+      "market_freeze_rate": 0.0,
+      "survival_rate": 0.8333,
+      "mean_bid_ask_spread": 0.1536,
+      "sfc_exact_zero": true,
+      "liquidity_healthy": true
+    },
+    "unsteered_llm_c000": null,
+    "passed": false
+  }
+}

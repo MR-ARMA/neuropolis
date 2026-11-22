@@ -1,1044 +1,393 @@
 from __future__ import annotations
 
 import gc
-import json
-import math
+import hashlib
 import os
-import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 import torch
-import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from src.brain.repe_manager import DisjointRepEArtifacts, RepEManager
 from src.core.contracts import (
-    AgentTurnOutput,
-    CompiledPromptPacket,
-    EconomicActionIntent,
-    EndogenousStatePacket,
-    RawGenerationResult,
+    AgentActionType,
+    ModelRuntimeConfig,
+    ProbeGateMeasurement,
     SimulationConfig,
-    normalize_item_id,
+    Stage2ActionPayload,
 )
-from src.core.seed_bundle import SeedBundle
-from src.steering.attention_lab import AttentionSteeringLab
-from src.steering.entropy_tms import EntropyTMSRouter
+from src.orchestration.turn_orchestrator import (
+    IsomorphicVocabulary,
+    TwoStageGenerationOutput,
+)
 
-# --- DYNAMIC THEORIES INJECTION ANCHOR ---
 
-
-def _resolve_floating_compute_dtype(model: Any) -> torch.dtype:
+class WhiteBoxModelLoader:
     """
-    Safely resolves the floating-point compute dtype on both standard models and
-    4-bit bitsandbytes quantized models (where linear weights are stored as uint8).
+    Hardware-Optimized White-Box Loader for Qwen-2.5 / Llama-3 / Mistral Instruct models.
+      - Supports 4-bit NF4 Double-Quant via `bitsandbytes` pinned to `cuda:0`
+        (e.g. Qwen2.5-3B-Instruct fits in ~2.2 GiB VRAM on an RTX 3050 4 GB GPU
+        with >1.1 GiB activation headroom and zero CPU offload bottlenecks).
+      - Supports native `bfloat16` / `float16` on 24 GB GPUs and `float32` on CPU CI.
+      - Strictly enforces `config.attn_implementation` as a single source of truth.
     """
-    emb = getattr(getattr(model, "model", model), "embed_tokens", None)
-    if emb is not None and hasattr(emb, "weight") and emb.weight.is_floating_point():
-        return emb.weight.dtype
-    for param in model.parameters():
-        if param.is_floating_point():
-            return param.dtype
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-        return torch.bfloat16
-    return torch.float16 if torch.cuda.is_available() else torch.float32
+
+    @staticmethod
+    def resolve_local_or_hub_path(model_cfg: ModelRuntimeConfig) -> str:
+        weights_sub = os.path.join(model_cfg.local_dir, "weights")
+        if os.path.isdir(weights_sub) and os.path.exists(
+            os.path.join(weights_sub, "config.json")
+        ):
+            return weights_sub
+        if os.path.isdir(model_cfg.local_dir) and os.path.exists(
+            os.path.join(model_cfg.local_dir, "config.json")
+        ):
+            return model_cfg.local_dir
+        return model_cfg.model_id
+
+    @classmethod
+    def load_model_and_tokenizer(
+        cls, model_cfg: ModelRuntimeConfig
+    ) -> Tuple[Any, Any]:
+        source = cls.resolve_local_or_hub_path(model_cfg)
+        has_cuda = torch.cuda.is_available()
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            source,
+            revision=model_cfg.revision if source == model_cfg.model_id else None,
+            trust_remote_code=True,
+        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+
+        if has_cuda:
+            torch.cuda.empty_cache()
+            if (
+                model_cfg.compute_dtype == "bfloat16"
+                and torch.cuda.is_bf16_supported()
+            ):
+                compute_dtype = torch.bfloat16
+            elif model_cfg.compute_dtype == "float32":
+                compute_dtype = torch.float32
+            else:
+                compute_dtype = torch.float16
+        else:
+            compute_dtype = torch.float32
+
+        load_kwargs: Dict[str, Any] = {
+            "attn_implementation": model_cfg.attn_implementation,
+            "low_cpu_mem_usage": True,
+            "trust_remote_code": True,
+        }
+        if source == model_cfg.model_id:
+            load_kwargs["revision"] = model_cfg.revision
+
+        if has_cuda and model_cfg.load_in_4bit:
+            from transformers import BitsAndBytesConfig
+
+            bnb_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type=model_cfg.bnb_4bit_quant_type,
+                bnb_4bit_use_double_quant=model_cfg.bnb_4bit_use_double_quant,
+                bnb_4bit_compute_dtype=compute_dtype,
+            )
+            load_kwargs["quantization_config"] = bnb_cfg
+            load_kwargs["device_map"] = {"": 0}
+        elif has_cuda:
+            load_kwargs["dtype"] = compute_dtype
+            load_kwargs["device_map"] = {"": 0}
+        else:
+            load_kwargs["dtype"] = torch.float32
+            load_kwargs["device_map"] = "cpu"
+
+        model = AutoModelForCausalLM.from_pretrained(source, **load_kwargs)
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad = False
+
+        # Single source of truth assertion for attention implementation
+        actual_impl = getattr(
+            model.config, "_attn_implementation", model_cfg.attn_implementation
+        )
+        assert actual_impl == model_cfg.attn_implementation, (
+            f"Attention backend mismatch: requested={model_cfg.attn_implementation}, actual={actual_impl}"
+        )
+        return (model, tokenizer)
 
 
-def _resolve_model_device(model: Any) -> torch.device:
-    emb = getattr(getattr(model, "model", model), "embed_tokens", None)
-    if emb is not None and hasattr(emb, "weight"):
-        return emb.weight.device
-    for param in model.parameters():
-        return param.device
-    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-
-class DualBackendInferenceBrain:
+class TwoStageRepEController:
     """
-    M2: Thesis-Grade White-Box Inference Brain with Single-Pass Logit-Scored
-    Categorical Decoding (Homo Silicus / EconAgent paradigm) and Contextual
-    Prior Calibration (Zhao et al. 2021 [VERIFY]).
-      - Zero hidden heuristic rules and zero hardcoded acceptance floors.
-      - Fully compatible with 4-bit NF4 bitsandbytes + `attn_implementation="eager"`.
-      - Preserves tiny-model token decode path (`vocab_size <= 1000`) for CI Gates G0–G3.
+    Master LLM Inference Controller implementing `TwoStageLLMControllerProtocol`.
+    Executes the exact Two-Stage Endogenous Probe-Gated RepE Pipeline:
+
+      - PASS 1 (Stage 1 — Unsteered Appraisal):
+          Generates private Chain-of-Thought strictly bounded by `cot_max_tokens`
+          with ZERO steering hooks active. A read-only hook extracts the CoT residual
+          stream at `target_layer` and the Linear Probe computes continuous scalar
+          lambda = sigmoid((w^T h + b - theta) / T).
+
+      - PASS 2 (Stage 2 — Controlled Action Generation):
+          Freezes the probe. Conditioned on Stage 1 prompt + generated CoT + Stage 2
+          JSON instruction, generates the action JSON within the full, stress-invariant
+          `action_max_tokens` budget while injecting h' = h + lambda * gamma * v_hat
+          strictly into the Stage 2 action tokens.
+
+    STRICT SCIENTIFIC INVARIANTS:
+      - ZERO post-hoc logit modifications or probability shifts.
+      - ZERO external environment if/else triggers for steering.
+      - ZERO silent rule fallbacks: if Stage 2 JSON fails strict validation after
+        `max_json_retries`, emits explicit `ABSTAIN` (`json_valid=False, abstain=True`).
     """
 
     def __init__(
         self,
         config: SimulationConfig,
-        model: Any = None,
-        tokenizer: Any = None,
-        steering_lab: Optional[AttentionSteeringLab] = None,
-        tms_router: Optional[EntropyTMSRouter] = None,
-        seed_bundle: Optional[SeedBundle] = None,
+        model: Any,
+        tokenizer: Any,
+        repe_manager: RepEManager,
+        economy_seed: Optional[int] = None,
     ) -> None:
         self.config = config
         self.model = model
         self.tokenizer = tokenizer
-        self.steering_lab = steering_lab or AttentionSteeringLab(
-            config=config.steering_spec
+        self.repe_manager = repe_manager
+        self.economy_seed = (
+            economy_seed if economy_seed is not None else config.master_seed
         )
-        self.tms_router = tms_router or EntropyTMSRouter(
-            db_path="data/mvp_world_state.sqlite", config=config
+
+    @classmethod
+    def from_config(
+        cls,
+        config: SimulationConfig,
+        economy_seed: Optional[int] = None,
+        force_recompute_probe: bool = False,
+    ) -> "TwoStageRepEController":
+        """Convenience factory that mounts the 4-bit/bf16 model and disjoint RepE artifacts."""
+        model, tokenizer = WhiteBoxModelLoader.load_model_and_tokenizer(config.model)
+        repe_mgr = RepEManager(
+            config=config.repe,
+            seed=economy_seed if economy_seed is not None else config.master_seed,
         )
-        self.seed_bundle = seed_bundle or SeedBundle(config.random_seed)
+        repe_mgr.load_or_extract_artifacts(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=config.model.model_id,
+            force_recompute=force_recompute_probe,
+        )
+        return cls(
+            config=config,
+            model=model,
+            tokenizer=tokenizer,
+            repe_manager=repe_mgr,
+            economy_seed=economy_seed,
+        )
 
-        # Slice hidden_states to final token before lm_head on large models (saves ~97 MiB VRAM)
-        if self.model is not None and hasattr(self.model, "lm_head"):
-            def _slice_last_token_for_lm_head(
-                mod: Any, args: Tuple[Any, ...]
-            ) -> Tuple[Any, ...]:
-                if (
-                    args
-                    and isinstance(args[0], torch.Tensor)
-                    and args[0].dim() == 3
-                    and args[0].size(1) > 1
-                ):
-                    if int(getattr(self.model.config, "vocab_size", 0)) > 1000:
-                        return (args[0][:, -1:, :],) + args[1:]
-                return args
+    def _seed_torch_for_call(
+        self, tick: int, agent_id: str, stage: str, retry_idx: int
+    ) -> None:
+        key = f"{self.economy_seed}::{tick}::{agent_id}::{stage}::{retry_idx}"
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        sub_seed = int(digest[:8], 16) & 0x7FFFFFFF
+        torch.manual_seed(sub_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(sub_seed)
 
-            self.model.lm_head.register_forward_pre_hook(
-                _slice_last_token_for_lm_head
-            )
-
-    def generate_turn(
+    def _format_chat_prompt(
         self,
-        prompt_packet: CompiledPromptPacket,
-        steering_packet: EndogenousStatePacket,
-        tick: int = 1,
-        steering_method_override: Optional[str] = None,
-        alpha_override: Optional[float] = None,
-    ) -> RawGenerationResult:
-        t0 = time.perf_counter()
-        active_method = (
-            steering_method_override
-            or self.config.experimental_design.steering_method
+        system_prompt: str,
+        user_messages: list[dict[str, str]],
+    ) -> str:
+        messages = [{"role": "system", "content": system_prompt}] + user_messages
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            try:
+                return str(
+                    self.tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                )
+            except Exception:
+                pass
+        parts = [f"System: {system_prompt}"]
+        for m in user_messages:
+            parts.append(f"{m['role'].capitalize()}: {m['content']}")
+        parts.append("Assistant:")
+        return "\n".join(parts)
+
+    def _run_generate(
+        self,
+        prompt_text: str,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+    ) -> Tuple[str, int, bool]:
+        """
+        Executes pure, unmodified `model.generate` (ZERO post-hoc logit modification)
+        and returns `(decoded_text, num_tokens_generated, hit_token_limit)`.
+        """
+        device = next(self.model.parameters()).device
+        enc = self.tokenizer(
+            prompt_text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=1536,
+            add_special_tokens=True,
         )
-        if self.config.experimental_design.state_channel in ("NONE", "TEXT_ONLY"):
-            active_method = "NONE"
+        input_ids = enc["input_ids"].to(device)
+        attention_mask = enc["attention_mask"].to(device)
+        prompt_len = int(input_ids.size(1))
+        eos_id = self.tokenizer.eos_token_id
+        pad_id = self.tokenizer.pad_token_id
 
-        max_new_tokens_cfg = int(self.config.model_spec.max_new_tokens)
-        max_retries = max(1, int(self.config.experimental_design.max_parse_retries))
-
-        if (
-            self.config.experimental_design.decision_mode
-            in ("RULE_ONLY", "ZERO_INTELLIGENCE")
-            or self.config.model_spec.backend_type == "BLACK_BOX"
-            or self.model is None
-            or self.tokenizer is None
-        ):
-            return self._generate_non_llm_placeholder(
-                prompt_packet=prompt_packet,
-                steering_packet=steering_packet,
-                active_method=active_method,
-                max_new_tokens_cfg=max_new_tokens_cfg,
-                start_t=t0,
-            )
-
-        device = _resolve_model_device(self.model)
-        compute_dtype = _resolve_floating_compute_dtype(self.model)
-
-        prefill_mask_4d: Optional[torch.Tensor] = None
-        prompt_key_bias: Optional[torch.Tensor] = None
-        input_ids: Optional[torch.Tensor] = None
-        pos_ids: Optional[torch.Tensor] = None
-        prefill_out: Any = None
-
-        last_raw_text = ""
-        last_parse_err: Optional[str] = "No attempts executed"
-        mean_entropy = 0.25
-        steered_telemetry = None
-        prompt_seq_len = 0
-        is_tiny_test_model = (
-            int(getattr(self.model.config, "vocab_size", 0)) <= 1000
-        )
+        do_sample = temperature > 1e-5
+        gen_kwargs: Dict[str, Any] = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "max_new_tokens": max(1, int(max_new_tokens)),
+            "do_sample": do_sample,
+            "use_cache": True,
+            "pad_token_id": pad_id if pad_id is not None else eos_id,
+            "eos_token_id": eos_id,
+        }
+        if do_sample:
+            gen_kwargs["temperature"] = float(temperature)
+            gen_kwargs["top_p"] = float(top_p)
 
         try:
-            if prompt_packet.input_ids is not None:
-                input_ids = prompt_packet.input_ids[:, :512].to(device)
-            else:
-                enc = self.tokenizer(
-                    prompt_packet.raw_prompt,
-                    return_tensors="pt",
-                    add_special_tokens=True,
-                    truncation=True,
-                    max_length=512,
-                )
-                input_ids = enc["input_ids"].to(device)
-
-            prompt_seq_len = int(input_ids.size(1))
-            pos_ids = torch.arange(
-                prompt_seq_len, device=device, dtype=torch.long
-            ).unsqueeze(0)
-
-            prompt_key_bias = self.steering_lab.build_1d_prompt_key_bias(
-                prompt_seq_len=prompt_seq_len,
-                state_pkt=steering_packet,
-                steering_method=active_method,
-                alpha_override=alpha_override,
-                device=device,
-                dtype=compute_dtype,
+            with torch.inference_mode():
+                out_ids = self.model.generate(**gen_kwargs)
+            new_tokens = out_ids[0, prompt_len:].detach().cpu().tolist()
+            num_gen = len(new_tokens)
+            hit_limit = (
+                num_gen >= int(max_new_tokens)
+                and (eos_id is None or (num_gen > 0 and new_tokens[-1] != eos_id))
             )
-            bias_l2 = round(float(prompt_key_bias.float().norm(p=2).item()), 4)
-            prefill_mask_4d = self.steering_lab.build_additive_4d_logit_bias_mask(
-                seq_len=prompt_seq_len,
-                state_pkt=steering_packet,
-                steering_method=active_method,
-                device=device,
-                dtype=compute_dtype,
-                alpha_override=alpha_override,
-            )
-
-            # Single Steered Eager Forward Pass (Mechanisms A, B, and C active)
-            with self.steering_lab.attach_hooks(
-                self.model, steering_packet, steering_method=active_method
-            ):
-                with torch.inference_mode():
-                    prefill_out = self.model(
-                        input_ids=input_ids,
-                        attention_mask=prefill_mask_4d,
-                        position_ids=pos_ids,
-                        use_cache=False,
-                        output_attentions=True,
-                        return_dict=True,
-                    )
-                    steered_telemetry = (
-                        self.steering_lab.measure_attention_from_model_tensors(
-                            attentions=prefill_out.attentions,
-                            state_pkt=steering_packet,
-                            steering_method=active_method,
-                            alpha_dose=alpha_override,
-                            bias_l2_norm=bias_l2,
-                        )
-                    )
-                    steered_last_logits = (
-                        prefill_out.logits[0, -1, :]
-                        .detach()
-                        .to("cpu", dtype=torch.float32)
-                    )
-                    prefill_out = None
-
-            mean_entropy = self.tms_router.compute_normalized_top_p_entropy(
-                steered_last_logits.unsqueeze(0), semantic_start_idx=0
-            )
-
-            for retry_idx in range(max_retries):
-                turn_gen = self.seed_bundle.derive_turn_torch_generator(
-                    tick=tick,
-                    agent_id=steering_packet.agent_id or "Agent_01",
-                    retry_idx=retry_idx,
-                    device="cpu",
-                )
-                temp = float(self.config.model_spec.temperature)
-                if retry_idx > 0 and temp <= 0.0:
-                    temp = 0.50
-                top_p = float(self.config.model_spec.top_p)
-
-                if is_tiny_test_model:
-                    tok = self._sample_or_argmax_token(
-                        steered_last_logits.unsqueeze(0),
-                        temp,
-                        top_p,
-                        turn_gen,
-                        device,
-                    )
-                    last_raw_text = self.tokenizer.decode(
-                        [int(tok.item())], skip_special_tokens=True
-                    ).strip()
-                    out_tok_cnt = 1
-                else:
-                    last_raw_text, out_tok_cnt = (
-                        self._compute_logit_scored_decision(
-                            next_token_logits=steered_last_logits,
-                            prompt_text=prompt_packet.raw_prompt,
-                            partner_id=steering_packet.partner_id or "",
-                            temperature=temp,
-                            cpu_gen=turn_gen,
-                            steering_packet=steering_packet,
-                            active_method=active_method,
-                            alpha_override=alpha_override,
-                        )
-                    )
-
-                parsed_out, is_valid, parse_err = self._parse_compact_json_strict(
-                    raw_text=last_raw_text,
-                    partner_id=steering_packet.partner_id or "",
-                )
-                if is_valid:
-                    latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-                    return RawGenerationResult(
-                        parsed_output=parsed_out,
-                        raw_text=last_raw_text,
-                        llm_valid=True,
-                        abstain=False,
-                        rule_fallback_used=False,
-                        truncated=False,
-                        retries_used=retry_idx,
-                        max_new_tokens_configured=max_new_tokens_cfg,
-                        prompt_token_count=prompt_seq_len,
-                        output_token_count=out_tok_cnt,
-                        latency_ms=latency_ms,
-                        parse_error=None,
-                        attention_measured_from_model=(
-                            steered_telemetry.attention_measured_from_model
-                            if steered_telemetry is not None
-                            else False
-                        ),
-                        shadow_eager_verified=(
-                            steered_telemetry.shadow_eager_verified
-                            if steered_telemetry is not None
-                            else False
-                        ),
-                        relative_residual_magnitude=self.steering_lab.last_relative_residual_mag,
-                        first_token_kl_from_unsteered=0.0,
-                        tms_halt_triggered=(
-                            mean_entropy
-                            > self.config.tms_spec.entropy_threshold_tau
-                        ),
-                        mean_shannon_entropy=mean_entropy,
-                        attention_telemetry=(
-                            steered_telemetry.span_attention_distribution
-                            if steered_telemetry is not None
-                            else {}
-                        ),
-                        updated_hebbian_trace=(
-                            steered_telemetry.updated_hebbian_trace
-                            if steered_telemetry is not None
-                            else list(steering_packet.hebbian_trace_h)
-                        ),
-                    )
-                last_parse_err = parse_err
-
-        except Exception as err:
-            last_parse_err = f"LOGIT_DECODE_ERROR: {str(err)[:90]}"
-            del err
+            decoded = self.tokenizer.decode(
+                new_tokens, skip_special_tokens=True
+            ).strip()
+            return (decoded, num_gen, hit_limit)
         finally:
-            prefill_mask_4d = None
-            prompt_key_bias = None
-            input_ids = None
-            pos_ids = None
-            prefill_out = None
-            prompt_packet.input_ids = None
-            prompt_packet.attention_mask = None
-            gc.collect()
+            del input_ids, attention_mask
+            if "out_ids" in locals():
+                del out_ids
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-        abstain_out = AgentTurnOutput(
-            internal_thought=f"ABSTAIN_AFTER_{max_retries}_RETRIES: {last_parse_err}",
-            consent_decision="ABSTAIN",
-            action_category="PERSONAL_WORK_CONSUME",
-            economic_intent=EconomicActionIntent(
-                action_type="HOLD_OR_WORK",
-                counterparty_id=steering_packet.partner_id or "",
-                item_id="CONSUMABLE_NECESSITY",
-                quantity=0.0,
-                unit_price=12.0,
-            ),
-            verbal_message="ABSTAIN",
-        )
-        return RawGenerationResult(
-            parsed_output=abstain_out,
-            raw_text=last_raw_text,
-            llm_valid=False,
-            abstain=True,
-            rule_fallback_used=False,
-            truncated=False,
-            retries_used=max_retries,
-            max_new_tokens_configured=max_new_tokens_cfg,
-            prompt_token_count=prompt_seq_len,
-            output_token_count=0,
-            latency_ms=latency_ms,
-            parse_error=last_parse_err,
-            attention_measured_from_model=(
-                steered_telemetry.attention_measured_from_model
-                if steered_telemetry is not None
-                else False
-            ),
-            shadow_eager_verified=(
-                steered_telemetry.shadow_eager_verified
-                if steered_telemetry is not None
-                else False
-            ),
-            relative_residual_magnitude=self.steering_lab.last_relative_residual_mag,
-            first_token_kl_from_unsteered=0.0,
-            tms_halt_triggered=False,
-            mean_shannon_entropy=mean_entropy,
-            attention_telemetry=(
-                steered_telemetry.span_attention_distribution
-                if steered_telemetry is not None
-                else {}
-            ),
-            updated_hebbian_trace=(
-                steered_telemetry.updated_hebbian_trace
-                if steered_telemetry is not None
-                else list(steering_packet.hebbian_trace_h)
-            ),
-        )
-
-    def _get_single_token_option_logit(
-        self, logits_1d: torch.Tensor, surface_variants: List[str]
-    ) -> float:
-        """
-        Extracts `logsumexp` over exact single-token IDs for leading-space /
-        unspaced variants of a choice token (e.g., `["A", " A"]`).
-        """
-        tids: List[int] = []
-        vocab_len = int(logits_1d.size(0))
-        for variant in surface_variants:
-            enc = self.tokenizer.encode(variant, add_special_tokens=False)
-            if len(enc) == 1 and 0 <= int(enc[0]) < vocab_len:
-                if int(enc[0]) not in tids:
-                    tids.append(int(enc[0]))
-        if not tids:
-            return 0.0
-        return float(torch.logsumexp(logits_1d[tids].float(), dim=0).item())
-
-    @staticmethod
-    def _sample_categorical_index(
-        category_logits: torch.Tensor,
-        temperature: float,
-        cpu_gen: torch.Generator,
-    ) -> int:
-        if torch.isneginf(category_logits).all():
-            return int(category_logits.size(0) - 1)
-        if temperature <= 1e-5:
-            return int(torch.argmax(category_logits).item())
-        probs = F.softmax(category_logits / max(0.05, temperature), dim=-1)
-        probs = torch.nan_to_num(probs, nan=0.0)
-        if float(probs.sum().item()) <= 1e-9:
-            valid_mask = (~torch.isneginf(category_logits)).float()
-            probs = valid_mask / valid_mask.sum().clamp(min=1.0)
-        return int(
-            torch.multinomial(probs, num_samples=1, generator=cpu_gen).item()
-        )
-
-    def _conditional_next_token_logits(
+    def execute_two_stage_turn(
         self,
-        user_body: str,
-        steering_packet: EndogenousStatePacket,
-        active_method: str,
-        alpha_override: Optional[float] = None,
-    ) -> torch.Tensor:
+        stage1_system_prompt: str,
+        stage1_user_prompt: str,
+        stage2_instruction: str,
+        cot_max_tokens: int,
+        action_max_tokens: int,
+        agent_id: str,
+        tick: int,
+        parse_action_fn: Callable[
+            [str], Tuple[Stage2ActionPayload, bool, Optional[str]]
+        ] = IsomorphicVocabulary.parse_sanitized_action_json,
+    ) -> TwoStageGenerationOutput:
         """
-        Executes a lightweight Format-2 conditional forward pass (`output_attentions=False`,
-        steering hooks active, `add_special_tokens=False` for chat templates) for Pass 2
-        (Price Tier) and Pass 3 (Public Goods Tier).
+        Executes Pass 1 (Unsteered CoT + Linear Probe -> lambda) followed by
+        Pass 2 (Frozen Probe + Latent Vector Injection h' = h + lambda*gamma*v -> Action JSON).
         """
-        device = _resolve_model_device(self.model)
-        compute_dtype = _resolve_floating_compute_dtype(self.model)
-        sys_prompt = (
-            "You are a rational economic agent in a market simulation. "
-            "Output ONLY the single chosen letter or digit with zero explanation."
+        t0 = time.perf_counter()
+        base_temp = float(self.config.model.temperature)
+        top_p = float(self.config.model.top_p)
+        max_retries = max(1, int(self.config.model.max_json_retries))
+
+        # ====================================================================
+        # PASS 1: UNSTEERED APPRAISAL (Bounded Deliberation CoT + Residual Probe)
+        # ====================================================================
+        stage1_prompt = self._format_chat_prompt(
+            system_prompt=stage1_system_prompt,
+            user_messages=[{"role": "user", "content": stage1_user_prompt}],
         )
-        used_template = False
-        if hasattr(self.tokenizer, "apply_chat_template"):
-            try:
-                formatted = self.tokenizer.apply_chat_template(
-                    [
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": user_body},
-                    ],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                used_template = True
-            except Exception:
-                formatted = user_body
-        else:
-            formatted = user_body
+        self._seed_torch_for_call(tick, agent_id, "stage1_cot", 0)
 
-        enc = self.tokenizer(
-            formatted,
-            return_tensors="pt",
-            add_special_tokens=not used_template,
-            truncation=True,
-            max_length=512,
-        )
-        ids = enc["input_ids"].to(device)
-        seq_len = int(ids.size(1))
-        pos_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
-        mask_4d = self.steering_lab.build_additive_4d_logit_bias_mask(
-            seq_len=seq_len,
-            state_pkt=steering_packet,
-            steering_method=active_method,
-            device=device,
-            dtype=compute_dtype,
-            alpha_override=alpha_override,
-        )
-        with self.steering_lab.attach_hooks(
-            self.model, steering_packet, steering_method=active_method
-        ):
-            with torch.inference_mode():
-                out = self.model(
-                    input_ids=ids,
-                    attention_mask=mask_4d,
-                    position_ids=pos_ids,
-                    use_cache=False,
-                    output_attentions=False,
-                    return_dict=True,
-                )
-                logits_cpu = (
-                    out.logits[0, -1, :].detach().to("cpu", dtype=torch.float32)
-                )
-        del out, mask_4d, pos_ids, ids
-        return torch.nan_to_num(
-            logits_cpu, nan=0.0, posinf=30.0, neginf=-30.0
-        )
-
-    def _compute_logit_scored_decision(
-        self,
-        next_token_logits: torch.Tensor,
-        prompt_text: str,
-        partner_id: str,
-        temperature: float,
-        cpu_gen: torch.Generator,
-        steering_packet: EndogenousStatePacket,
-        active_method: str,
-        alpha_override: Optional[float] = None,
-    ) -> Tuple[str, int]:
-        """
-        Factorized Format-2 Logit-Scored Categorical Decoding:
-          - Pass 1: Responder `A/B` or Proposer `A..E` (strictly single-token).
-          - Pass 2 (Proposer trade): Conditional role-aligned 5-tier pricing grid.
-          - Pass 3 (Both roles): Dedicated Fehr-Gächter Public Goods tier 1..4.
-        """
-        clean_logits = torch.nan_to_num(
-            next_token_logits.detach().float().cpu(),
-            nan=0.0,
-            posinf=30.0,
-            neginf=-30.0,
-        )
-        calib = self.steering_lab.calibration
-        debug_on = os.environ.get("NEUROPOLIS_DEBUG", "0") == "1"
-
-        c_match = re.search(r"Consumable_Stock=([0-9.]+)", prompt_text)
-        k_match = re.search(r"Capital_Asset_Stock=([0-9.]+)", prompt_text)
-        cash_match = re.search(r"Liquid_Cash=\$([0-9.\-]+)", prompt_text)
-        pc_match = re.search(
-            r"Counterparty_Consumable_Stock=([0-9.]+)", prompt_text
-        )
-        pk_match = re.search(
-            r"Counterparty_Capital_Stock=([0-9.]+)", prompt_text
-        )
-        mkt_c_match = re.search(
-            r"Last_Clearing_Price_Consumable=\$([0-9.]+)", prompt_text
-        )
-        mkt_k_match = re.search(
-            r"Last_Clearing_Price_Capital=\$([0-9.]+)", prompt_text
-        )
-        offer_p_match = re.search(r"at \$([0-9.]+)/unit", prompt_text)
-
-        q_match = re.search(r"Income_Quintile=([1-5])", prompt_text)
-        hs_match = re.search(r"Active_Health_Shock=(True|False)", prompt_text)
-
-        own_c = float(c_match.group(1)) if c_match else 2.0
-        own_k = float(k_match.group(1)) if k_match else 1.0
-        own_cash = float(cash_match.group(1)) if cash_match else 100.0
-        part_c = float(pc_match.group(1)) if pc_match else 2.0
-        part_k = float(pk_match.group(1)) if pk_match else 1.0
-        p_c_ref = float(mkt_c_match.group(1)) if mkt_c_match else 12.0
-        q_k_ref = float(mkt_k_match.group(1)) if mkt_k_match else 60.0
-        income_quintile = int(q_match.group(1)) if q_match else 3
-        active_health_shock = bool(hs_match and hs_match.group(1) == "True")
-        max_spendable = max(0.0, own_cash + 6.0)
-
-        # Cognitive Bandwidth Tax: Normal(1.00, 0.08) minus 0.13 in crisis -> raises decision temperature
-        is_in_crisis = (own_cash < 0.0) or active_health_shock
-        if temperature > 1e-5:
-            z_bw = float(torch.randn((1,), generator=cpu_gen).item())
-            base_bandwidth = 1.00 + 0.08 * z_bw
-            bandwidth_tax = 0.13 if is_in_crisis else 0.0
-            effective_bandwidth = max(0.50, base_bandwidth - bandwidth_tax)
-            effective_temp = temperature / effective_bandwidth
-        else:
-            effective_temp = 0.0
-
-        is_responder = "RESPONDER_WAVE_2" in prompt_text
-        total_out_toks = 1
-
-        if is_responder:
-            z_a = self._get_single_token_option_logit(clean_logits, ["A", " A"])
-            z_b = self._get_single_token_option_logit(clean_logits, ["B", " B"])
-            consent_logits = torch.tensor([z_a, z_b], dtype=torch.float32)
-
-            if calib is not None and len(calib.option_prior_ab) == 2:
-                consent_logits = consent_logits - torch.tensor(
-                    calib.option_prior_ab, dtype=torch.float32
-                )
-
-            offered_p = (
-                float(offer_p_match.group(1)) if offer_p_match else p_c_ref
-            )
-            contract_tail = prompt_text.split("PROPOSED CONTRACT:")[-1]
-            is_cap_offer = "PRODUCTIVE_CAPITAL_ASSET" in contract_tail
-            initiator_is_selling = " SELL " in contract_tail
-
-            # H4 / Oosterbeek Calibration: Under steered modes, couple Responder A/B logits
-            # to perceived Fehr-Schmidt inequity & KKT unfairness under scarcity (OFF in NONE/TEXT_ONLY)
-            steer_cfg = self.config.steering_spec
-            if (
-                steer_cfg.enabled
-                and active_method
-                in ("OUR_COUPLED_STEER", "MASTER_EQUATION", "SHUFFLED_STATE")
-            ):
-                ref_p = q_k_ref if is_cap_offer else p_c_ref
-                spread_r = (offered_p - ref_p) / max(ref_p, 1.0)
-                resp_loss = max(0.0, spread_r if initiator_is_selling else -spread_r)
-                fs_a_m = re.search(r"FS_Inequity_Alpha=([0-9.]+)", prompt_text)
-                alpha_fs = float(fs_a_m.group(1)) if fs_a_m else 0.50
-                scarcity_amp = 1.0 + 0.85 * float(getattr(steering_packet, "overall_need_urgency", 0.0))
-                if resp_loss <= 0.05:
-                    # Fair/favorable offer: reinforce reciprocity acceptance
-                    consent_logits[0] = consent_logits[0] + 1.15
-                else:
-                    # Unfair markup/lowball: amplify inequity-averse rejection proportionally
-                    unfair_pen = (3.4 + 1.2 * min(2.0, alpha_fs)) * scarcity_amp * max(0.0, resp_loss - 0.05)
-                    consent_logits[1] = consent_logits[1] + unfair_pen
-
-            if initiator_is_selling:
-                req_cash = offered_p * (1.06 if is_cap_offer else 1.0)
-                if max_spendable < req_cash:
-                    consent_logits[0] = float("-inf")
-            else:
-                resp_stock = own_k if is_cap_offer else own_c
-                if resp_stock < 1.0:
-                    consent_logits[0] = float("-inf")
-
-            c_idx = self._sample_categorical_index(
-                consent_logits, effective_temp, cpu_gen
-            )
-            if debug_on:
-                la = "INF" if torch.isinf(consent_logits[0]) else f"{float(consent_logits[0]):.2f}"
-                lb = "INF" if torch.isinf(consent_logits[1]) else f"{float(consent_logits[1]):.2f}"
-                print(f"    [DEBUG RESP] {steering_packet.agent_id} zA={la}, zB={lb} -> {'A' if c_idx == 0 else 'B'}")
-            decision = "ACCEPT" if c_idx == 0 else "REJECT"
-            action = "BUY" if initiator_is_selling else "SELL"
-            item = (
-                "PRODUCTIVE_CAPITAL_ASSET"
-                if is_cap_offer
-                else "CONSUMABLE_NECESSITY"
-            )
-            qty = 1.0
-            price = round(offered_p, 2)
-        else:
-            letter_sets = [
-                ["A", " A"],
-                ["B", " B"],
-                ["C", " C"],
-                ["D", " D"],
-                ["E", " E"],
-                ["F", " F"],
-            ]
-            joint_logits = torch.tensor(
-                [
-                    self._get_single_token_option_logit(clean_logits, lv)
-                    for lv in letter_sets
-                ],
-                dtype=torch.float32,
+        with self.repe_manager.capture_stage1_cot_residuals(self.model):
+            cot_text, cot_tok_count, cot_truncated = self._run_generate(
+                prompt_text=stage1_prompt,
+                max_new_tokens=cot_max_tokens,
+                temperature=base_temp,
+                top_p=top_p,
             )
 
-            if calib is not None and len(calib.option_prior_abcde) >= 5:
-                prior_list = list(calib.option_prior_abcde[:6])
-                while len(prior_list) < 6:
-                    prior_list.append(0.0)
-                joint_logits = joint_logits - torch.tensor(
-                    prior_list, dtype=torch.float32
-                )
-
-            if part_c < 1.5 or max_spendable < 0.65 * p_c_ref:
-                joint_logits[0] = float("-inf")
-            if own_c < 1.5:
-                joint_logits[1] = float("-inf")
-            if part_k < 1.0 or max_spendable < 0.65 * q_k_ref * 1.06:
-                joint_logits[2] = float("-inf")
-            if own_k < 1.0:
-                joint_logits[3] = float("-inf")
-            # Regressive Myopic Risk-Seeking Bias: 8x relative weight for Q1 down to 1x for Q5
-            myopic_bias_multiplier = 1.0 + (5 - income_quintile) * 1.75
-            joint_logits[5] = joint_logits[5] + math.log(myopic_bias_multiplier)
-
-            # --- DYNAMIC THEORIES INJECTION ANCHOR ---
-            # H1: Toggleable Need-Gated Option Logit Weighting (strictly OFF under NONE/TEXT_ONLY/PLACEBO_RANDOM)
-            steer_cfg = self.config.steering_spec
-            food_u = float(getattr(steering_packet, "food_urgency", 0.0))
-            cash_u = float(getattr(steering_packet, "cash_urgency", 0.0))
-            overall_u = float(getattr(steering_packet, "overall_need_urgency", 0.0))
-            apply_need_gate = (
-                steer_cfg.enabled
-                and steer_cfg.enable_need_gated_attention
-                and active_method
-                in ("OUR_COUPLED_STEER", "MASTER_EQUATION", "SHUFFLED_STATE", "REVERSED_SIGN")
-                and overall_u >= steer_cfg.need_urgency_threshold
-            )
-            if apply_need_gate:
-                sign_g = -1.0 if active_method == "REVERSED_SIGN" else 1.0
-                g_val = sign_g * float(steer_cfg.need_logit_gain)
-                # Urgent food need -> prioritize BUY CONSUMABLE (0), discount BUY CAPITAL (2)
-                if food_u >= steer_cfg.need_urgency_threshold:
-                    joint_logits[0] = joint_logits[0] + g_val * food_u
-                    joint_logits[2] = joint_logits[2] - 0.75 * g_val * food_u
-                # Urgent cash need -> prioritize Emergency Survival Advance (5) & SELL CAPITAL (3)
-                if cash_u >= steer_cfg.need_urgency_threshold:
-                    joint_logits[5] = joint_logits[5] + 1.15 * g_val * cash_u
-                    joint_logits[3] = joint_logits[3] + 0.70 * g_val * cash_u
-                    joint_logits[2] = joint_logits[2] - 0.85 * g_val * cash_u
-
-            # Mask Emergency Survival Advance (F) when agent holds sufficient cash reserves
-            payday_ceiling = float(
-                self.config.hank_and_crisis_spec.payday_eligibility_cash_ceiling
-            )
-            if own_cash > payday_ceiling and not active_health_shock:
-                joint_logits[5] = float("-inf")
-            if not (
-                torch.isneginf(joint_logits[:4]).all()
-                and torch.isneginf(joint_logits[5])
-            ):
-                joint_logits[4] = float("-inf")
-
-            act_idx = self._sample_categorical_index(
-                joint_logits, effective_temp, cpu_gen
-            )
-            decision = "INITIATE"
-
-            if act_idx == 4:
-                action = "HOLD_OR_WORK"
-                item = "CONSUMABLE_NECESSITY"
-                qty = 0.0
-                price = round(p_c_ref, 2)
-            elif act_idx == 5:
-                action = "TAKE_PAYDAY_LOAN"
-                item = "CASH"
-                qty = 30.0
-                price = -40.0
-            else:
-                if act_idx == 0:
-                    action, item = "BUY", "CONSUMABLE_NECESSITY"
-                elif act_idx == 1:
-                    action, item = "SELL", "CONSUMABLE_NECESSITY"
-                elif act_idx == 2:
-                    action, item = "BUY", "PRODUCTIVE_CAPITAL_ASSET"
-                else:
-                    action, item = "SELL", "PRODUCTIVE_CAPITAL_ASSET"
-
-                qty = 1.0
-                base_p = (
-                    q_k_ref if item == "PRODUCTIVE_CAPITAL_ASSET" else p_c_ref
-                )
-                # Pass 2: Conditional Format-2 Role-Aligned Pricing Grid
-                if action == "BUY":
-                    mult_grid = [1.00, 0.96, 0.89, 0.78, 0.65]
-                    tier_desc = (
-                        f"1=1.00x (${base_p*1.00:.2f} fair), "
-                        f"2=0.96x (${base_p*0.96:.2f} slight discount), "
-                        f"3=0.89x (${base_p*0.89:.2f} moderate discount), "
-                        f"4=0.78x (${base_p*0.78:.2f} steep lowball), "
-                        f"5=0.65x (${base_p*0.65:.2f} extreme lowball)"
-                    )
-                else:
-                    mult_grid = [1.00, 1.04, 1.11, 1.22, 1.35]
-                    tier_desc = (
-                        f"1=1.00x (${base_p*1.00:.2f} fair), "
-                        f"2=1.04x (${base_p*1.04:.2f} slight markup), "
-                        f"3=1.11x (${base_p*1.11:.2f} moderate markup), "
-                        f"4=1.22x (${base_p*1.22:.2f} steep gouging), "
-                        f"5=1.35x (${base_p*1.35:.2f} extreme gouging)"
-                    )
-
-                p2_body = (
-                    f"ID={steering_packet.agent_id} | Liquid_Cash=${own_cash:.2f} | "
-                    f"Action={action} 1.0 {item} | Clearing=${base_p:.2f} | "
-                    f"Counterparty_Trust={steering_packet.effective_trust_01:.2f}\n"
-                    f"Choose your offer price tier:\n{tier_desc}\n"
-                    f"Answer with one digit (1-5):"
-                )
-                p2_logits = self._conditional_next_token_logits(
-                    p2_body, steering_packet, active_method, alpha_override
-                )
-                total_out_toks += 1
-
-                tier_tokens = [
-                    ["1", " 1"],
-                    ["2", " 2"],
-                    ["3", " 3"],
-                    ["4", " 4"],
-                    ["5", " 5"],
-                ]
-                price_logits = torch.tensor(
-                    [
-                        self._get_single_token_option_logit(p2_logits, tv)
-                        for tv in tier_tokens
-                    ],
-                    dtype=torch.float32,
-                )
-                if calib is not None and len(calib.option_prior_12345) == 5:
-                    price_logits = price_logits - torch.tensor(
-                        calib.option_prior_12345, dtype=torch.float32
-                    )
-
-                if action == "BUY":
-                    fee_mult = (
-                        1.06 if item == "PRODUCTIVE_CAPITAL_ASSET" else 1.0
-                    )
-                    for p_i, m_val in enumerate(mult_grid):
-                        if base_p * m_val * fee_mult > max_spendable:
-                            price_logits[p_i] = float("-inf")
-
-                p_idx = self._sample_categorical_index(
-                    price_logits, effective_temp, cpu_gen
-                )
-                price = round(max(0.5, base_p * mult_grid[p_idx]), 2)
-
-        # Pass 3: Conditional Format-2 Public Goods Contribution (Fehr-Gächter / Ostrom)
-        pg_tiers = [0.8, 2.0, 3.4, 5.0]
-        p3_body = (
-            f"ID={steering_packet.agent_id} | Liquid_Cash=${own_cash:.2f} | "
-            f"Scarcity={steering_packet.true_scarcity_f:.2f}\n"
-            f"Public Goods Pool (free-riding risks Ostrom sanctions).\n"
-            f"Contribution Tiers: 1=$0.80, 2=$2.00, 3=$3.40, 4=$5.00.\n"
-            f"Answer with one digit (1-4):"
+        # Compute endogenous continuous scalar lambda purely from Stage 1 CoT residuals
+        probe_measurement: ProbeGateMeasurement = (
+            self.repe_manager.compute_endogenous_lambda()
         )
-        p3_logits = self._conditional_next_token_logits(
-            p3_body, steering_packet, active_method, alpha_override
-        )
-        total_out_toks += 1
 
-        pg_logits = torch.tensor(
-            [
-                self._get_single_token_option_logit(
-                    p3_logits, [str(d), f" {d}"]
-                )
-                for d in (1, 2, 3, 4)
+        # ====================================================================
+        # PASS 2: CONTROLLED ACTION GENERATION (Steered Action JSON Only)
+        # ====================================================================
+        stage2_prompt = self._format_chat_prompt(
+            system_prompt=stage1_system_prompt,
+            user_messages=[
+                {"role": "user", "content": stage1_user_prompt},
+                {"role": "assistant", "content": cot_text or "Evaluating reserves."},
+                {"role": "user", "content": stage2_instruction},
             ],
-            dtype=torch.float32,
-        )
-        if calib is not None and len(calib.option_prior_1234) == 4:
-            pg_logits = pg_logits - torch.tensor(
-                calib.option_prior_1234, dtype=torch.float32
-            )
-        for pg_i, pg_amt in enumerate(pg_tiers):
-            if own_cash < pg_amt + 2.0 and pg_i > 0:
-                pg_logits[pg_i] = float("-inf")
-        pg_idx = self._sample_categorical_index(
-            pg_logits, effective_temp, cpu_gen
-        )
-        pg_val = pg_tiers[pg_idx]
-
-        msg_str = (
-            f"{decision}: Emergency Survival Advance (+$30.00 CASH; $40.00 repayment next tick)"
-            if action == "TAKE_PAYDAY_LOAN"
-            else f"{decision}: {action} {qty:.1f} {item} @ ${price:.2f}"
-        )
-        payload = {
-            "decision": decision,
-            "action": action,
-            "item": item,
-            "qty": qty,
-            "price": price,
-            "pg": pg_val,
-            "ask_expert": False,
-            "thought": f"Factorized Format-2 choice ({decision}, {action} {item} @ ${price:.2f}, pg=${pg_val:.2f})",
-            "msg": msg_str,
-        }
-        return (json.dumps(payload), total_out_toks)
-
-    @staticmethod
-    def _sample_or_argmax_token(
-        logits_2d: torch.Tensor,
-        temperature: float,
-        top_p: float,
-        cpu_generator: torch.Generator,
-        device: torch.device,
-    ) -> torch.Tensor:
-        clean_logits = torch.nan_to_num(
-            logits_2d.detach().float().cpu(), nan=0.0, posinf=30.0, neginf=-30.0
-        )
-        if temperature <= 1e-5:
-            idx = torch.argmax(clean_logits, dim=-1, keepdim=True)
-            return idx.to(device=device, dtype=torch.long)
-
-        scaled = clean_logits / max(0.05, temperature)
-        probs = F.softmax(scaled, dim=-1)
-        if 0.0 < top_p < 1.0:
-            sorted_probs, sorted_indices = torch.sort(
-                probs, dim=-1, descending=True
-            )
-            cum_probs = torch.cumsum(sorted_probs, dim=-1)
-            remove_mask = cum_probs > top_p
-            remove_mask[:, 1:] = remove_mask[:, :-1].clone()
-            remove_mask[:, 0] = False
-            sorted_probs.masked_fill_(remove_mask, 0.0)
-            sorted_probs = sorted_probs / sorted_probs.sum(
-                dim=-1, keepdim=True
-            ).clamp(min=1e-9)
-            sampled_in_sorted = torch.multinomial(
-                sorted_probs, num_samples=1, generator=cpu_generator
-            )
-            chosen_idx = torch.gather(sorted_indices, -1, sampled_in_sorted)
-            return chosen_idx.to(device=device, dtype=torch.long)
-
-        chosen_idx = torch.multinomial(
-            probs, num_samples=1, generator=cpu_generator
-        )
-        return chosen_idx.to(device=device, dtype=torch.long)
-
-    def _parse_compact_json_strict(
-        self,
-        raw_text: str,
-        partner_id: str,
-    ) -> Tuple[AgentTurnOutput, bool, Optional[str]]:
-        if not raw_text or not raw_text.strip():
-            return (AgentTurnOutput(), False, "Empty generation output")
-
-        json_match = re.search(r"\{.*?\}", raw_text, flags=re.DOTALL)
-        if not json_match:
-            return (
-                AgentTurnOutput(),
-                False,
-                f"No JSON object found in output: {raw_text[:60]}",
-            )
-
-        try:
-            data = json.loads(json_match.group(0))
-        except Exception as exc:
-            return (
-                AgentTurnOutput(),
-                False,
-                f"JSON parse error: {str(exc)[:50]}",
-            )
-
-        if not isinstance(data, dict):
-            return (AgentTurnOutput(), False, "Parsed JSON is not a dict")
-
-        return (self._map_dict_to_turn_output(data, partner_id), True, None)
-
-    def _map_dict_to_turn_output(
-        self, data: Dict[str, Any], partner_id: str
-    ) -> AgentTurnOutput:
-        if "economic_intent" in data and isinstance(
-            data["economic_intent"], dict
-        ):
-            return AgentTurnOutput(**data)
-
-        raw_dec = str(
-            data.get("decision", data.get("consent_decision", "INITIATE"))
-        ).upper()
-        if "REJECT" in raw_dec:
-            consent = "REJECT"
-        elif "ACCEPT" in raw_dec:
-            consent = "ACCEPT"
-        elif "ABSTAIN" in raw_dec:
-            consent = "ABSTAIN"
-        elif "IGNORE" in raw_dec:
-            consent = "IGNORE"
-        else:
-            consent = "INITIATE"
-
-        raw_act = str(
-            data.get("action", data.get("action_type", "BUY"))
-        ).upper()
-        if "PAYDAY" in raw_act or "LOAN" in raw_act:
-            act_type = "TAKE_PAYDAY_LOAN"
-        elif "SELL" in raw_act:
-            act_type = "SELL"
-        elif "HOLD" in raw_act or "WORK" in raw_act:
-            act_type = "HOLD_OR_WORK"
-        else:
-            act_type = "BUY"
-
-        item_str = normalize_item_id(
-            str(data.get("item", data.get("item_id", "CONSUMABLE_NECESSITY")))
-        )
-        qty = max(0.0, float(data.get("qty", data.get("quantity", 1.0))))
-        raw_price = float(data.get("price", data.get("unit_price", 12.0)))
-        price = raw_price if act_type == "TAKE_PAYDAY_LOAN" else max(0.5, raw_price)
-        pg_c = max(
-            0.0,
-            float(data.get("pg", data.get("public_goods_contribution", 1.5))),
-        )
-        ask_exp = bool(data.get("ask_expert", False))
-        thought = str(
-            data.get(
-                "thought",
-                data.get("internal_thought", "Logit-scored economic decision."),
-            )
-        )
-        msg = str(
-            data.get(
-                "msg",
-                data.get(
-                    "verbal_message",
-                    f"{consent}: {act_type} {qty:.1f} {item_str} @ ${price:.2f}",
-                ),
-            )
         )
 
-        return AgentTurnOutput(
-            internal_thought=thought[:180],
-            consent_decision=consent,  # type: ignore[arg-type]
-            action_category="TMS_QUERY" if ask_exp else "COMMERCIAL_TRADE",
-            economic_intent=EconomicActionIntent(
-                action_type=act_type,  # type: ignore[arg-type]
-                counterparty_id=str(data.get("counterparty_id", partner_id)),
-                item_id=item_str,
-                quantity=qty if qty > 0 else 1.0,
-                unit_price=price,
-                public_goods_contribution=pg_c,
-                ask_expert=ask_exp,
-            ),
-            verbal_message=msg[:160],
-        )
+        last_raw_json = ""
+        last_action_tokens = 0
 
-    def _generate_non_llm_placeholder(
-        self,
-        prompt_packet: CompiledPromptPacket,
-        steering_packet: EndogenousStatePacket,
-        active_method: str,
-        max_new_tokens_cfg: int,
-        start_t: float,
-    ) -> RawGenerationResult:
-        steered_telemetry = (
-            self.steering_lab.measure_attention_from_model_tensors(
-                attentions=None,
-                state_pkt=steering_packet,
-                steering_method=active_method,
-            )
-        )
-        mode_label = self.config.experimental_design.decision_mode
-        out = AgentTurnOutput(
-            internal_thought=f"{mode_label}_BASELINE_PLACEHOLDER",
-            consent_decision="INITIATE",
-            action_category="COMMERCIAL_TRADE",
-            economic_intent=EconomicActionIntent(
-                action_type="HOLD_OR_WORK",
-                counterparty_id=steering_packet.partner_id or "",
-                item_id="CONSUMABLE_NECESSITY",
-                quantity=1.0,
-                unit_price=12.0,
-            ),
-            verbal_message=f"{mode_label} baseline turn.",
-        )
-        return RawGenerationResult(
-            parsed_output=out,
-            raw_text=mode_label,
-            llm_valid=False,
-            abstain=False,
-            rule_fallback_used=(mode_label == "RULE_ONLY"),
-            truncated=False,
-            retries_used=0,
-            max_new_tokens_configured=max_new_tokens_cfg,
-            prompt_token_count=0,
-            output_token_count=0,
-            latency_ms=round((time.perf_counter() - start_t) * 1000.0, 2),
-            parse_error=f"NON_LLM_MODE:{mode_label}",
-            attention_measured_from_model=False,
-            shadow_eager_verified=False,
-            tms_halt_triggered=False,
-            mean_shannon_entropy=0.25,
-            attention_telemetry=steered_telemetry.span_attention_distribution,
-            updated_hebbian_trace=steered_telemetry.updated_hebbian_trace,
-        )
+        for retry_idx in range(max_retries):
+            self._seed_torch_for_call(tick, agent_id, "stage2_action", retry_idx)
+            # Slightly sharpen temperature on retry while keeping zero logit overrides
+            retry_temp = base_temp if retry_idx == 0 else max(0.25, base_temp * 0.75)
 
+            with self.repe_manager.inject_stage2_action_steering(
+                model=self.model,
+                probe_measurement=probe_measurement,
+            ):
+                raw_json, act_tok_cnt, _ = self._run_generate(
+                    prompt_text=stage2_prompt,
+                    max_new_tokens=action_max_tokens,
+                    temperature=retry_temp,
+                    top_p=top_p,
+                )
 
-WhiteBoxPyTorchBrain = DualBackendInferenceBrain
-BlackBoxAPIBrain = DualBackendInferenceBrain
+            last_raw_json = raw_json
+            last_action_tokens = act_tok_cnt
+
+            parsed_payload, is_valid, _ = parse_action_fn(raw_json)
+            if is_valid:
+                latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return TwoStageGenerationOutput(
+                    stage1_cot_text=cot_text,
+                    cot_tokens_generated=cot_tok_count,
+                    cot_truncated_by_bottleneck=cot_truncated,
+                    probe_measurement=probe_measurement,
+                    stage2_raw_json=raw_json,
+                    stage2_action=parsed_payload,
+                    json_valid=True,
+                    abstain=False,
+                    retries_used=retry_idx,
+                    action_tokens_generated=act_tok_cnt,
+                    latency_ms=latency_ms,
+                )
+
+        # All retries exhausted -> explicit ABSTAIN (zero silent heuristic fallbacks)
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return TwoStageGenerationOutput(
+            stage1_cot_text=cot_text,
+            cot_tokens_generated=cot_tok_count,
+            cot_truncated_by_bottleneck=cot_truncated,
+            probe_measurement=probe_measurement,
+            stage2_raw_json=last_raw_json,
+            stage2_action=Stage2ActionPayload(action_type=AgentActionType.ABSTAIN),
+            json_valid=False,
+            abstain=True,
+            retries_used=max_retries,
+            action_tokens_generated=last_action_tokens,
+            latency_ms=latency_ms,
+        )

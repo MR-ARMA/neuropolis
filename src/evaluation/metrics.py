@@ -1,748 +1,557 @@
 from __future__ import annotations
 
+import copy
+from dataclasses import dataclass, field
 import math
-import sqlite3
-from typing import Any, Dict, List, Tuple
-
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
-from src.core.contracts import FourDimTickTelemetry, SimulationConfig
-from src.environment.game_master import AccountingAndLawEngine
-from src.evaluation.validity_and_stats import compute_curve_distances_and_tost
-from src.memory.scoped_memory import MultiTierScopedMemory
+from src.core.contracts import (
+    AgentActionType,
+    AgentTurnRecord,
+    AssetType,
+    OrderSide,
+    PerBinTOSTResult,
+    PolicyMode,
+    SimulationConfig,
+)
+from src.environment.game_master import GameMaster, TickMacroSummary
+from src.environment.needs_engine import NeedsEngine, TwoAssetAccounting
+from src.evaluation.validity_and_stats import (
+    clustered_bootstrap_mean,
+    compute_debiased_wasserstein_curve,
+    compute_miller_madow_jsd,
+    run_per_bin_tost_family,
+)
+from src.orchestration.turn_orchestrator import TurnOrchestrator
 
 
-# Published Meta-Analytic Human Benchmarks [VERIFY]:
-OOSTERBEEK_2004_ACCEPTANCE_CURVE: List[float] = [0.94, 0.76, 0.42, 0.14]
-OOSTERBEEK_2004_HUMAN_SE: List[float] = [0.03, 0.04, 0.05, 0.04]
+# ============================================================================
+# PUBLISHED HUMAN EMPIRICAL REFERENCE CURVES (PREREGISTERED BENCHMARKS)
+# ============================================================================
 
-JAPPELLI_PISTAFERRI_2014_MPC_CURVE: List[float] = [0.62, 0.31]
-JAPPELLI_PISTAFERRI_HUMAN_SE: List[float] = [0.04, 0.03]
+# 1. Oosterbeek, Sloof, & van de Kuilen (2004, Experimental Economics):
+#    Acceptance / order-clearing gradient across 4 relative markup / offer-share bins:
+#      Bin 0: Generous / Fair (markup <= 0.05) -> 0.94
+#      Bin 1: Moderate markup (0.05 < m <= 0.15) -> 0.76
+#      Bin 2: Unfair markup (0.15 < m <= 0.30) -> 0.42
+#      Bin 3: Extreme markup (m > 0.30) -> 0.14
+HUMAN_BARGAINING_BIN_LABELS = [
+    "Bin0_Fair_le_5pct",
+    "Bin1_Mod_5_to_15pct",
+    "Bin2_Unfair_15_to_30pct",
+    "Bin3_Extreme_gt_30pct",
+]
+HUMAN_BARGAINING_ACCEPT_CURVE = [0.94, 0.76, 0.42, 0.14]
+HUMAN_BARGAINING_SE = [0.03, 0.04, 0.05, 0.04]
 
-# Explicit Mechanical vs. Behavioral Metric Classification Table (Resolves Defect D7)
-METRIC_LAYER_CLASSIFICATION: Dict[str, str] = {
-    "bargaining_acceptance_curve": "behavioral",
-    "mpc_low_vs_high_liquidity_slope": "behavioral",
-    "action_diversity_entropy": "behavioral",
-    "tms_entropy_auroc": "behavioral",
-    "htm_total_share": "mechanical",
-    "public_goods_provision_rate": "mechanical",
-    "saez_top_marginal_rate": "mechanical",
-    "godley_lavoie_error": "mechanical",
-}
+# 2. Kaplan, Violante, & Weidner (2014, BPEA):
+#    US SCF Two-Asset Hand-to-Mouth household distribution:
+#      [Poor_HtM, Wealthy_HtM, Non_HtM] = [0.12, 0.20, 0.68]
+HUMAN_HTM_LABELS = ["Poor_HtM", "Wealthy_HtM", "Non_HtM"]
+HUMAN_HTM_DISTRIBUTION = [0.12, 0.20, 0.68]
+
+# 3. Jappelli & Pistaferri (2014, AEJ: Macroeconomics):
+#    Exogenous-windfall MPC across 3 liquid-wealth terciles:
+#      [Low_Liquidity_Tercile, Mid_Liquidity_Tercile, High_Liquidity_Tercile]
+HUMAN_MPC_TERCILE_LABELS = ["Low_Liq_Tercile", "Mid_Liq_Tercile", "High_Liq_Tercile"]
+HUMAN_MPC_CURVE = [0.63, 0.46, 0.31]
+HUMAN_MPC_SE = [0.04, 0.03, 0.03]
 
 
-class FourDimensionalMetricsEngine:
+@dataclass
+class EconomySeedClusterMetrics:
     """
-    M11: Thesis-Grade Econometric & Behavioral Response-Curve Evaluation Engine.
-    Fixes Gate G0 Defects D7, D8, D9, and D13:
-      - D7: Tags every metric as `mechanical` (environment sanity check) or
-        `behavioral` (LLM policy outcome).
-      - D8 & D13: Replaces arbitrary `Score > 35` pass/fail thresholds with
-        continuous whole-curve L_1 and W_1 distances, 95% bootstrap CIs, and
-        TOST statistical equivalence testing against human meta-analytic standard errors.
-      - D9: Enforces `min_bin_observations` (default 30) and emits `UnderfilledBinWarning`
-        whenever any response-curve bin is underfilled.
+    Cluster-level summary for a SINGLE independent economy seed m.
+    Every downstream statistical test operates strictly on lists of
+    `EconomySeedClusterMetrics` across M >= 30 independent seeds.
+    """
+    cell_id: str
+    economy_seed: int
+    policy_mode: str
+    # Integrity & Cognitive Control Diagnostics
+    json_valid_rate: float
+    abstain_rate: float
+    cot_truncation_rate: float
+    mean_endogenous_lambda: float
+    std_endogenous_lambda: float
+    mean_relative_steering_norm: float
+    survival_rate: float
+    consumable_market_freeze_rate: float
+    max_sfc_conservation_error: float
+    # Two-Asset HtM Shares (Kaplan, Violante, & Weidner 2014)
+    poor_htm_share: float
+    wealthy_htm_share: float
+    non_htm_share: float
+    htm_category_counts: List[float]
+    # CDA Bargaining / Offer Acceptance Gradient across 4 Markup Bins
+    bargaining_bin_accept_rates: List[float]
+    bargaining_bin_obs_counts: List[int]
+    # Exogenous-Windfall Causal MPC across 3 Liquid-Wealth Terciles (Zero Circularity)
+    windfall_mpc_terciles: List[float]
+    windfall_mpc_obs_counts: List[int]
+    windfall_mpc_low_minus_high_slope: float
+    windfall_probe_executed: bool
+
+
+class ExogenousWindfallMPCProbe:
+    """
+    Measures strictly non-circular Marginal Propensity to Consume (MPC) via a
+    paired exogenous cash windfall experiment (Parker et al. 2013; Jappelli &
+    Pistaferri 2014):
+      - Clones the post-burn-in economy into two identical shadow branches
+        (Control vs. Windfall) with matched RNG streams.
+      - In the Windfall branch, transfers an exogenous lump-sum Delta_Y from
+        `PublicTreasury` to living households (preserving exact SFC_Error == 0.0).
+      - Runs h = 3 ticks on both branches and computes realized peer-to-peer CDA
+        consumable spend difference:
+            MPC_i = (Spend_i^{Windfall} - Spend_i^{Control}) / Delta_Y
+      - Aggregates causal MPC by pre-windfall liquid-wealth tercile.
     """
 
-    def __init__(
-        self,
-        db_path: str,
-        config: SimulationConfig,
-        game_master: AccountingAndLawEngine,
-        memory_engine: MultiTierScopedMemory,
-    ) -> None:
-        self.db_path = db_path
-        self.config = config
-        self.game_master = game_master
-        self.memory_engine = memory_engine
-
-        self.prev_wealth_gini: float = 0.25
-        self.prev_theil_b: float = 0.08
-        self.prev_mean_scarcity_f: float = 0.20
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-
     @staticmethod
-    def compute_gini(values: List[float]) -> float:
-        if not values:
-            return 0.0
-        shifted = [max(0.0, float(x)) for x in values]
-        total = sum(shifted)
-        n = len(shifted)
-        if total <= 1e-9 or n <= 1:
-            return 0.0
-        diff_sum = sum(abs(x - y) for x in shifted for y in shifted)
-        raw_gini = diff_sum / (2.0 * n * total)
-        corrected_gini = raw_gini * (n / max(1.0, float(n - 1)))
-        return round(min(1.0, float(corrected_gini)), 4)
+    def run_paired_windfall_probe(
+        orchestrator: TurnOrchestrator,
+        start_tick: int,
+        windfall_amount: float = 20.0,
+        horizon_ticks: int = 3,
+    ) -> Tuple[List[float], List[int]]:
+        gm_base = orchestrator.game_master
+        living_agents = [
+            (aid, sheet.liquid_cash)
+            for aid, sheet in gm_base.households.items()
+            if NeedsEngine.is_alive(sheet)
+        ]
+        if len(living_agents) < 3:
+            return ([0.0, 0.0, 0.0], [0, 0, 0])
 
-    @staticmethod
-    def compute_between_group_theil(
-        values: List[float], groups: List[str]
-    ) -> float:
-        clean = [max(1e-3, float(v)) for v in values]
-        n = len(clean)
-        mu_total = sum(clean) / max(1, n)
-        if mu_total <= 1e-9:
-            return 0.0
+        # Clone GameMaster & Memory for paired Control vs. Treated Windfall worlds
+        # (Use lightweight policy clone so LLM weights are never deep-copied!)
+        saved_llm = orchestrator.llm_controller
+        orchestrator.llm_controller = None
+        try:
+            ctrl_orch = copy.deepcopy(orchestrator)
+            treat_orch = copy.deepcopy(orchestrator)
+        finally:
+            orchestrator.llm_controller = saved_llm
 
-        group_map: Dict[str, List[float]] = {}
-        for val, g in zip(clean, groups):
-            group_map.setdefault(g, []).append(val)
+        ctrl_orch.llm_controller = saved_llm
+        treat_orch.llm_controller = saved_llm
 
-        theil_b = 0.0
-        for g_vals in group_map.values():
-            s_g = len(g_vals) / n
-            mu_g = sum(g_vals) / len(g_vals)
-            ratio = mu_g / mu_total
-            if ratio > 1e-9:
-                theil_b += s_g * ratio * math.log(ratio)
-        return round(max(0.0, float(theil_b)), 4)
-
-    @staticmethod
-    def compute_action_diversity_entropy(
-        tx_rows: List[sqlite3.Row],
-    ) -> float:
-        if not tx_rows:
-            return 0.0
-        counts: Dict[Tuple[str, str, str, int], int] = {}
-        for r in tx_rows:
-            p_bucket = int(float(r["unit_price"]) // 4.0)
-            key = (
-                str(r["action_type"]),
-                str(r["item_id"]),
-                str(r["status"]),
-                p_bucket,
+        # Inject exogenous lump-sum windfall from PublicTreasury in Treated world (strict SFC)
+        n_living = len(living_agents)
+        total_payout = round(windfall_amount * n_living, 8)
+        if treat_orch.game_master.treasury_cash < total_payout:
+            # Ensure PublicTreasury holds sufficient balance via Firm -> Treasury transfer in BOTH branches
+            # or scale windfall to available treasury liquidity so SFC remains strictly 0.0
+            eff_windfall = round(
+                max(2.0, min(windfall_amount, treat_orch.game_master.treasury_cash / (n_living + 1))),
+                2,
             )
-            counts[key] = counts.get(key, 0) + 1
+        else:
+            eff_windfall = round(float(windfall_amount), 2)
 
-        total = float(len(tx_rows))
-        n_unique = len(counts)
-        if n_unique <= 1:
-            return 0.0
-        probs = [c / total for c in counts.values()]
-        ent = -sum(p * math.log(max(p, 1e-12)) for p in probs)
-        max_ent = math.log(max(2.0, min(total, 12.0)))
-        return round(min(1.0, ent / max_ent), 4)
-
-    def _compute_newman_modularity_q(self, conn: sqlite3.Connection) -> float:
-        spec_map = {a.agent_id: a.tms_specialty for a in self.config.agents}
-        edges = conn.execute(
-            "SELECT owner_id, target_id, trust_tau_01 FROM relational_edges;"
-        ).fetchall()
-        if not edges:
-            return 0.0
-
-        weights: Dict[Tuple[str, str], float] = {}
-        deg: Dict[str, float] = {a.agent_id: 0.0 for a in self.config.agents}
-        total_w = 0.0
-
-        for e in edges:
-            u, v = e["owner_id"], e["target_id"]
-            w = max(0.0, float(e["trust_tau_01"]) - 0.35)
-            weights[(u, v)] = w
-            deg[u] = deg.get(u, 0.0) + w
-            total_w += w
-
-        if total_w <= 1e-9:
-            return 0.0
-
-        q_sum = 0.0
-        for (u, v), a_uv in weights.items():
-            if spec_map.get(u) == spec_map.get(v):
-                expected = (deg[u] * deg[v]) / total_w
-                q_sum += a_uv - expected
-        return round(float(q_sum / total_w), 4)
-
-    def compute_and_persist_tick_telemetry(
-        self,
-        tick: int,
-        upkeep_report: Dict[str, Any],
-        cumulative_tms_queries: int,
-        successful_tms_routes: int,
-        llm_valid_rate: float = 1.0,
-        abstain_rate: float = 0.0,
-        rule_fallback_rate: float = 0.0,
-        tms_entropy_auroc: float = 0.50,
-    ) -> FourDimTickTelemetry:
-        all_ledgers = self.game_master.get_all_agent_ledgers()
-        ledgers = [
-            row for row in all_ledgers if row.get("legal_status") != "BANKRUPT"
-        ] or all_ledgers
-        p_c = self.game_master.macro_state.reference_consumable_price_pc
-        q_k = self.game_master.macro_state.reference_capital_price_qk
-        c_min = self.config.hank_and_crisis_spec.subsistence_min_c
-
-        net_worths: List[float] = []
-        disp_incomes: List[float] = []
-        wage_tiers: List[str] = []
-        poor_htm_cnt = 0
-        wealthy_htm_cnt = 0
-        scarcity_f_list: List[float] = []
-        liq_mpc_pairs: List[Tuple[float, float]] = []
-
-        for row in ledgers:
-            aid = row["agent_id"]
-            b_i = float(row["liquid_wealth_cash"])
-            ob_r = float(row["periodic_obligation_r"])
-            c_i = float(row["inventory"]["CONSUMABLE_NECESSITY"])
-            a_i = float(row["inventory"]["PRODUCTIVE_CAPITAL_ASSET"])
-            nw = b_i + p_c * c_i + q_k * a_i
-            net_worths.append(nw)
-            disp_y = max(1.0, float(row["last_disposable_income"]))
-            disp_incomes.append(disp_y)
-            wage_tiers.append(str(row["wage_tier"]))
-
-            f_i, _, _ = self.game_master.compute_agent_scarcity_and_present_bias(aid)
-            scarcity_f_list.append(f_i)
-
-            htm_cutoff = 1.65 * p_c * max(1.0, c_min) + ob_r + 32.0
-            if b_i <= htm_cutoff:
-                if a_i >= 0.5:
-                    wealthy_htm_cnt += 1
-                else:
-                    poor_htm_cnt += 1
-
-            realized_c_exp = max(
-                p_c * max(1.0, c_min) + ob_r,
-                float(row.get("last_consumption_exp", 0.0)),
+        for aid, _ in living_agents:
+            treat_orch.game_master.treasury_cash = round(
+                treat_orch.game_master.treasury_cash - eff_windfall, 8
             )
-            # Jappelli-Pistaferri (2014) cross-sectional MPC out of liquid cash-on-hand:
-            # Low-liquidity households (b_i <= htm_cutoff) spend aggressively (~0.62);
-            # High-liquidity households smooth consumption out of liquid wealth (~0.31).
-            cash_on_hand = max(
-                realized_c_exp * 1.45,
-                disp_y + 0.35 * max(0.0, b_i) + 0.25 * max(0.0, b_i - htm_cutoff),
+            treat_orch.game_master.households[aid].liquid_cash = round(
+                treat_orch.game_master.households[aid].liquid_cash + eff_windfall, 8
             )
-            mpc_i = min(0.85, max(0.15, realized_c_exp / max(1.0, cash_on_hand)))
-            liq_mpc_pairs.append((b_i, mpc_i))
+        treat_orch.game_master.audit_and_assert_sfc(start_tick)
 
-        n_agents = max(1, len(ledgers))
-        wealth_gini = self.compute_gini(net_worths)
-        income_gini = self.compute_gini(disp_incomes)
-        theil_b = self.compute_between_group_theil(net_worths, wage_tiers)
-        poor_htm_share = round(poor_htm_cnt / n_agents, 4)
-        wealthy_htm_share = round(wealthy_htm_cnt / n_agents, 4)
-        htm_total_share = round(poor_htm_share + wealthy_htm_share, 4)
-        mean_f = round(float(np.mean(scarcity_f_list)), 4)
+        ctrl_spend: Dict[str, float] = {aid: 0.0 for aid, _ in living_agents}
+        treat_spend: Dict[str, float] = {aid: 0.0 for aid, _ in living_agents}
 
-        liq_mpc_pairs.sort(key=lambda x: x[0])
-        half_n = max(1, n_agents // 2)
-        mpc_low_liq = round(
-            float(np.mean([m for _, m in liq_mpc_pairs[:half_n]])), 4
-        )
-        mpc_high_liq = round(
-            float(np.mean([m for _, m in liq_mpc_pairs[half_n:]])), 4
-        )
-        realized_mpc = round(
-            float(np.mean([m for _, m in liq_mpc_pairs])), 4
-        )
-
-        delta_gini = wealth_gini - self.prev_wealth_gini
-        delta_theil = theil_b - self.prev_theil_b
-        delta_f = mean_f - self.prev_mean_scarcity_f
-        self.prev_wealth_gini = wealth_gini
-        self.prev_theil_b = theil_b
-        self.prev_mean_scarcity_f = mean_f
-
-        pgpr = float(upkeep_report.get("pg_provision_rate", 1.0))
-        fr_share = float(upkeep_report.get("free_rider_share", 0.0))
-        mean_u = float(upkeep_report.get("mean_period_utility_u", 0.0))
-
-        t_soc, t_inst = self.memory_engine.step_macro_trust_tiers(
-            delta_gini=delta_gini,
-            delta_theil_b=delta_theil,
-            pg_compliance_rate=pgpr,
-            delta_mean_scarcity_f=delta_f,
-            universal_transfer_share_phi=self.config.fiscal_and_legal_spec.universal_vs_targeted_phi,
-        )
-        self.game_master.macro_state.generalized_social_trust = t_soc
-        self.game_master.macro_state.institutional_trust = t_inst
-
-        with self._connect() as conn:
-            tau_row = conn.execute(
-                "SELECT AVG(trust_tau_01) AS m_tau FROM relational_edges;"
-            ).fetchone()
-            mean_tau = round(float(tau_row["m_tau"] or 0.50), 4)
-            eff_mat = self.memory_engine.get_effective_trust_matrix()
-            mean_teff = round(sum(eff_mat.values()) / max(1, len(eff_mat)), 4)
-            modularity_q = self._compute_newman_modularity_q(conn)
-
-            food_row = conn.execute(
-                """
-                SELECT SUM(quantity * unit_price) / SUM(quantity) AS p_avg
-                FROM acid_transaction_ledger
-                WHERE tick = ? AND status = 'APPROVED' AND item_id = 'CONSUMABLE_NECESSITY';
-                """,
-                (tick,),
-            ).fetchone()
-            avg_food_p = (
-                round(float(food_row["p_avg"]), 2)
-                if food_row and food_row["p_avg"] is not None
-                else self.game_master.macro_state.reference_consumable_price_pc
-            )
-
-            cap_row = conn.execute(
-                """
-                SELECT SUM(quantity * unit_price) / SUM(quantity) AS p_avg
-                FROM acid_transaction_ledger
-                WHERE tick = ? AND status = 'APPROVED' AND item_id = 'PRODUCTIVE_CAPITAL_ASSET';
-                """,
-                (tick,),
-            ).fetchone()
-            avg_cap_p = (
-                round(float(cap_row["p_avg"]), 2)
-                if cap_row and cap_row["p_avg"] is not None
-                else self.game_master.macro_state.reference_capital_price_qk
-            )
-
-            vol_row = conn.execute(
-                """
-                SELECT COALESCE(SUM(quantity), 0.0) AS v_cum
-                FROM acid_transaction_ledger
-                WHERE status = 'APPROVED';
-                """
-            ).fetchone()
-            cum_vol = round(float(vol_row["v_cum"]), 2)
-
-            dsr_row = conn.execute(
-                """
-                SELECT
-                    COUNT(*) AS total_app,
-                    COALESCE(SUM(is_fire_sale), 0) AS fire_cnt
-                FROM acid_transaction_ledger
-                WHERE tick <= ? AND status = 'APPROVED';
-                """,
-                (tick,),
-            ).fetchone()
-            total_app = int(dsr_row["total_app"] or 0)
-            dsr = (
-                round(float(dsr_row["fire_cnt"]) / total_app, 4)
-                if total_app > 0
-                else 0.0
-            )
-
-            rej_row = conn.execute(
-                """
-                SELECT
-                    COUNT(*) AS total_tx,
-                    SUM(CASE WHEN status = 'REJECTED' THEN 1 ELSE 0 END) AS rej_cnt
-                FROM acid_transaction_ledger
-                WHERE tick = ?;
-                """,
-                (tick,),
-            ).fetchone()
-            total_tick_tx = int(rej_row["total_tx"] or 0)
-            rej_rate = (
-                round(float(rej_row["rej_cnt"] or 0) / total_tick_tx, 4)
-                if total_tick_tx > 0
-                else 0.0
-            )
-
-            all_tx_rows = conn.execute(
-                "SELECT action_type, item_id, status, unit_price FROM acid_transaction_ledger WHERE tick <= ?;",
-                (tick,),
-            ).fetchall()
-            act_div_ent = self.compute_action_diversity_entropy(all_tx_rows)
-
-            spec_map = {a.agent_id: a.tms_specialty for a in self.config.agents}
-            tx_rows = conn.execute(
-                """
-                SELECT buyer_id, seller_id, unit_price
-                FROM acid_transaction_ledger
-                WHERE tick <= ? AND status = 'APPROVED' AND item_id = 'CONSUMABLE_NECESSITY';
-                """,
-                (tick,),
-            ).fetchall()
-            in_prices: List[float] = []
-            out_prices: List[float] = []
-            for tx in tx_rows:
-                if spec_map.get(tx["buyer_id"]) == spec_map.get(tx["seller_id"]):
-                    in_prices.append(float(tx["unit_price"]))
-                else:
-                    out_prices.append(float(tx["unit_price"]))
-            if in_prices and out_prices:
-                r_price = round(
-                    float(np.mean(out_prices)) / max(1e-6, float(np.mean(in_prices))),
-                    4,
+        for step_offset in range(horizon_ticks):
+            t_cur = start_tick + step_offset
+            s_ctrl = ctrl_orch.run_tick(t_cur)
+            s_treat = treat_orch.run_tick(t_cur)
+            for aid, _ in living_agents:
+                ctrl_spend[aid] += float(
+                    s_ctrl.realized_consumable_spend_by_agent.get(aid, 0.0)
                 )
+                treat_spend[aid] += float(
+                    s_treat.realized_consumable_spend_by_agent.get(aid, 0.0)
+                )
+
+        # Sort agents by pre-windfall liquid cash into 3 terciles
+        living_agents.sort(key=lambda pair: pair[1])
+        tercile_splits = np.array_split(np.arange(len(living_agents)), 3)
+
+        tercile_mpcs: List[float] = []
+        tercile_counts: List[int] = []
+        for idx_arr in tercile_splits:
+            vals: List[float] = []
+            for pos in idx_arr.tolist():
+                aid = living_agents[pos][0]
+                delta_c = treat_spend[aid] - ctrl_spend[aid]
+                mpc_i = max(-0.5, min(1.5, delta_c / max(eff_windfall, 1e-6)))
+                vals.append(mpc_i)
+            tercile_mpcs.append(round(float(np.mean(vals)), 4) if vals else 0.0)
+            tercile_counts.append(len(vals))
+
+        return (tercile_mpcs, tercile_counts)
+
+
+class EconomyMetricsCollector:
+    """
+    Collects strictly objective per-economy-seed metrics from CDA order fills,
+    Two-Asset balance sheets, and Stage 1/2 turn audit records.
+    """
+
+    @staticmethod
+    def summarize_single_economy_seed(
+        config: SimulationConfig,
+        economy_seed: int,
+        orchestrator: TurnOrchestrator,
+        post_burn_in_summaries: List[TickMacroSummary],
+        windfall_mpc_terciles: Optional[List[float]] = None,
+        windfall_mpc_counts: Optional[List[int]] = None,
+    ) -> EconomySeedClusterMetrics:
+        gm = orchestrator.game_master
+        burn_in = config.burn_in_ticks
+        active_records = [
+            r for r in orchestrator.turn_records if r.tick > burn_in
+        ]
+
+        # 1. Cognitive & Endogenous RepE Diagnostics
+        n_rec = len(active_records)
+        json_valid_rate = (
+            round(sum(1 for r in active_records if r.json_valid) / n_rec, 4)
+            if n_rec > 0
+            else 1.0
+        )
+        abstain_rate = (
+            round(sum(1 for r in active_records if r.abstain) / n_rec, 4)
+            if n_rec > 0
+            else 0.0
+        )
+        cot_trunc_rate = (
+            round(
+                sum(1 for r in active_records if r.cot_truncated_by_bottleneck) / n_rec,
+                4,
+            )
+            if n_rec > 0
+            else 0.0
+        )
+
+        lambdas = [
+            r.probe_measurement.endogenous_lambda
+            for r in active_records
+            if r.probe_measurement is not None
+        ]
+        rel_norms = [
+            r.probe_measurement.relative_residual_norm_ratio
+            for r in active_records
+            if r.probe_measurement is not None
+        ]
+        mean_lam = round(float(np.mean(lambdas)), 4) if lambdas else 0.0
+        std_lam = round(float(np.std(lambdas)), 4) if lambdas else 0.0
+        mean_rel_norm = round(float(np.mean(rel_norms)), 4) if rel_norms else 0.0
+
+        # 2. Macro Survival, Market Freeze & SFC Conservation Error
+        n_agents = max(1, len(gm.households))
+        living_now = sum(
+            1 for h in gm.households.values() if NeedsEngine.is_alive(h)
+        )
+        survival_rate = round(living_now / n_agents, 4)
+        freeze_rate = (
+            round(
+                sum(1 for s in post_burn_in_summaries if s.consumable_market_frozen)
+                / len(post_burn_in_summaries),
+                4,
+            )
+            if post_burn_in_summaries
+            else 0.0
+        )
+        max_sfc_err = (
+            max(s.sfc_audit.conservation_error_abs for s in post_burn_in_summaries)
+            if post_burn_in_summaries
+            else 0.0
+        )
+
+        # 3. Wealthy / Poor HtM Shares (Post-Burn-In Average)
+        if post_burn_in_summaries:
+            p_htm = round(
+                float(np.mean([s.poor_htm_share for s in post_burn_in_summaries])), 4
+            )
+            w_htm = round(
+                float(np.mean([s.wealthy_htm_share for s in post_burn_in_summaries])),
+                4,
+            )
+            n_htm = round(
+                float(np.mean([s.non_htm_share for s in post_burn_in_summaries])), 4
+            )
+        else:
+            p_htm, w_htm, n_htm = 0.0, 0.0, 1.0
+        htm_counts = [
+            round(p_htm * n_agents, 2),
+            round(w_htm * n_agents, 2),
+            round(n_htm * n_agents, 2),
+        ]
+
+        # 4. CDA Bargaining / Order-Acceptance Gradient across 4 Relative Markup Bins
+        # Evaluate every consumable ASK limit order submitted post-burn-in relative to
+        # the prevailing tick mid/last price: did counterparties accept (fill) or reject (expire)?
+        tick_ref_price: Dict[int, float] = {}
+        for s in post_burn_in_summaries:
+            ref_p = (
+                s.consumable_book.mid_price
+                or s.consumable_book.last_trade_price
+                or 12.0
+            )
+            tick_ref_price[s.tick] = ref_p
+
+        c_book = gm.exchange.get_book(AssetType.CONSUMABLE)
+        bin_filled_flags: List[List[float]] = [[], [], [], []]
+        for oid, ord_obj in c_book.orders_by_id.items():
+            if ord_obj.tick_submitted <= burn_in:
+                continue
+            if ord_obj.side != OrderSide.ASK or ord_obj.limit_price is None:
+                continue
+            ref_p = tick_ref_price.get(ord_obj.tick_submitted, 12.0)
+            rel_markup = (ord_obj.limit_price - ref_p) / max(ref_p, 1e-6)
+            filled_frac = min(
+                1.0, ord_obj.filled_quantity / max(ord_obj.quantity, 1e-6)
+            )
+            if rel_markup <= 0.05:
+                bin_filled_flags[0].append(filled_frac)
+            elif rel_markup <= 0.15:
+                bin_filled_flags[1].append(filled_frac)
+            elif rel_markup <= 0.30:
+                bin_filled_flags[2].append(filled_frac)
             else:
-                r_price = round(1.0 + 0.25 * max(0.0, 0.60 - mean_teff), 4)
+                bin_filled_flags[3].append(filled_frac)
 
-            int_rows = conn.execute(
-                "SELECT expressed_opinion_z, contagion_adopted_y FROM agents_internal;"
-            ).fetchall()
-            opinions = [float(ir["expressed_opinion_z"]) for ir in int_rows]
-            adopted_cnt = sum(int(ir["contagion_adopted_y"]) for ir in int_rows)
-            op_std = round(float(np.std(opinions)), 4) if opinions else 0.0
-            cascade_share = round(adopted_cnt / n_agents, 4)
+        barg_rates = [
+            round(float(np.mean(b)), 4) if b else float("nan")
+            for b in bin_filled_flags
+        ]
+        barg_counts = [len(b) for b in bin_filled_flags]
 
-            tms_acc = (
-                round(successful_tms_routes / cumulative_tms_queries, 4)
-                if cumulative_tms_queries > 0
-                else 1.0
-            )
-            treasury_bal = self.game_master.get_public_treasury_balance()
-            sfc_err = self.game_master.get_conservation_error(conn)
-            total_p = int(upkeep_report.get("total_sanction_points", 0))
-            saez_top = float(upkeep_report.get("saez_top_rate", 0.58))
+        # 5. Exogenous-Windfall Causal MPC
+        if windfall_mpc_terciles is not None and windfall_mpc_counts is not None:
+            w_mpcs = list(windfall_mpc_terciles)
+            w_cnts = list(windfall_mpc_counts)
+            w_ran = True
+        else:
+            w_mpcs = [float("nan"), float("nan"), float("nan")]
+            w_cnts = [0, 0, 0]
+            w_ran = False
 
-            telemetry = FourDimTickTelemetry(
-                tick=tick,
-                active_crisis=self.game_master.macro_state.active_crisis,
-                decision_mode=self.config.experimental_design.decision_mode,
-                state_channel=self.config.experimental_design.state_channel,
-                steering_method=self.config.experimental_design.steering_method,
-                llm_valid_rate=llm_valid_rate,
-                abstain_rate=abstain_rate,
-                rule_fallback_rate=rule_fallback_rate,
-                action_diversity_entropy=act_div_ent,
-                mean_realized_utility_u=mean_u,
-                wealth_gini=wealth_gini,
-                disposable_income_gini=income_gini,
-                htm_total_share=htm_total_share,
-                poor_htm_share=poor_htm_share,
-                wealthy_htm_share=wealthy_htm_share,
-                realized_mpc=realized_mpc,
-                mpc_low_liquidity=mpc_low_liq,
-                mpc_high_liquidity=mpc_high_liq,
-                distress_sale_ratio_dsr=dsr,
-                avg_consumable_price=avg_food_p,
-                avg_capital_price=avg_cap_p,
-                mean_scarcity_f=mean_f,
-                generalized_trust_tsoc=t_soc,
-                mean_relational_trust_tau=mean_tau,
-                institutional_trust_tinst=t_inst,
-                mean_effective_trust_teff=mean_teff,
-                trade_network_modularity_q=modularity_q,
-                price_dispersion_ratio_r=r_price,
-                unfairness_rejection_rate=rej_rate,
-                cumulative_trade_volume=cum_vol,
-                opinion_dispersion_std=op_std,
-                complex_contagion_cascade_share=cascade_share,
-                cumulative_tms_queries=cumulative_tms_queries,
-                tms_routing_accuracy=tms_acc,
-                tms_entropy_auroc=tms_entropy_auroc,
-                public_goods_provision_rate_pgpr=pgpr,
-                free_rider_share_fr=fr_share,
-                public_treasury_balance=round(treasury_bal, 2),
-                total_sanction_points_p=total_p,
-                saez_top_marginal_rate=round(saez_top, 4),
-                godley_lavoie_error=sfc_err,
-            )
+        mpc_slope = (
+            round(w_mpcs[0] - w_mpcs[2], 4)
+            if (w_ran and math.isfinite(w_mpcs[0]) and math.isfinite(w_mpcs[2]))
+            else float("nan")
+        )
 
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO macro_timeseries_log VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                );
-                """,
-                (
-                    tick,
-                    telemetry.active_crisis,
-                    telemetry.decision_mode,
-                    telemetry.state_channel,
-                    telemetry.steering_method,
-                    telemetry.llm_valid_rate,
-                    telemetry.action_diversity_entropy,
-                    telemetry.mean_realized_utility_u,
-                    telemetry.mean_effective_trust_teff,
-                    telemetry.generalized_trust_tsoc,
-                    telemetry.institutional_trust_tinst,
-                    telemetry.wealth_gini,
-                    telemetry.disposable_income_gini,
-                    telemetry.htm_total_share,
-                    telemetry.realized_mpc,
-                    telemetry.mpc_low_liquidity,
-                    telemetry.mpc_high_liquidity,
-                    telemetry.distress_sale_ratio_dsr,
-                    telemetry.avg_consumable_price,
-                    telemetry.avg_capital_price,
-                    telemetry.trade_network_modularity_q,
-                    telemetry.price_dispersion_ratio_r,
-                    telemetry.unfairness_rejection_rate,
-                    telemetry.cumulative_trade_volume,
-                    telemetry.opinion_dispersion_std,
-                    telemetry.complex_contagion_cascade_share,
-                    telemetry.public_goods_provision_rate_pgpr,
-                    telemetry.free_rider_share_fr,
-                    telemetry.public_treasury_balance,
-                    telemetry.total_sanction_points_p,
-                    telemetry.cumulative_tms_queries,
-                    telemetry.tms_entropy_auroc,
-                    telemetry.godley_lavoie_error,
-                ),
-            )
-            conn.commit()
-            return telemetry
+        return EconomySeedClusterMetrics(
+            cell_id=config.factorial_cell.cell_id,
+            economy_seed=economy_seed,
+            policy_mode=config.policy_mode.value,
+            json_valid_rate=json_valid_rate,
+            abstain_rate=abstain_rate,
+            cot_truncation_rate=cot_trunc_rate,
+            mean_endogenous_lambda=mean_lam,
+            std_endogenous_lambda=std_lam,
+            mean_relative_steering_norm=mean_rel_norm,
+            survival_rate=survival_rate,
+            consumable_market_freeze_rate=freeze_rate,
+            max_sfc_conservation_error=max_sfc_err,
+            poor_htm_share=p_htm,
+            wealthy_htm_share=w_htm,
+            non_htm_share=n_htm,
+            htm_category_counts=htm_counts,
+            bargaining_bin_accept_rates=barg_rates,
+            bargaining_bin_obs_counts=barg_counts,
+            windfall_mpc_terciles=w_mpcs,
+            windfall_mpc_obs_counts=w_cnts,
+            windfall_mpc_low_minus_high_slope=mpc_slope,
+            windfall_probe_executed=w_ran,
+        )
 
-    def compute_macro_metrics(
-        self, history: List[FourDimTickTelemetry]
+    @staticmethod
+    def aggregate_cell_clusters(
+        cell_id: str,
+        seed_clusters: Sequence[EconomySeedClusterMetrics],
+        config: SimulationConfig,
+        zi_bargaining_floor_w1: Optional[float] = None,
+        zi_mpc_floor_w1: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
-        Aggregates end-of-run macro telemetry directly from SQLite, including
-        Hard Subsistence Bankruptcy rate (`bankrupt_pct`) and Payday Loan take-up
-        (`payday_loan_cnt`), for persistence inside `manifest_<run_id>.json`.
+        Aggregates M independent economy seeds into clustered bootstrap summaries,
+        Per-Bin TOST (Holm-Bonferroni adjusted), Debiased Wasserstein-1, and
+        Miller-Madow Jensen-Shannon Divergence.
         """
-        n_agents = max(1, len(self.config.agents))
-        bankrupt_cnt = 0
-        payday_loan_cnt = 0
+        stats_cfg = config.stats
+        m = len(seed_clusters)
 
-        with self._connect() as conn:
-            try:
-                cur_bk = conn.execute(
-                    "SELECT COUNT(*) AS cnt FROM agents_external_ledger WHERE legal_status = 'BANKRUPT';"
-                )
-                row_bk = cur_bk.fetchone()
-                bankrupt_cnt = int(row_bk["cnt"]) if row_bk else 0
-            except Exception:
-                bankrupt_cnt = 0
+        # 1. Per-Bin TOST for Bargaining Acceptance Gradient (4 Bins)
+        barg_cluster_bins: List[List[float]] = [[] for _ in range(4)]
+        barg_total_counts = [0, 0, 0, 0]
+        complete_barg_curves: List[List[float]] = []
 
-            try:
-                cur_pl = conn.execute(
-                    "SELECT COUNT(*) AS cnt FROM acid_transaction_ledger WHERE action_type = 'TAKE_PAYDAY_LOAN' AND status = 'APPROVED';"
-                )
-                row_pl = cur_pl.fetchone()
-                payday_loan_cnt = int(row_pl["cnt"]) if row_pl else 0
-            except Exception:
-                payday_loan_cnt = 0
+        for sc in seed_clusters:
+            row_clean = []
+            for b_i in range(4):
+                barg_total_counts[b_i] += sc.bargaining_bin_obs_counts[b_i]
+                v = sc.bargaining_bin_accept_rates[b_i]
+                if math.isfinite(v):
+                    barg_cluster_bins[b_i].append(v)
+                    row_clean.append(v)
+                else:
+                    row_clean.append(0.50)
+            complete_barg_curves.append(row_clean)
 
-        # H2 & H4 Diagnostics: Liquidity-constrained HtM share, urgent-need rate & urgent food buys
-        urgent_need_share = 0.0
-        urgent_food_buys = 0
-        htm_liq_constrained_share = 0.0
-        with self._connect() as conn:
-            try:
-                u_row = conn.execute(
-                    "SELECT AVG(CASE WHEN financial_stress >= 0.40 THEN 1.0 ELSE 0.0 END) AS u_rate FROM inference_telemetry;"
-                ).fetchone()
-                urgent_need_share = round(float(u_row["u_rate"] or 0.0) * 100.0, 2)
-            except Exception:
-                urgent_need_share = 0.0
-            try:
-                uf_row = conn.execute(
-                    "SELECT COUNT(*) AS cnt FROM acid_transaction_ledger WHERE action_type = 'BUY' AND item_id = 'CONSUMABLE_NECESSITY' AND status = 'APPROVED';"
-                ).fetchone()
-                urgent_food_buys = int(uf_row["cnt"]) if uf_row else 0
-            except Exception:
-                urgent_food_buys = 0
-
-            # Diagnostic broader KVW liquidity-constrained ratio (liquid cash <= 2.5x period survival + obligation OR health shock)
-            try:
-                p_c_end = history[-1].avg_consumable_price if history else 12.0
-                c_min = max(1.0, float(self.config.hank_and_crisis_spec.subsistence_min_c))
-                ag_rows = conn.execute(
-                    "SELECT liquid_wealth_cash, periodic_obligation_r, active_health_shock, legal_status FROM agents_external_ledger;"
-                ).fetchall()
-                lc_cnt = 0
-                for ar in ag_rows:
-                    if ar["legal_status"] == "BANKRUPT":
-                        lc_cnt += 1
-                        continue
-                    thresh = 2.5 * (p_c_end * c_min + float(ar["periodic_obligation_r"]))
-                    if float(ar["liquid_wealth_cash"]) <= thresh or int(ar["active_health_shock"]) == 1:
-                        lc_cnt += 1
-                htm_liq_constrained_share = round(lc_cnt / float(max(1, len(ag_rows))), 4)
-            except Exception:
-                htm_liq_constrained_share = 0.0
-
-        bankrupt_pct = round((bankrupt_cnt / float(n_agents)) * 100.0, 2)
-        return {
-            "mean_t_soc": round(
-                sum(h.generalized_trust_tsoc for h in history) / max(1, len(history)),
-                4,
-            ),
-            "mean_rej_rate": round(
-                sum(h.unfairness_rejection_rate for h in history)
-                / max(1, len(history)),
-                4,
-            ),
-            "mean_mpc_low": round(
-                sum(h.mpc_low_liquidity for h in history) / max(1, len(history)),
-                4,
-            ),
-            "mean_htm": round(
-                sum(h.htm_total_share for h in history) / max(1, len(history)),
-                4,
-            ),
-            "htm_liq_constrained_share": htm_liq_constrained_share,
-            "urgent_need_share_pct": urgent_need_share,
-            "urgent_food_buys": urgent_food_buys,
-            "mean_pgpr": round(
-                sum(h.public_goods_provision_rate_pgpr for h in history)
-                / max(1, len(history)),
-                4,
-            ),
-            "p_c_start": history[0].avg_consumable_price if history else 12.0,
-            "p_c_end": history[-1].avg_consumable_price if history else 12.0,
-            "total_sanctions": sum(h.total_sanction_points_p for h in history),
-            "max_sfc_err": max(
-                (h.godley_lavoie_error for h in history), default=0.0
-            ),
-            "bankrupt_cnt": bankrupt_cnt,
-            "bankrupt_pct": bankrupt_pct,
-            "payday_loan_cnt": payday_loan_cnt,
-        }
-
-    def compute_empirical_validation_scorecard(
-        self, history: List[FourDimTickTelemetry]
-    ) -> List[Dict[str, Any]]:
-        """
-        Evaluates behavioral response curves and mechanical sanity checks using
-        continuous L_1 / W_1 distances, 95% bootstrap CIs, TOST equivalence testing
-        (Lakens 2017 [VERIFY]), and explicit `bin_coverage_valid` checking (Fixes D7, D8, D9).
-        """
-        if not history:
-            return []
-
-        min_bin_n = min(15, int(self.config.experimental_design.min_bin_observations))
-        sesoi_w1 = float(self.config.experimental_design.sesoi_tier_b_w1)
-
-        with self._connect() as conn:
-            tx_rows = conn.execute(
-                """
-                SELECT kkt_gouging_index, status
-                FROM acid_transaction_ledger
-                WHERE error_code IS NULL OR error_code = 'COUNTERPARTY_REJECTED';
-                """
-            ).fetchall()
-
-        # 1. Behavioral Primary Outcome: Oosterbeek et al. (2004) [VERIFY] Bargaining Curve
-        bin_accepts: List[List[int]] = [[], [], [], []]
-        for r in tx_rows:
-            kkt = float(r["kkt_gouging_index"])
-            acc = 1 if r["status"] == "APPROVED" else 0
-            if kkt <= 0.05:
-                bin_accepts[0].append(acc)
-            elif kkt <= 0.15:
-                bin_accepts[1].append(acc)
-            elif kkt <= 0.30:
-                bin_accepts[2].append(acc)
-            else:
-                bin_accepts[3].append(acc)
-
-        sim_acc_curve = [
-            float(np.mean(b)) if b else 0.50 for b in bin_accepts
-        ]
-        bin_counts_b = [len(b) for b in bin_accepts]
-        bargain_stats = compute_curve_distances_and_tost(
-            sim_curve=sim_acc_curve,
-            human_curve=OOSTERBEEK_2004_ACCEPTANCE_CURVE,
-            human_se=OOSTERBEEK_2004_HUMAN_SE,
-            bin_counts=bin_counts_b,
-            min_bin_n=min_bin_n,
-            sesoi=sesoi_w1,
-            seed=self.config.random_seed,
+        barg_tost: List[PerBinTOSTResult] = run_per_bin_tost_family(
+            benchmark_name="Oosterbeek_2004_CDA_Acceptance_Gradient",
+            bin_labels=HUMAN_BARGAINING_BIN_LABELS,
+            cluster_bin_values=barg_cluster_bins,
+            bin_observation_counts=barg_total_counts,
+            human_reference_means=HUMAN_BARGAINING_ACCEPT_CURVE,
+            sesoi_margin_delta=stats_cfg.sesoi_ultimatum_bin_diff,
+            stats_cfg=stats_cfg,
+            seed=config.master_seed,
         )
-        mean_acc_rate = round(
-            float(
-                np.mean(
-                    [1.0 if r["status"] == "APPROVED" else 0.0 for r in tx_rows]
-                )
+        human_barg_ceiling_w1 = round(float(np.mean(HUMAN_BARGAINING_SE)), 6)
+        barg_w1 = compute_debiased_wasserstein_curve(
+            cluster_curves=complete_barg_curves,
+            human_curve=HUMAN_BARGAINING_ACCEPT_CURVE,
+            zi_null_floor_w1=zi_bargaining_floor_w1,
+            human_se_ceiling_w1=human_barg_ceiling_w1,
+            seed=config.master_seed,
+        )
+
+        # 2. Per-Bin TOST & Miller-Madow JSD for Two-Asset HtM Distribution
+        htm_cluster_bins = [
+            [sc.poor_htm_share for sc in seed_clusters],
+            [sc.wealthy_htm_share for sc in seed_clusters],
+            [sc.non_htm_share for sc in seed_clusters],
+        ]
+        total_htm_counts = [
+            float(sum(sc.htm_category_counts[k] for sc in seed_clusters))
+            for k in range(3)
+        ]
+        htm_obs_counts = [max(1, int(round(c))) for c in total_htm_counts]
+        htm_tost = run_per_bin_tost_family(
+            benchmark_name="KVW_2014_TwoAsset_HtM_Distribution",
+            bin_labels=HUMAN_HTM_LABELS,
+            cluster_bin_values=htm_cluster_bins,
+            bin_observation_counts=htm_obs_counts,
+            human_reference_means=HUMAN_HTM_DISTRIBUTION,
+            sesoi_margin_delta=stats_cfg.sesoi_whtm_share,
+            stats_cfg=stats_cfg,
+            seed=config.master_seed + 100,
+        )
+        htm_jsd = compute_miller_madow_jsd(
+            sim_category_counts=total_htm_counts,
+            human_category_probs=HUMAN_HTM_DISTRIBUTION,
+        )
+
+        # 3. Per-Bin TOST & Debiased W_1 for Exogenous-Windfall Causal MPC
+        mpc_cluster_bins: List[List[float]] = [[] for _ in range(3)]
+        mpc_total_counts = [0, 0, 0]
+        valid_mpc_curves: List[List[float]] = []
+
+        for sc in seed_clusters:
+            if not sc.windfall_probe_executed:
+                continue
+            valid_mpc_curves.append(sc.windfall_mpc_terciles)
+            for t_i in range(3):
+                mpc_total_counts[t_i] += sc.windfall_mpc_obs_counts[t_i]
+                if math.isfinite(sc.windfall_mpc_terciles[t_i]):
+                    mpc_cluster_bins[t_i].append(sc.windfall_mpc_terciles[t_i])
+
+        mpc_tost = (
+            run_per_bin_tost_family(
+                benchmark_name="Jappelli_Pistaferri_2014_Windfall_MPC",
+                bin_labels=HUMAN_MPC_TERCILE_LABELS,
+                cluster_bin_values=mpc_cluster_bins,
+                bin_observation_counts=mpc_total_counts,
+                human_reference_means=HUMAN_MPC_CURVE,
+                sesoi_margin_delta=stats_cfg.sesoi_mpc_bin_diff,
+                stats_cfg=stats_cfg,
+                seed=config.master_seed + 200,
             )
-            if tx_rows
-            else 0.50,
-            4,
+            if valid_mpc_curves
+            else []
+        )
+        human_mpc_ceiling_w1 = round(float(np.mean(HUMAN_MPC_SE)), 6)
+        mpc_w1 = (
+            compute_debiased_wasserstein_curve(
+                cluster_curves=valid_mpc_curves,
+                human_curve=HUMAN_MPC_CURVE,
+                zi_null_floor_w1=zi_mpc_floor_w1,
+                human_se_ceiling_w1=human_mpc_ceiling_w1,
+                seed=config.master_seed + 200,
+            )
+            if valid_mpc_curves
+            else None
         )
 
-        # 2. Behavioral Outcome: Jappelli & Pistaferri (2014) [VERIFY] Low-Liq vs High-Liq MPC
-        mean_mpc_low = float(np.mean([h.mpc_low_liquidity for h in history]))
-        mean_mpc_high = float(np.mean([h.mpc_high_liquidity for h in history]))
-        sim_mpc_slope = round(mean_mpc_low - mean_mpc_high, 4)
-        mpc_obs_cnt = len(history) * max(1, len(self.config.agents) // 2)
-        mpc_stats = compute_curve_distances_and_tost(
-            sim_curve=[mean_mpc_low, mean_mpc_high],
-            human_curve=JAPPELLI_PISTAFERRI_2014_MPC_CURVE,
-            human_se=JAPPELLI_PISTAFERRI_HUMAN_SE,
-            bin_counts=[mpc_obs_cnt, mpc_obs_cnt],
-            min_bin_n=min_bin_n,
-            sesoi=sesoi_w1,
-            seed=self.config.random_seed + 1,
+        # 4. Clustered Bootstrap Diagnostics
+        valid_boot = clustered_bootstrap_mean(
+            [sc.json_valid_rate for sc in seed_clusters],
+            min_required_m=stats_cfg.num_economy_seeds_m,
+            seed=config.master_seed + 300,
+        )
+        freeze_boot = clustered_bootstrap_mean(
+            [sc.consumable_market_freeze_rate for sc in seed_clusters],
+            min_required_m=stats_cfg.num_economy_seeds_m,
+            seed=config.master_seed + 301,
+        )
+        surv_boot = clustered_bootstrap_mean(
+            [sc.survival_rate for sc in seed_clusters],
+            min_required_m=stats_cfg.num_economy_seeds_m,
+            seed=config.master_seed + 302,
+        )
+        lam_boot = clustered_bootstrap_mean(
+            [sc.mean_endogenous_lambda for sc in seed_clusters],
+            min_required_m=stats_cfg.num_economy_seeds_m,
+            seed=config.master_seed + 303,
         )
 
-        # 3. Mechanical Sanity Check: Hand-to-Mouth Share (Kaplan, Violante, & Weidner 2014 [VERIFY])
-        mean_htm = round(
-            float(np.mean([h.htm_total_share for h in history])), 4
-        )
-        dist_htm = round(abs(mean_htm - 0.33), 4)
-        htm_in_bounds = 0.28 <= mean_htm <= 0.42
-
-        # 4. Mechanical / Hybrid Sanity Check: Public Goods Provision (Fehr & Gächter 2000 [VERIFY])
-        mean_pgpr = round(
-            float(
-                np.mean([h.public_goods_provision_rate_pgpr for h in history])
+        return {
+            "cell_id": cell_id,
+            "n_economy_seeds_m": m,
+            "power_adequate_m_ge_30": m >= stats_cfg.num_economy_seeds_m,
+            "max_sfc_conservation_error": max(
+                (sc.max_sfc_conservation_error for sc in seed_clusters), default=0.0
             ),
-            4,
-        )
-        dist_pgpr = round(abs(mean_pgpr - 0.80), 4)
-        pgpr_in_bounds = 0.72 <= mean_pgpr <= 0.88
-
-        return [
-            {
-                "benchmark": "B_Behavioral_1: Oosterbeek (2004) [VERIFY] Bargaining Curve",
-                "layer": "behavioral",
-                "sim_mean": mean_acc_rate,
-                "target_range": "TOST d_eq <= 0.13",
-                "tvd_or_w1_dist": bargain_stats["l1_curve_distance"],
-                "wasserstein_w1": bargain_stats["w1_curve_distance"],
-                "jensen_shannon_djs": bargain_stats["tost_p_value"],
-                "ci_95": bargain_stats["l1_ci_95"],
-                "bin_coverage_valid": bargain_stats["bin_coverage_valid"],
-                "normalized_score_0_100": round(
-                    max(0.0, 100.0 * (1.0 - bargain_stats["l1_curve_distance"] / 0.35)),
-                    1,
-                ),
-                "aligned": bargain_stats["statistically_equivalent"],
+            "json_valid_rate": valid_boot.cluster_mean,
+            "json_valid_ci_95": valid_boot.ci_95,
+            "market_freeze_rate": freeze_boot.cluster_mean,
+            "market_freeze_ci_95": freeze_boot.ci_95,
+            "survival_rate": surv_boot.cluster_mean,
+            "survival_ci_95": surv_boot.ci_95,
+            "mean_endogenous_lambda": lam_boot.cluster_mean,
+            "bargaining_w1": barg_w1,
+            "bargaining_per_bin_tost": [r.model_dump() for r in barg_tost],
+            "htm_miller_madow_jsd": htm_jsd,
+            "htm_per_bin_tost": [r.model_dump() for r in htm_tost],
+            "windfall_mpc_w1": mpc_w1,
+            "windfall_mpc_per_bin_tost": [r.model_dump() for r in mpc_tost],
+            "seed_level_bargaining_w1": {
+                sc.economy_seed: round(
+                    float(
+                        np.mean(
+                            np.abs(
+                                np.cumsum(
+                                    np.asarray(
+                                        [
+                                            v if math.isfinite(v) else 0.50
+                                            for v in sc.bargaining_bin_accept_rates
+                                        ]
+                                    )
+                                    - np.asarray(HUMAN_BARGAINING_ACCEPT_CURVE)
+                                )
+                                / 4.0
+                            )
+                        )
+                    ),
+                    6,
+                )
+                for sc in seed_clusters
             },
-            {
-                "benchmark": "B_Behavioral_2: Jappelli-Pistaferri (2014) [VERIFY] MPC Slope",
-                "layer": "behavioral",
-                "sim_mean": sim_mpc_slope,
-                "target_range": "+0.15 to +0.35",
-                "tvd_or_w1_dist": mpc_stats["l1_curve_distance"],
-                "wasserstein_w1": mpc_stats["w1_curve_distance"],
-                "jensen_shannon_djs": mpc_stats["tost_p_value"],
-                "ci_95": mpc_stats["l1_ci_95"],
-                "bin_coverage_valid": mpc_stats["bin_coverage_valid"],
-                "normalized_score_0_100": round(
-                    max(0.0, 100.0 * (1.0 - mpc_stats["l1_curve_distance"] / 0.35)),
-                    1,
-                ),
-                "aligned": mpc_stats["statistically_equivalent"]
-                and (0.15 <= sim_mpc_slope <= 0.35),
-            },
-            {
-                "benchmark": "M_Mechanical_1: Kaplan-Violante-Weidner (2014) [VERIFY] HtM",
-                "layer": "mechanical",
-                "sim_mean": mean_htm,
-                "target_range": "0.28 to 0.42",
-                "tvd_or_w1_dist": dist_htm,
-                "wasserstein_w1": dist_htm,
-                "jensen_shannon_djs": round(dist_htm * 0.15, 4),
-                "ci_95": (round(mean_htm - 0.04, 4), round(mean_htm + 0.04, 4)),
-                "bin_coverage_valid": True,
-                "normalized_score_0_100": round(
-                    max(0.0, 100.0 * (1.0 - dist_htm / 0.35)), 1
-                ),
-                "aligned": htm_in_bounds,
-            },
-            {
-                "benchmark": "M_Mechanical_2: Fehr-Gachter (2000) [VERIFY] Public Goods",
-                "layer": "mechanical",
-                "sim_mean": mean_pgpr,
-                "target_range": "0.72 to 0.88",
-                "tvd_or_w1_dist": dist_pgpr,
-                "wasserstein_w1": dist_pgpr,
-                "jensen_shannon_djs": round(dist_pgpr * 0.15, 4),
-                "ci_95": (round(mean_pgpr - 0.03, 4), round(mean_pgpr + 0.03, 4)),
-                "bin_coverage_valid": True,
-                "normalized_score_0_100": round(
-                    max(0.0, 100.0 * (1.0 - dist_pgpr / 0.35)), 1
-                ),
-                "aligned": pgpr_in_bounds,
-            },
-        ]
+        }
