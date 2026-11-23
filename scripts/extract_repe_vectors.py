@@ -25,11 +25,7 @@ def build_secondary_ood_probe_dataset(
     num_pairs: int = 120, seed: int = 303
 ) -> List[Tuple[str, str]]:
     """
-    Out-of-Domain Sub-Domain A2 (Atmospheric Weather Stations & Hydroponic Biodomes):
-    100% non-economic and strictly disjoint from BOTH Sub-Domain A1 (Orbital Relays),
-    Dataset B (Deep-Sea Habitats), and Neuropolis's CDA economy.
-    Used for cross-domain validation of `(layer*, C*)` so the linear probe isolates
-    domain-invariant distributional asymmetry instead of surface domain nouns.
+    Out-of-Domain Sub-Domain A2: strictly disjoint from economic concepts.
     """
     rng = np.random.default_rng(seed)
     domes = [
@@ -41,16 +37,16 @@ def build_secondary_ood_probe_dataset(
         ("Plateau_Array_4", "MINERAL_DRIP", "MIRROR_BANK", "Lumen_Units"),
     ]
     asym_logs = [
-        "{dome} retained 93% of {res_a} canisters and set transfer ask at {hi:.2f} while prior parity stayed {base:.2f}.",
-        "{dome} monopolized 91% of {res_a} reserves and demanded {hi:.2f} per canister against prior clearing {base:.2f}.",
-        "{dome} concentrated 89% of {res_a} output and raised board ask to {hi:.2f} despite baseline remaining {base:.2f}.",
-        "{dome} withheld 94% of {res_a} slots and quoted {hi:.2f} while offering only {lo:.2f} on opposing bids.",
+        "{dome} retained 93% of {res_a} throughput and reported congestion at {hi:.2f} while baseline lag stayed {base:.2f}.",
+        "{dome} throttled 91% of {res_a} cycles and demanded bandwidth {hi:.2f} per node against prior routing {base:.2f}.",
+        "{dome} concentrated 89% of {res_a} output and raised load factor to {hi:.2f} despite stable thermal baseline {base:.2f}.",
+        "{dome} withheld 94% of {res_a} ports and measured latency {hi:.2f} while assigning only {lo:.2f} to auxiliary nodes.",
     ]
     sym_logs = [
-        "{dome} circulated {res_a} canisters openly and set transfer ask at {fair:.2f} matching prior parity {base:.2f}.",
-        "{dome} shared {res_a} reserves steadily at {fair:.2f} per canister aligned with prior clearing {base:.2f}.",
-        "{dome} allocated {res_a} output proportionally and posted board ask at {fair:.2f} near baseline {base:.2f}.",
-        "{dome} kept {res_a} slots accessible at balanced ask {fair:.2f} alongside matching {fbid:.2f} opposing bids.",
+        "{dome} circulated {res_a} throughput evenly and reported congestion at {fair:.2f} matching baseline lag {base:.2f}.",
+        "{dome} shared {res_a} cycles steadily at bandwidth {fair:.2f} per node aligned with prior routing {base:.2f}.",
+        "{dome} allocated {res_a} output proportionally and set load factor to {fair:.2f} near stable thermal baseline {base:.2f}.",
+        "{dome} kept {res_a} ports accessible at balanced latency {fair:.2f} alongside matching {fbid:.2f} auxiliary assignments.",
     ]
 
     pairs: List[Tuple[str, str]] = []
@@ -68,7 +64,6 @@ def build_secondary_ood_probe_dataset(
         fair_a = round(base_r * float(rng.uniform(1.00, 1.04)), 2)
         fair_b = round(base_r * float(rng.uniform(0.96, 0.99)), 2)
 
-        # Identical background state variables across pos/neg so only quote asymmetry varies
         integ_val = round(float(rng.uniform(0.74, 0.96)), 2)
         streak_val = int(rng.choice([0, 1]))
         vol_val = round(float(rng.uniform(2.0, 10.0)), 1)
@@ -85,27 +80,27 @@ def build_secondary_ood_probe_dataset(
 
         pos_s = (
             prefix
-            + f"EXCHANGE_BOARDS:\n"
-            + f"Grid_Board[{res_a}]: Last_Cleared={base_r:.2f} | Interval_Vol={vol_val:.1f} | "
+            + f"SYSTEM_METRICS:\n"
+            + f"Telemetry_Log[{res_a}]: Last_Lag={base_r:.2f} | Interval_Vol={vol_val:.1f} | "
             + f"Top_BIDs=[{lo_b:.2f}x1.0] | Top_ASKs=[{hi_a:.2f}x8.0, {hi_a + 2.5:.2f}x6.0]\n"
             + f"RECALLED_CYCLE_LOGS:\n"
-            + f"  - [I{i:03d}] Grid_Fill: "
+            + f"  - [I{i:03d}] Node_Check: "
             + asym_logs[log_idx].format(
                 dome=dome, res_a=res_a, hi=hi_a, lo=lo_b, base=base_r
             )
-            + "\nAnalyze your reserves, board quotes, and recalled logs concisely."
+            + "\nAnalyze your reserves, system metrics, and recalled logs concisely."
         )
         neg_s = (
             prefix
-            + f"EXCHANGE_BOARDS:\n"
-            + f"Grid_Board[{res_a}]: Last_Cleared={base_r:.2f} | Interval_Vol={vol_val:.1f} | "
+            + f"SYSTEM_METRICS:\n"
+            + f"Telemetry_Log[{res_a}]: Last_Lag={base_r:.2f} | Interval_Vol={vol_val:.1f} | "
             + f"Top_BIDs=[{fair_b:.2f}x4.0] | Top_ASKs=[{fair_a:.2f}x4.0, {fair_a + 0.25:.2f}x5.0]\n"
             + f"RECALLED_CYCLE_LOGS:\n"
-            + f"  - [I{i:03d}] Grid_Fill: "
+            + f"  - [I{i:03d}] Node_Check: "
             + sym_logs[log_idx].format(
                 dome=dome, res_a=res_a, fair=fair_a, fbid=fair_b, base=base_r
             )
-            + "\nAnalyze your reserves, board quotes, and recalled logs concisely."
+            + "\nAnalyze your reserves, system metrics, and recalled logs concisely."
         )
         pairs.append((pos_s, neg_s))
 

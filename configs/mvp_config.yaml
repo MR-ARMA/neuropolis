@@ -14,15 +14,14 @@ factorial_cell:
   policy_mode: "LLM_AGENT"
 
 model:
-  model_id: "meta-llama/Llama-3.1-8B-Instruct"
-  revision: "main"
-  local_dir: "./models/meta-llama--Llama-3.1-8B-Instruct"
+  model_id: "Qwen/Qwen2.5-7B-Instruct"
+  local_dir: "./models/Qwen--Qwen2.5-7B-Instruct"
   load_in_4bit: true
   bnb_4bit_quant_type: "nf4"
   bnb_4bit_use_double_quant: true
   compute_dtype: "float16"
   attn_implementation: "sdpa"
-  temperature: 0.70
+  temperature: 0.1
   top_p: 0.95
   max_json_retries: 3
 
@@ -77,7 +76,7 @@ repe:
   enabled: true
   mode: "ENDOGENOUS_PROBE_GATED"
   concept_name: "perceived_inequity"
-  target_layer: 16
+  target_layer: 18
   steering_strength_gamma: 4.50
   probe_pooling: "early_appraisal_cot"
   appraisal_window_tokens: 20

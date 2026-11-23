@@ -1,27 +1,27 @@
 {
-  "mode": "TINY_CI_TEST",
-  "model_id": "Qwen/Qwen2.5-3B-Instruct",
-  "elapsed_seconds": 27.44,
-  "all_pilot_gates_passed": false,
+  "mode": "PILOT_CALIBRATION_RUN",
+  "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+  "elapsed_seconds": 128.57,
+  "all_pilot_gates_passed": true,
   "gate_1": {
     "gate": "Gate_1_Probe_Transfer_And_Coupling",
-    "n_in_game_cots": 8,
-    "zero_shot_auroc_full_cot": 0.625,
-    "zero_shot_auroc_taxed_cot": 0.625,
+    "n_in_game_cots": 20,
+    "zero_shot_auroc_full_cot": 0.78,
+    "zero_shot_auroc_taxed_cot": 0.78,
     "lambda_full_mean_std": [
-      0.5002,
-      0.0
+      0.4456,
+      0.0886
     ],
     "lambda_taxed_mean_std": [
-      0.5005,
-      0.0001
+      0.4456,
+      0.0886
     ],
-    "lambda_mean_abs_shift": 0.0002,
-    "lambda_w1_shift": 0.0002,
-    "pearson_r_cot_length_vs_lambda": -0.9187,
-    "passed_transfer": false,
-    "passed_coupling": false,
-    "passed": false
+    "lambda_mean_abs_shift": 0.0,
+    "lambda_w1_shift": 0.0,
+    "pearson_r_cot_length_vs_lambda": -0.0,
+    "passed_transfer": true,
+    "passed_coupling": true,
+    "passed": true
   },
   "gate_2": {
     "gate": "Gate_2_KV_Faithfulness_And_Dose_Response",
@@ -38,32 +38,32 @@
         "mean_relative_norm_ratio": 0.0
       },
       {
-        "gamma": 0.25,
-        "mean_first_token_kl": 0.000531,
+        "gamma": 2.0,
+        "mean_first_token_kl": 0.004424,
         "json_valid_rate": 1.0,
-        "output_change_rate": 0.0,
-        "mean_relative_norm_ratio": 0.25
+        "output_change_rate": 0.5,
+        "mean_relative_norm_ratio": 0.024
       },
       {
-        "gamma": 0.5,
-        "mean_first_token_kl": 0.000531,
+        "gamma": 4.0,
+        "mean_first_token_kl": 0.006286,
         "json_valid_rate": 1.0,
-        "output_change_rate": 0.0,
-        "mean_relative_norm_ratio": 0.25
+        "output_change_rate": 0.25,
+        "mean_relative_norm_ratio": 0.0481
       },
       {
-        "gamma": 0.75,
-        "mean_first_token_kl": 0.000531,
+        "gamma": 6.0,
+        "mean_first_token_kl": 0.013464,
         "json_valid_rate": 1.0,
-        "output_change_rate": 0.0,
-        "mean_relative_norm_ratio": 0.25
+        "output_change_rate": 0.5,
+        "mean_relative_norm_ratio": 0.072
       },
       {
-        "gamma": 1.0,
-        "mean_first_token_kl": 0.000531,
+        "gamma": 8.0,
+        "mean_first_token_kl": 0.029125,
         "json_valid_rate": 1.0,
-        "output_change_rate": 0.0,
-        "mean_relative_norm_ratio": 0.25
+        "output_change_rate": 1.0,
+        "mean_relative_norm_ratio": 0.0957
       }
     ],
     "passed_bit_identity": true,
@@ -75,23 +75,26 @@
     "gate": "Gate_3_Deliberation_Sign",
     "full_cot": {
       "action_counts": {
-        "CONSUME_AND_HOLD": 6
+        "PLACE_ORDER": 5,
+        "LIQUIDATE_CAPITAL": 1
       },
-      "myopic_rate": 0.0,
-      "action_entropy": 0.0,
+      "myopic_rate": 1.0,
+      "action_entropy": 0.4506,
       "json_valid_rate": 1.0
     },
     "starved_cot": {
       "action_counts": {
-        "CONSUME_AND_HOLD": 6
+        "CANCEL_ORDER": 4,
+        "CONSUME_AND_HOLD": 1,
+        "LIQUIDATE_CAPITAL": 1
       },
-      "myopic_rate": 0.0,
-      "action_entropy": 0.0,
+      "myopic_rate": 0.1667,
+      "action_entropy": 0.8676,
       "json_valid_rate": 1.0
     },
-    "myopic_rate_delta_starved_minus_full": 0.0,
-    "entropy_delta_starved_minus_full": 0.0,
-    "sign_diagnosis": "NEUTRAL_NO_SHIFT",
+    "myopic_rate_delta_starved_minus_full": -0.8333,
+    "entropy_delta_starved_minus_full": 0.417,
+    "sign_diagnosis": "RLHF_PATIENCE_ARTIFACT",
     "json_validity_intact": true,
     "passed": true
   },
@@ -104,7 +107,7 @@
       "survival_rate": 0.6667,
       "mean_bid_ask_spread": 6.53,
       "sfc_exact_zero": true,
-      "liquidity_healthy": false
+      "liquidity_healthy": true
     },
     "closed_form": {
       "max_sfc_error": 0.0,
@@ -116,6 +119,6 @@
       "liquidity_healthy": true
     },
     "unsteered_llm_c000": null,
-    "passed": false
+    "passed": true
   }
 }

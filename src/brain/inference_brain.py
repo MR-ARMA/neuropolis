@@ -49,15 +49,19 @@ class WhiteBoxModelLoader:
 
     @staticmethod
     def resolve_local_or_hub_path(model_cfg: ModelRuntimeConfig) -> str:
+        # Check if config.json exists directly in local_dir
+        if os.path.isdir(model_cfg.local_dir) and os.path.exists(
+            os.path.join(model_cfg.local_dir, "config.json")
+        ):
+            return model_cfg.local_dir
+            
+        # Check if it exists in a weights subdirectory (for Kaggle compatibility)
         weights_sub = os.path.join(model_cfg.local_dir, "weights")
         if os.path.isdir(weights_sub) and os.path.exists(
             os.path.join(weights_sub, "config.json")
         ):
             return weights_sub
-        if os.path.isdir(model_cfg.local_dir) and os.path.exists(
-            os.path.join(model_cfg.local_dir, "config.json")
-        ):
-            return model_cfg.local_dir
+            
         return model_cfg.model_id
 
     @classmethod
