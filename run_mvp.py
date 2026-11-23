@@ -39,9 +39,9 @@ def build_full_factorial_and_control_specs() -> Dict[str, FactorialCellSpec]:
     """
     Constructs all 8 cells of the 2^3 Factorial Ablation Matrix (C000..C111)
     plus the 4 mandatory mechanistic and non-LLM baselines:
-      - Factor A: Bounded Deliberation Budget (B_CoT)
-      - Factor B: Episodic Memory Friction (M_RAG)
-      - Factor C: Two-Stage Endogenous Probe-Gated RepE (R_RepE)
+    - Factor A: Bounded Deliberation Budget (B_CoT)
+    - Factor B: Episodic Memory Friction (M_RAG)
+    - Factor C: Two-Stage Endogenous Probe-Gated RepE (R_RepE)
     """
     specs: Dict[str, FactorialCellSpec] = {}
     for a in (0, 1):
@@ -439,9 +439,9 @@ def main() -> None:
             f"[BOOT] Mounting White-Box model '{base_cfg.model.model_id}' "
             f"(4bit={base_cfg.model.load_in_4bit}, attn={base_cfg.model.attn_implementation})..."
         )
-        shared_model, shared_tokenizer = WhiteBoxModelLoader.load_model_and_tokenizer(
-            base_cfg.model
-        )
+        # CRITICAL FIX: Utilizing safe fallback logic for MVP runner to prevent token/license crashes
+        shared_model, shared_tokenizer = WhiteBoxModelLoader.load_with_fallback(base_cfg)
+
         boot_repe = RepEManager(config=base_cfg.repe, seed=base_cfg.master_seed)
         shared_repe_artifacts = boot_repe.load_or_extract_artifacts(
             model=shared_model,

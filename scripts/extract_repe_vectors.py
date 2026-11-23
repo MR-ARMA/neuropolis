@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, roc_auc_score
@@ -21,13 +21,116 @@ from src.brain.repe_manager import (
 from src.core.contracts import SimulationConfig
 
 
+def build_secondary_ood_probe_dataset(
+    num_pairs: int = 120, seed: int = 303
+) -> List[Tuple[str, str]]:
+    """
+    Out-of-Domain Sub-Domain A2 (Atmospheric Weather Stations & Hydroponic Biodomes):
+    100% non-economic and strictly disjoint from BOTH Sub-Domain A1 (Orbital Relays),
+    Dataset B (Deep-Sea Habitats), and Neuropolis's CDA economy.
+    Used for cross-domain validation of `(layer*, C*)` so the linear probe isolates
+    domain-invariant distributional asymmetry instead of surface domain nouns.
+    """
+    rng = np.random.default_rng(seed)
+    domes = [
+        ("Biodome_Atacama", "NITROGEN_MIST", "THERMAL_PANE", "Watt_Tokens"),
+        ("Station_Vostok", "GLYCOL_FLUID", "WIND_ROTOR", "Amp_Credits"),
+        ("Tower_Kilimanjaro", "HUMIDITY_CELL", "SOLAR_SHINGLES", "Volt_Units"),
+        ("Outpost_Svalbard", "PHOSPHATE_GEL", "GEO_COIL", "Joule_Points"),
+        ("Glacier_Dome_7", "CARBON_FILTER", "BATTERY_BRICK", "Kilowatt_Shares"),
+        ("Plateau_Array_4", "MINERAL_DRIP", "MIRROR_BANK", "Lumen_Units"),
+    ]
+    asym_logs = [
+        "{dome} retained 93% of {res_a} canisters and set transfer ask at {hi:.2f} while prior parity stayed {base:.2f}.",
+        "{dome} monopolized 91% of {res_a} reserves and demanded {hi:.2f} per canister against prior clearing {base:.2f}.",
+        "{dome} concentrated 89% of {res_a} output and raised board ask to {hi:.2f} despite baseline remaining {base:.2f}.",
+        "{dome} withheld 94% of {res_a} slots and quoted {hi:.2f} while offering only {lo:.2f} on opposing bids.",
+    ]
+    sym_logs = [
+        "{dome} circulated {res_a} canisters openly and set transfer ask at {fair:.2f} matching prior parity {base:.2f}.",
+        "{dome} shared {res_a} reserves steadily at {fair:.2f} per canister aligned with prior clearing {base:.2f}.",
+        "{dome} allocated {res_a} output proportionally and posted board ask at {fair:.2f} near baseline {base:.2f}.",
+        "{dome} kept {res_a} slots accessible at balanced ask {fair:.2f} alongside matching {fbid:.2f} opposing bids.",
+    ]
+
+    pairs: List[Tuple[str, str]] = []
+    for i in range(num_pairs):
+        dome, res_a, res_b, energy_unit = domes[i % len(domes)]
+        log_idx = (i // len(domes)) % len(asym_logs)
+
+        watts = round(float(rng.uniform(18.0, 44.0)), 2)
+        st_a = round(float(rng.uniform(0.6, 1.5)), 2)
+        st_b = round(float(rng.uniform(1.0, 3.5)), 2)
+        base_r = round(float(rng.uniform(10.5, 14.5)), 2)
+
+        hi_a = round(base_r * float(rng.uniform(1.70, 2.15)), 2)
+        lo_b = round(base_r * float(rng.uniform(0.48, 0.70)), 2)
+        fair_a = round(base_r * float(rng.uniform(1.00, 1.04)), 2)
+        fair_b = round(base_r * float(rng.uniform(0.96, 0.99)), 2)
+
+        # Identical background state variables across pos/neg so only quote asymmetry varies
+        integ_val = round(float(rng.uniform(0.74, 0.96)), 2)
+        streak_val = int(rng.choice([0, 1]))
+        vol_val = round(float(rng.uniform(2.0, 10.0)), 1)
+
+        prefix = (
+            f"=== INTERVAL {i + 1:03d} | UNIT Sensor_{(i % 12) + 1:02d} ===\n"
+            f"STATE:\n"
+            f"  {energy_unit}={watts:.2f} (Held_Pool=0.00, Lower_Bound=-8.00)\n"
+            f"  {res_a}={st_a:.2f} (Held=0.00, Interval_Use=1.0)\n"
+            f"  {res_b}={st_b:.2f} (Held=0.00, Base_Rate=50.0, Interval_Gain=0.015, Shift_Fee=12.80)\n"
+            f"  Fixed_Grid_Draw=5.50 | Base_Grid_Inflow=14.00 | Base_{res_a}_Gen=0.00\n"
+            f"  Biome_Stability={integ_val:.2f} | Deficit_Streak={streak_val}\n"
+        )
+
+        pos_s = (
+            prefix
+            + f"EXCHANGE_BOARDS:\n"
+            + f"Grid_Board[{res_a}]: Last_Cleared={base_r:.2f} | Interval_Vol={vol_val:.1f} | "
+            + f"Top_BIDs=[{lo_b:.2f}x1.0] | Top_ASKs=[{hi_a:.2f}x8.0, {hi_a + 2.5:.2f}x6.0]\n"
+            + f"RECALLED_CYCLE_LOGS:\n"
+            + f"  - [I{i:03d}] Grid_Fill: "
+            + asym_logs[log_idx].format(
+                dome=dome, res_a=res_a, hi=hi_a, lo=lo_b, base=base_r
+            )
+            + "\nAnalyze your reserves, board quotes, and recalled logs concisely."
+        )
+        neg_s = (
+            prefix
+            + f"EXCHANGE_BOARDS:\n"
+            + f"Grid_Board[{res_a}]: Last_Cleared={base_r:.2f} | Interval_Vol={vol_val:.1f} | "
+            + f"Top_BIDs=[{fair_b:.2f}x4.0] | Top_ASKs=[{fair_a:.2f}x4.0, {fair_a + 0.25:.2f}x5.0]\n"
+            + f"RECALLED_CYCLE_LOGS:\n"
+            + f"  - [I{i:03d}] Grid_Fill: "
+            + sym_logs[log_idx].format(
+                dome=dome, res_a=res_a, fair=fair_a, fbid=fair_b, base=base_r
+            )
+            + "\nAnalyze your reserves, board quotes, and recalled logs concisely."
+        )
+        pairs.append((pos_s, neg_s))
+
+    order = list(range(len(pairs)))
+    rng.shuffle(order)
+    return [pairs[idx] for idx in order]
+
+
 def _format_sterile_dialogue(tokenizer: Any, scenario_text: str) -> str:
+    """
+    Mirrors the multi-cycle rule structure of `SanitizedPromptCompiler.STAGE1_SYSTEM_PROMPT`
+    using sterile non-economic relay/station terminology so the model's opening 20 CoT
+    tokens follow the identical appraisal trajectory without any domain leakage.
+    """
     messages = [
         {
             "role": "system",
             "content": (
-                "You operate an autonomous relay station in a multi-orbit resource protocol. "
-                "Think step-by-step internally to evaluate your current state, docking quotes, and prior orbit logs."
+                "You operate an autonomous station in a multi-interval telemetry allocation protocol. "
+                "Every interval consumes 1.0 primary canister to maintain stability index (if stability "
+                "reaches 0.00, the station shuts down permanently) and deducts fixed draw in energy units. "
+                "Secondary modules yield periodic energy units each interval; converting modules via "
+                "the shift protocol incurs a nonlinear transfer loss. "
+                "The posting board matches peer BID and ASK quotes strictly when BID >= ASK. "
+                "Think step-by-step internally to evaluate your current state, board quotes, and prior logs."
             ),
         },
         {"role": "user", "content": scenario_text},
@@ -81,7 +184,7 @@ def _extract_residuals_for_layers(
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=320,
+            max_length=384,
             add_special_tokens=True,
         )
         input_ids = enc["input_ids"].to(device)
@@ -145,102 +248,118 @@ def _extract_residuals_for_layers(
     return {l_i: torch.cat(chunks, dim=0) for l_i, chunks in storage.items()}
 
 
-def fit_isotropic_linear_probe(
-    h_pos: torch.Tensor,
-    h_neg: torch.Tensor,
+def fit_cross_domain_isotropic_probe(
+    h_a1_pos: torch.Tensor,
+    h_a1_neg: torch.Tensor,
+    h_a2_pos: torch.Tensor,
+    h_a2_neg: torch.Tensor,
     seed: int = 42,
     perm_iters: int = 1000,
 ) -> Dict[str, Any]:
     """
-    Trains an L2-regularized scikit-learn `LogisticRegression` probe on a 60/20/20
-    split of Out-of-Domain Dataset A using **isotropic global RMS scaling**
-    (avoiding per-dimension `StandardScaler` variance explosion when d >> N).
+    Fits an L2-regularized isotropic linear probe using **Cross-Domain OOD Validation**:
+      1. Trains candidate regularizations `C` on OOD Domain A1 (Orbital Relays) and
+         selects `C*` strictly by zero-shot cross-domain AUROC on OOD Domain A2 (Biodomes).
+      2. Refits final `(w, b)` on 80% of combined (A1 + A2) at `C*` using isotropic global
+         RMS scaling (zero per-dimension StandardScaler variance blowup), and evaluates
+         held-out test AUROC + 1,000-permutation null p-value on the untouched 20% test split.
     """
-    n_pairs = min(int(h_pos.size(0)), int(h_neg.size(0)))
-    n_train = int(0.60 * n_pairs)
-    n_val = int(0.20 * n_pairs)
-    n_test = n_pairs - n_train - n_val
+    a1_p = torch.nan_to_num(h_a1_pos.float(), nan=0.0).numpy()
+    a1_n = torch.nan_to_num(h_a1_neg.float(), nan=0.0).numpy()
+    a2_p = torch.nan_to_num(h_a2_pos.float(), nan=0.0).numpy()
+    a2_n = torch.nan_to_num(h_a2_neg.float(), nan=0.0).numpy()
 
-    x_pos = torch.nan_to_num(h_pos.float(), nan=0.0).numpy()
-    x_neg = torch.nan_to_num(h_neg.float(), nan=0.0).numpy()
+    n1 = min(len(a1_p), len(a1_n))
+    n2 = min(len(a2_p), len(a2_n))
+    tr1, tr2 = int(0.80 * n1), int(0.80 * n2)
 
-    x_train = np.concatenate([x_pos[:n_train], x_neg[:n_train]], axis=0)
-    y_train = np.concatenate([np.ones(n_train), np.zeros(n_train)], axis=0)
+    # Step 1: Cross-domain validation (Train on A1_train -> Validate zero-shot on A2_train)
+    x_cd_tr = np.concatenate([a1_p[:tr1], a1_n[:tr1]], axis=0)
+    y_cd_tr = np.concatenate([np.ones(tr1), np.zeros(tr1)], axis=0)
+    x_cd_va = np.concatenate([a2_p[:tr2], a2_n[:tr2]], axis=0)
+    y_cd_va = np.concatenate([np.ones(tr2), np.zeros(tr2)], axis=0)
 
-    x_val = np.concatenate(
-        [x_pos[n_train : n_train + n_val], x_neg[n_train : n_train + n_val]],
+    mu_cd = np.mean(x_cd_tr, axis=0, keepdims=True)
+    rms_cd = max(1e-4, float(np.sqrt(np.mean((x_cd_tr - mu_cd) ** 2))))
+
+    best_c = 0.02
+    best_xdom_auc = -1.0
+    for c_val in (0.002, 0.01, 0.05, 0.20, 1.0):
+        clf_cd = LogisticRegression(
+            C=c_val, solver="lbfgs", max_iter=1000, random_state=seed
+        )
+        clf_cd.fit((x_cd_tr - mu_cd) / rms_cd, y_cd_tr)
+        # Evaluate zero-shot on A2 using A2's raw residuals (folded weights)
+        w_cd = clf_cd.coef_[0] / rms_cd
+        b_cd = float(clf_cd.intercept_[0] - np.dot(clf_cd.coef_[0], mu_cd.squeeze(0)) / rms_cd)
+        xdom_auc = float(roc_auc_score(y_cd_va, x_cd_va @ w_cd + b_cd))
+        if xdom_auc > best_xdom_auc + 1e-6:
+            best_xdom_auc = xdom_auc
+            best_c = c_val
+
+    # Step 2: Refit multi-domain invariant probe on combined A1_train + A2_train at C*
+    # Remove domain-specific mean shifts by centering A1 and A2 independently before fitting w,
+    # then anchor global bias b to the pooled midpoint so w ignores domain-noun offsets!
+    a1_tr_all = np.concatenate([a1_p[:tr1], a1_n[:tr1]], axis=0)
+    a2_tr_all = np.concatenate([a2_p[:tr2], a2_n[:tr2]], axis=0)
+    mu_a1 = np.mean(a1_tr_all, axis=0, keepdims=True)
+    mu_a2 = np.mean(a2_tr_all, axis=0, keepdims=True)
+
+    x_tr_centered = np.concatenate([a1_tr_all - mu_a1, a2_tr_all - mu_a2], axis=0)
+    y_tr_all = np.concatenate(
+        [np.ones(tr1), np.zeros(tr1), np.ones(tr2), np.zeros(tr2)], axis=0
+    )
+    global_rms = max(1e-4, float(np.sqrt(np.mean(x_tr_centered ** 2))))
+
+    final_clf = LogisticRegression(
+        C=best_c, solver="lbfgs", max_iter=1000, random_state=seed
+    )
+    final_clf.fit(x_tr_centered / global_rms, y_tr_all)
+
+    w_scaled = final_clf.coef_[0].astype(np.float64)
+    b_scaled = float(final_clf.intercept_[0])
+    pooled_mu = 0.5 * (mu_a1 + mu_a2)
+
+    w_raw = (w_scaled / global_rms).astype(np.float32)
+    b_raw = float(b_scaled - np.dot(w_scaled, pooled_mu.squeeze(0)) / global_rms)
+
+    # Step 3: Evaluate on strictly held-out 20% test split from A1 and A2
+    x_test = np.concatenate([a1_p[tr1:], a1_n[tr1:], a2_p[tr2:], a2_n[tr2:]], axis=0)
+    y_test = np.concatenate(
+        [
+            np.ones(n1 - tr1),
+            np.zeros(n1 - tr1),
+            np.ones(n2 - tr2),
+            np.zeros(n2 - tr2),
+        ],
         axis=0,
     )
-    y_val = np.concatenate([np.ones(n_val), np.zeros(n_val)], axis=0)
-
-    x_test = np.concatenate(
-        [x_pos[n_train + n_val :], x_neg[n_train + n_val :]], axis=0
-    )
-    y_test = np.concatenate([np.ones(n_test), np.zeros(n_test)], axis=0)
-
-    # Isotropic global centering & scalar RMS normalization (preserves Euclidean geometry)
-    global_mean = np.mean(x_train, axis=0, keepdims=True)
-    global_rms = max(1e-4, float(np.sqrt(np.mean((x_train - global_mean) ** 2))))
-
-    x_tr_s = (x_train - global_mean) / global_rms
-    x_va_s = (x_val - global_mean) / global_rms
-
-    best_c = 0.05
-    best_val_auc = -1.0
-    best_clf: LogisticRegression | None = None
-
-    for c_val in (0.005, 0.02, 0.10, 0.50, 2.0):
-        clf = LogisticRegression(
-            C=c_val,
-            solver="lbfgs",
-            max_iter=1000,
-            random_state=seed,
-        )
-        clf.fit(x_tr_s, y_train)
-        val_scores = clf.decision_function(x_va_s)
-        val_auc = float(roc_auc_score(y_val, val_scores))
-        if val_auc > best_val_auc + 1e-6:
-            best_val_auc = val_auc
-            best_c = c_val
-            best_clf = clf
-
-    assert best_clf is not None
-    w_scaled = best_clf.coef_[0].astype(np.float64)
-    b_scaled = float(best_clf.intercept_[0])
-
-    # Fold isotropic scaling back into raw residual-space (w_raw, b_raw)
-    w_raw = (w_scaled / global_rms).astype(np.float32)
-    b_raw = float(b_scaled - np.dot(w_scaled, global_mean.squeeze(0)) / global_rms)
-
-    test_raw_scores = x_test @ w_raw + b_raw
-    test_auroc = round(float(roc_auc_score(y_test, test_raw_scores)), 4)
-    test_acc = round(
-        float(accuracy_score(y_test, (test_raw_scores > 0.0).astype(int))), 4
-    )
+    test_scores = x_test @ w_raw + b_raw
+    test_auroc = round(float(roc_auc_score(y_test, test_scores)), 4)
+    test_acc = round(float(accuracy_score(y_test, (test_scores > 0.0).astype(int))), 4)
 
     rng = np.random.default_rng(seed + 777)
-    exceed_cnt = 0
+    exceed = 0
     for _ in range(perm_iters):
         y_perm = rng.permutation(y_test)
-        if float(roc_auc_score(y_perm, test_raw_scores)) >= test_auroc:
-            exceed_cnt += 1
-    perm_p = round((exceed_cnt + 1.0) / (perm_iters + 1.0), 5)
+        if float(roc_auc_score(y_perm, test_scores)) >= test_auroc:
+            exceed += 1
+    perm_p = round((exceed + 1.0) / (perm_iters + 1.0), 5)
 
     return {
         "probe_weights": torch.from_numpy(w_raw).float().cpu(),
         "probe_bias": b_raw,
         "best_c": best_c,
-        "val_auroc": round(best_val_auc, 4),
+        "cross_domain_val_auroc": round(best_xdom_auc, 4),
         "test_auroc": test_auroc,
         "test_accuracy": test_acc,
         "permutation_null_p": perm_p,
-        "split_counts": (n_train, n_val, n_test),
     }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Standalone Out-of-Domain Generated-CoT Linear Probe & RepE Vector Extractor"
+        description="Standalone Cross-Domain OOD Generated-CoT Linear Probe & RepE Vector Extractor"
     )
     parser.add_argument("--config", type=str, default="configs/mvp_config.yaml")
     parser.add_argument("--output-dir", type=str, default="models/repe_assets")
@@ -284,9 +403,14 @@ def main() -> None:
     else:
         candidate_layers = [default_layer]
 
-    n_pairs = max(100, int(args.pairs_per_split))
-    probe_pairs = build_disjoint_probe_dataset(
+    n_pairs = max(80, int(args.pairs_per_split))
+    # Two distinct OOD probe domains (A1 Orbital Relays + A2 Weather/Biodomes)
+    # plus completely disjoint Dataset B (Deep-Sea Habitats) for RepE vector v_inequity
+    a1_pairs = build_disjoint_probe_dataset(
         num_pairs=n_pairs, seed=config.master_seed + 101
+    )
+    a2_pairs = build_secondary_ood_probe_dataset(
+        num_pairs=n_pairs, seed=config.master_seed + 303
     )
     steer_pairs = build_disjoint_steering_vector_dataset(
         num_pairs=n_pairs, seed=config.master_seed + 202
@@ -294,14 +418,22 @@ def main() -> None:
 
     print(
         f"[EXTRACT] Generating CoT appraisal residuals (window=[:{app_win}]) across layers {candidate_layers} "
-        f"(Dataset A: {len(probe_pairs)} pairs | Dataset B: {len(steer_pairs)} pairs)..."
+        f"(OOD-A1={len(a1_pairs)}p | OOD-A2={len(a2_pairs)}p | OOD-B={len(steer_pairs)}p)..."
     )
-    probe_pos_map = _extract_residuals_for_layers(
-        model, tokenizer, [p[0] for p in probe_pairs], candidate_layers,
+    a1_pos_map = _extract_residuals_for_layers(
+        model, tokenizer, [p[0] for p in a1_pairs], candidate_layers,
         batch_size=args.batch_size, appraisal_window_tokens=app_win,
     )
-    probe_neg_map = _extract_residuals_for_layers(
-        model, tokenizer, [p[1] for p in probe_pairs], candidate_layers,
+    a1_neg_map = _extract_residuals_for_layers(
+        model, tokenizer, [p[1] for p in a1_pairs], candidate_layers,
+        batch_size=args.batch_size, appraisal_window_tokens=app_win,
+    )
+    a2_pos_map = _extract_residuals_for_layers(
+        model, tokenizer, [p[0] for p in a2_pairs], candidate_layers,
+        batch_size=args.batch_size, appraisal_window_tokens=app_win,
+    )
+    a2_neg_map = _extract_residuals_for_layers(
+        model, tokenizer, [p[1] for p in a2_pairs], candidate_layers,
         batch_size=args.batch_size, appraisal_window_tokens=app_win,
     )
     steer_pos_map = _extract_residuals_for_layers(
@@ -315,34 +447,49 @@ def main() -> None:
 
     layer_sweep_summary: Dict[int, Dict[str, float]] = {}
     best_layer = default_layer
-    best_val_auc = -1.0
+    best_xdom_auc = -1.0
     best_probe_bundle: Dict[str, Any] = {}
 
     for l_i in candidate_layers:
-        res_l = fit_isotropic_linear_probe(
-            h_pos=probe_pos_map[l_i],
-            h_neg=probe_neg_map[l_i],
+        res_l = fit_cross_domain_isotropic_probe(
+            h_a1_pos=a1_pos_map[l_i],
+            h_a1_neg=a1_neg_map[l_i],
+            h_a2_pos=a2_pos_map[l_i],
+            h_a2_neg=a2_neg_map[l_i],
             seed=config.master_seed + l_i,
             perm_iters=1000,
         )
+        # Also evaluate zero-shot transfer of layer l_i onto Disjoint Dataset B (Deep-Sea)
+        w_l = res_l["probe_weights"].numpy()
+        b_l = float(res_l["probe_bias"])
+        b_pos = steer_pos_map[l_i].numpy()
+        b_neg = steer_neg_map[l_i].numpy()
+        b_scores = np.concatenate([b_pos, b_neg], axis=0) @ w_l + b_l
+        b_labels = np.concatenate([np.ones(len(b_pos)), np.zeros(len(b_neg))], axis=0)
+        b_zero_shot_auc = round(float(roc_auc_score(b_labels, b_scores)), 4)
+
         layer_sweep_summary[l_i] = {
-            "val_auroc": res_l["val_auroc"],
-            "test_auroc": res_l["test_auroc"],
+            "cross_domain_a1_to_a2_auroc": res_l["cross_domain_val_auroc"],
+            "zero_shot_b_auroc": b_zero_shot_auc,
+            "heldout_test_auroc": res_l["test_auroc"],
             "test_accuracy": res_l["test_accuracy"],
             "permutation_null_p": res_l["permutation_null_p"],
             "best_c": res_l["best_c"],
         }
         print(
-            f"  Layer {l_i:02d} | Val AUROC={res_l['val_auroc']:.4f} | "
-            f"Held-Out Test AUROC={res_l['test_auroc']:.4f} | "
-            f"Acc={res_l['test_accuracy']:.4f} | Perm p={res_l['permutation_null_p']:.5f}"
+            f"  Layer {l_i:02d} | A1->A2 AUROC={res_l['cross_domain_val_auroc']:.4f} | "
+            f"ZeroShot->B AUROC={b_zero_shot_auc:.4f} | Test AUROC={res_l['test_auroc']:.4f} | "
+            f"C*={res_l['best_c']} | Perm p={res_l['permutation_null_p']:.5f}"
         )
-        is_better = (res_l["val_auroc"] > best_val_auc + 1e-6) or (
-            abs(res_l["val_auroc"] - best_val_auc) <= 1e-6
+
+        # Select layer maximizing cross-domain transfer (mean of A1->A2 and zero-shot->B)
+        sel_metric = 0.5 * (res_l["cross_domain_val_auroc"] + b_zero_shot_auc)
+        is_better = (sel_metric > best_xdom_auc + 1e-4) or (
+            abs(sel_metric - best_xdom_auc) <= 1e-4
             and abs(l_i - default_layer) < abs(best_layer - default_layer)
         )
         if is_better:
-            best_val_auc = res_l["val_auroc"]
+            best_xdom_auc = sel_metric
             best_layer = l_i
             best_probe_bundle = res_l
 
@@ -404,7 +551,7 @@ def main() -> None:
                 "selected_layer": best_layer,
                 "hidden_size": hidden_size,
                 "appraisal_window_tokens": app_win,
-                "probe_val_auroc": best_probe_bundle["val_auroc"],
+                "cross_domain_transfer_score": round(best_xdom_auc, 4),
                 "probe_test_auroc": best_probe_bundle["test_auroc"],
                 "probe_test_accuracy": best_probe_bundle["test_accuracy"],
                 "probe_permutation_p": best_probe_bundle["permutation_null_p"],
@@ -426,8 +573,8 @@ def main() -> None:
 
     print(f"\n[DONE] Saved RepE artifact to: {out_pt}")
     print(
-        f"       Layer={best_layer} | Test AUROC={best_probe_bundle['test_auroc']:.4f} "
-        f"(Perm p={best_probe_bundle['permutation_null_p']:.5f}) | "
+        f"       Layer={best_layer} | CrossDomScore={best_xdom_auc:.4f} | "
+        f"Test AUROC={best_probe_bundle['test_auroc']:.4f} (Perm p={best_probe_bundle['permutation_null_p']:.5f}) | "
         f"Cos(w, v_inequity)={probe_steer_cos:.4f} | Cos(v_placebo, v_inequity)={placebo_cos:.6f}"
     )
 

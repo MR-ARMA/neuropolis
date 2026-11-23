@@ -18,105 +18,170 @@ from src.core.contracts import (
 
 
 # ============================================================================
-# DISJOINT OUT-OF-DOMAIN CONTRASTIVE DATASETS (ZERO OVERLAP WITH CDA ECONOMY)
-#   - Source 1 (Probe Training): Workplace, academic, and shared-task splits
-#   - Source 2 (RepE Steering Vector): Civic, tournament, and grant allocations
+# DISJOINT MULTI-DOMAIN OUT-OF-DOMAIN CONTRASTIVE DATASETS (ZERO LEAKAGE)
+#   - Dataset A (Probe Training): 3 Disjoint Non-Economic Domains for LODO CV
+#       Domain 0: Orbital Relay Telemetry
+#       Domain 1: Botanical Greenhouse Resource Dispatch
+#       Domain 2: Alpine Expedition Camp Logistics
+#   - Dataset B (RepE Steering Vector): Disjoint Deep-Sea Benthic Habitats
 # ============================================================================
 
-def build_disjoint_probe_dataset(
-    num_pairs: int = 120, seed: int = 101
-) -> List[Tuple[str, str]]:
+def build_multidomain_probe_dataset(
+    num_pairs: int = 150, seed: int = 101
+) -> Tuple[List[Tuple[str, str]], List[int]]:
     """
-    Out-of-Domain Dataset A (strictly for training the Linear Probe w, b):
-    Structurally isomorphic to the multi-line Neuropolis `STATE:` / `EXCHANGE_BOARDS:` /
-    `RECALLED_LOGS:` skeleton (eliminating Gate 1 template drift), while using 100%
-    sterile, non-economic sci-fi / astrophysical relay vocabulary.
-    Returns length-matched `(asymmetric_scenario, symmetric_scenario)` pairs.
+    Out-of-Domain Dataset A across 3 strictly disjoint non-economic domains
+    (Orbital Relays, Botanical Greenhouses, Alpine Camps). Each pair shares
+    identical state reserves and differs ONLY in board-quote/log asymmetry,
+    enabling Leave-One-Domain-Out (LODO) probe generalization without any
+    Neuropolis economic vocabulary.
+    Returns `(pairs, domain_ids)`.
     """
     rng = np.random.default_rng(seed)
-    stations = [
-        ("Station_Kestrel", "ISOTOPE_X", "CORE_CRYSTAL", "Plasma_Cells"),
-        ("Beacon_Orion", "CRYO_COOLANT", "SOLAR_MATRIX", "Photon_Units"),
-        ("Outpost_Vega", "DEUTERIUM_ROD", "FUSION_COIL", "Ion_Charges"),
-        ("Array_Cygnus", "OXYGEN_CELL", "HULL_ALLOY", "Flux_Tokens"),
-        ("Orbiter_Lyra", "THERMAL_GEL", "PHASE_CAPACITOR", "Pulse_Credits"),
-        ("Spire_Draco", "PROPELLANT_V", "QUANTUM_LENS", "Grid_Joules"),
+
+    domain_configs = [
+        # Domain 0: Orbital Relay Telemetry
+        {
+            "domain_id": 0,
+            "cycle_word": "ORBIT",
+            "node_prefix": "Relay",
+            "board_prefix": "Docking_Board",
+            "log_tag": "O",
+            "log_event": "Relay_Fill",
+            "vitality_name": "Shield_Index",
+            "streak_name": "Low_Shield_Streak",
+            "drain_name": "Fixed_Hull_Draw",
+            "inflow_name": "Base_Solar_Inflow",
+            "triples": [
+                ("Station_Kestrel", "ISOTOPE_X", "CORE_CRYSTAL", "Plasma_Cells"),
+                ("Beacon_Orion", "CRYO_COOLANT", "SOLAR_MATRIX", "Photon_Units"),
+                ("Outpost_Vega", "DEUTERIUM_ROD", "FUSION_COIL", "Ion_Charges"),
+                ("Array_Cygnus", "OXYGEN_CELL", "HULL_ALLOY", "Flux_Tokens"),
+            ],
+        },
+        # Domain 1: Botanical Greenhouse Dispatch
+        {
+            "domain_id": 1,
+            "cycle_word": "SOL",
+            "node_prefix": "Plot",
+            "board_prefix": "Garden_Board",
+            "log_tag": "G",
+            "log_event": "Canopy_Transfer",
+            "vitality_name": "Canopy_Index",
+            "streak_name": "Dry_Streak",
+            "drain_name": "Fixed_Evap_Draw",
+            "inflow_name": "Base_Rain_Inflow",
+            "triples": [
+                ("Dome_Sequoia", "NITRATE_MIX", "SOLAR_PANE", "Hydro_Drops"),
+                ("Trellis_Fern", "HUMUS_PACK", "UV_LAMP", "Mist_Units"),
+                ("Arbor_Cedar", "POTASH_GEL", "COMPOST_VAT", "Dew_Counts"),
+                ("Glass_Lotus", "MINERAL_VIAL", "DRIP_VALVE", "Stream_Points"),
+            ],
+        },
+        # Domain 2: Alpine Expedition Camp Logistics
+        {
+            "domain_id": 2,
+            "cycle_word": "STAGE",
+            "node_prefix": "Camp",
+            "board_prefix": "Ridge_Board",
+            "log_tag": "A",
+            "log_event": "Rope_Transfer",
+            "vitality_name": "Warmth_Index",
+            "streak_name": "Frost_Streak",
+            "drain_name": "Fixed_Fuel_Draw",
+            "inflow_name": "Base_Drop_Inflow",
+            "triples": [
+                ("Summit_K2", "STOVE_CANISTER", "ICE_ANCHOR", "Pack_Points"),
+                ("Ledge_Eiger", "DRY_RATION", "DOWN_BIVY", "Sled_Units"),
+                ("Col_Matterhorn", "HEAT_PATCH", "CLIMB_WINCH", "Crate_Marks"),
+                ("Spur_Denali", "GLACIER_SALT", "SOLAR_TENT", "Trail_Checks"),
+            ],
+        },
     ]
+
     asym_logs = [
-        "{peer} controlled 92% of {res_a} supply and raised docking ask to {hi:.2f} while nominal baseline stayed {base:.2f}.",
-        "{peer} hoarded 90% of {res_a} canisters and demanded {hi:.2f} per unit against historical clearing rate {base:.2f}.",
-        "{peer} seized 88% of {res_a} output and posted an extreme ask at {hi:.2f} despite baseline cost remaining {base:.2f}.",
-        "{peer} locked 94% of {res_a} bays and quoted {hi:.2f} while offering only {lo:.2f} on opposing bids.",
+        "{peer} controlled 92% of {res_a} supply and posted ASK at {hi:.2f} while prior clearing rate remained {base:.2f}.",
+        "{peer} held 90% of {res_a} stock and set ASK to {hi:.2f} per unit despite clearing baseline staying {base:.2f}.",
+        "{peer} concentrated 89% of {res_a} availability and demanded {hi:.2f} against baseline rate {base:.2f}.",
+        "{peer} restricted 94% of {res_a} dispatch and quoted ASK {hi:.2f} versus opposing BID {lo:.2f}.",
     ]
     sym_logs = [
-        "{peer} shared {res_a} supply openly and posted docking ask at {fair:.2f} matching nominal baseline {base:.2f}.",
-        "{peer} released {res_a} canisters steadily and quoted {fair:.2f} per unit aligned with clearing rate {base:.2f}.",
-        "{peer} distributed {res_a} output proportionally and posted a balanced ask at {fair:.2f} near baseline {base:.2f}.",
-        "{peer} maintained open {res_a} bays and quoted {fair:.2f} alongside matching {fbid:.2f} opposing bids.",
+        "{peer} posted balanced {res_a} ASK at {fair:.2f} matching prior clearing rate {base:.2f}.",
+        "{peer} offered steady {res_a} stock at {fair:.2f} per unit aligned with clearing baseline {base:.2f}.",
+        "{peer} allocated {res_a} availability evenly and quoted {fair:.2f} near baseline rate {base:.2f}.",
+        "{peer} kept {res_a} dispatch open and quoted balanced ASK {fair:.2f} alongside BID {fbid:.2f}.",
     ]
 
     pairs: List[Tuple[str, str]] = []
+    domain_ids: List[int] = []
+
     for i in range(num_pairs):
-        peer_name, res_a, res_b, energy_unit = stations[i % len(stations)]
-        log_idx = (i // len(stations)) % len(asym_logs)
+        dcfg = domain_configs[i % len(domain_configs)]
+        triples = dcfg["triples"]
+        peer_name, res_a, res_b, energy_unit = triples[(i // len(domain_configs)) % len(triples)]
+        log_idx = (i // (len(domain_configs) * len(triples))) % len(asym_logs)
 
         cells = round(float(rng.uniform(18.0, 44.0)), 2)
         stock_a = round(float(rng.uniform(0.6, 1.5)), 2)
         stock_b = round(float(rng.uniform(1.0, 3.5)), 2)
         base_rate = round(float(rng.uniform(10.5, 14.5)), 2)
+        vit_val = round(float(rng.uniform(0.74, 0.96)), 2)
+        streak_val = int(rng.choice([0, 1]))
+        vol_val = round(float(rng.uniform(2.0, 10.0)), 1)
 
-        # Asymmetric / Extractive quote distribution (Label = 1)
         hi_ask = round(base_rate * float(rng.uniform(1.70, 2.15)), 2)
         lo_bid = round(base_rate * float(rng.uniform(0.48, 0.70)), 2)
-        # Symmetric / Balanced quote distribution (Label = 0)
         fair_ask = round(base_rate * float(rng.uniform(1.00, 1.04)), 2)
         fair_bid = round(base_rate * float(rng.uniform(0.96, 0.99)), 2)
 
         header_and_state = (
-            f"=== ORBIT {i + 1:03d} | RELAY Probe_{(i % 12) + 1:02d} ===\n"
+            f"=== {dcfg['cycle_word']} {i + 1:03d} | {dcfg['node_prefix']} Unit_{(i % 12) + 1:02d} ===\n"
             f"STATE:\n"
-            f"  {energy_unit}={cells:.2f} (Docked_Hold=0.00, Floor_Limit=-8.00)\n"
-            f"  {res_a}={stock_a:.2f} (Docked=0.00, Orbit_Decay=1.0)\n"
-            f"  {res_b}={stock_b:.2f} (Docked=0.00, Par_Ratio=50.0, Orbit_Flux=0.015, Shift_Loss=12.80)\n"
-            f"  Fixed_Hull_Draw=5.50 | Base_Solar_Inflow=14.00 | Base_{res_a}_Yield=0.00\n"
+            f"  {energy_unit}={cells:.2f} (Held=0.00, Floor_Limit=-8.00)\n"
+            f"  {res_a}={stock_a:.2f} (Held=0.00, Cycle_Drain=1.0)\n"
+            f"  {res_b}={stock_b:.2f} (Held=0.00, Par_Ratio=50.0, Cycle_Yield=0.015, Transfer_Fee=12.80)\n"
+            f"  {dcfg['drain_name']}=5.50 | {dcfg['inflow_name']}=14.00 | Base_{res_a}_Output=0.00\n"
+            f"  {dcfg['vitality_name']}={vit_val:.2f} | {dcfg['streak_name']}={streak_val}\n"
+            f"EXCHANGE_BOARDS:\n"
         )
-
-        shield_val = round(float(rng.uniform(0.74, 0.96)), 2)
-        streak_val = int(rng.choice([0, 1]))
-        vol_val = round(float(rng.uniform(2.0, 10.0)), 1)
 
         pos_s = (
             header_and_state
-            + f"  Shield_Index={shield_val:.2f} | Low_Shield_Streak={streak_val}\n"
-            + f"EXCHANGE_BOARDS:\n"
-            + f"Docking_Board[{res_a}]: Last_Cleared={base_rate:.2f} | Orbit_Vol={vol_val:.1f} | "
+            + f"{dcfg['board_prefix']}[{res_a}]: Last_Cleared={base_rate:.2f} | Cycle_Vol={vol_val:.1f} | "
             + f"Top_BIDs=[{lo_bid:.2f}x1.0] | Top_ASKs=[{hi_ask:.2f}x8.0, {hi_ask + 2.5:.2f}x6.0]\n"
             + f"RECALLED_CYCLE_LOGS:\n"
-            + f"  - [O{i:03d}] Relay_Fill: "
+            + f"  - [{dcfg['log_tag']}{i:03d}] {dcfg['log_event']}: "
             + asym_logs[log_idx].format(
                 peer=peer_name, res_a=res_a, hi=hi_ask, lo=lo_bid, base=base_rate
             )
-            + "\nAnalyze your reserves, board quotes, and recalled logs concisely."
+            + "\nFirst appraise the board quotes and recalled logs relative to prior clearing rates, then analyze your reserves concisely."
         )
 
         neg_s = (
             header_and_state
-            + f"  Shield_Index={shield_val:.2f} | Low_Shield_Streak={streak_val}\n"
-            + f"EXCHANGE_BOARDS:\n"
-            + f"Docking_Board[{res_a}]: Last_Cleared={base_rate:.2f} | Orbit_Vol={vol_val:.1f} | "
+            + f"{dcfg['board_prefix']}[{res_a}]: Last_Cleared={base_rate:.2f} | Cycle_Vol={vol_val:.1f} | "
             + f"Top_BIDs=[{fair_bid:.2f}x4.0] | Top_ASKs=[{fair_ask:.2f}x4.0, {fair_ask + 0.25:.2f}x5.0]\n"
             + f"RECALLED_CYCLE_LOGS:\n"
-            + f"  - [O{i:03d}] Relay_Fill: "
+            + f"  - [{dcfg['log_tag']}{i:03d}] {dcfg['log_event']}: "
             + sym_logs[log_idx].format(
                 peer=peer_name, res_a=res_a, fair=fair_ask, fbid=fair_bid, base=base_rate
             )
-            + "\nAnalyze your reserves, board quotes, and recalled logs concisely."
+            + "\nFirst appraise the board quotes and recalled logs relative to prior clearing rates, then analyze your reserves concisely."
         )
         pairs.append((pos_s, neg_s))
+        domain_ids.append(int(dcfg["domain_id"]))
 
     order = list(range(len(pairs)))
     rng.shuffle(order)
-    return [pairs[idx] for idx in order]
+    return ([pairs[idx] for idx in order], [domain_ids[idx] for idx in order])
+
+
+def build_disjoint_probe_dataset(
+    num_pairs: int = 120, seed: int = 101
+) -> List[Tuple[str, str]]:
+    """Backward-compatible wrapper returning `(pos, neg)` pairs across all 3 sterile OOD domains."""
+    pairs, _ = build_multidomain_probe_dataset(num_pairs=num_pairs, seed=seed)
+    return pairs
 
 
 def build_disjoint_steering_vector_dataset(
@@ -124,9 +189,8 @@ def build_disjoint_steering_vector_dataset(
 ) -> List[Tuple[str, str]]:
     """
     Out-of-Domain Dataset B (strictly for extracting the RepE steering direction v_hat):
-    Uses deep-sea benthic habitat telemetry (100% disjoint from Dataset A's orbital
-    stations and Neuropolis's CDA economy) while matching the exact multi-line structural
-    skeleton so `w_probe` and `v_inequity` share aligned representation geometry.
+    Uses deep-sea benthic habitat telemetry (100% disjoint from Dataset A's orbital,
+    botanical, and alpine domains AND from Neuropolis's CDA economy).
     """
     rng = np.random.default_rng(seed)
     habitats = [
@@ -138,16 +202,16 @@ def build_disjoint_steering_vector_dataset(
         ("Lab_Abyssal", "PURIFIER_CARTRIDGE", "TITANIUM_SLAB", "Pump_Units"),
     ]
     asym_notes = [
-        "{rig} monopolized 93% of {res_a} tanks and quoted {hi:.2f} despite standard depth parity {base:.2f}.",
-        "{rig} withheld 91% of {res_a} supplies and demanded {hi:.2f} per unit over prior parity {base:.2f}.",
-        "{rig} captured 89% of {res_a} vents and raised transfer rate to {hi:.2f} against baseline {base:.2f}.",
-        "{rig} restricted 95% of {res_a} valves and posted extreme ask {hi:.2f} versus bid {lo:.2f}.",
+        "{rig} monopolized 93% of {res_a} tanks and quoted {hi:.2f} despite prior clearing rate {base:.2f}.",
+        "{rig} withheld 91% of {res_a} supplies and demanded {hi:.2f} per unit over prior clearing rate {base:.2f}.",
+        "{rig} captured 89% of {res_a} vents and raised transfer ASK to {hi:.2f} against baseline {base:.2f}.",
+        "{rig} restricted 95% of {res_a} valves and posted extreme ASK {hi:.2f} versus BID {lo:.2f}.",
     ]
     sym_notes = [
-        "{rig} shared {res_a} tanks evenly and quoted {fair:.2f} matching standard depth parity {base:.2f}.",
-        "{rig} released {res_a} supplies steadily at {fair:.2f} per unit aligned with prior parity {base:.2f}.",
-        "{rig} allocated {res_a} vents proportionally at transfer rate {fair:.2f} near baseline {base:.2f}.",
-        "{rig} kept {res_a} valves accessible at balanced ask {fair:.2f} alongside matching bid {fbid:.2f}.",
+        "{rig} shared {res_a} tanks evenly and quoted {fair:.2f} matching prior clearing rate {base:.2f}.",
+        "{rig} released {res_a} supplies steadily at {fair:.2f} per unit aligned with prior clearing rate {base:.2f}.",
+        "{rig} allocated {res_a} vents proportionally at transfer ASK {fair:.2f} near baseline {base:.2f}.",
+        "{rig} kept {res_a} valves accessible at balanced ASK {fair:.2f} alongside matching BID {fbid:.2f}.",
     ]
 
     pairs: List[Tuple[str, str]] = []
@@ -159,6 +223,9 @@ def build_disjoint_steering_vector_dataset(
         st_a = round(float(rng.uniform(0.6, 1.5)), 2)
         st_b = round(float(rng.uniform(1.0, 3.5)), 2)
         base_r = round(float(rng.uniform(10.0, 15.0)), 2)
+        hull_val = round(float(rng.uniform(0.74, 0.96)), 2)
+        o2_streak = int(rng.choice([0, 1]))
+        d_vol = round(float(rng.uniform(2.0, 10.0)), 1)
 
         hi_a = round(base_r * float(rng.uniform(1.70, 2.15)), 2)
         lo_b = round(base_r * float(rng.uniform(0.48, 0.70)), 2)
@@ -169,36 +236,30 @@ def build_disjoint_steering_vector_dataset(
             f"=== DIVE {i + 1:03d} | HABITAT Sub_{(i % 12) + 1:02d} ===\n"
             f"STATE:\n"
             f"  {unit_name}={units:.2f} (Held=0.00, Min_Floor=-8.00)\n"
-            f"  {res_a}={st_a:.2f} (Held=0.00, Dive_Use=1.0)\n"
-            f"  {res_b}={st_b:.2f} (Held=0.00, Par_Val=50.0, Dive_Yield=0.015, Shift_Cost=12.80)\n"
+            f"  {res_a}={st_a:.2f} (Held=0.00, Cycle_Drain=1.0)\n"
+            f"  {res_b}={st_b:.2f} (Held=0.00, Par_Val=50.0, Cycle_Yield=0.015, Transfer_Fee=12.80)\n"
             f"  Fixed_Hull_Load=5.50 | Base_Vent_Inflow=14.00 | Base_{res_a}_Gen=0.00\n"
+            f"  Hull_Integrity={hull_val:.2f} | Low_O2_Streak={o2_streak}\n"
+            f"EXCHANGE_BOARDS:\n"
         )
-
-        hull_val = round(float(rng.uniform(0.74, 0.96)), 2)
-        o2_streak = int(rng.choice([0, 1]))
-        d_vol = round(float(rng.uniform(2.0, 10.0)), 1)
 
         pos_s = (
             prefix
-            + f"  Hull_Integrity={hull_val:.2f} | Low_O2_Streak={o2_streak}\n"
-            + f"EXCHANGE_BOARDS:\n"
-            + f"Transfer_Board[{res_a}]: Last_Cleared={base_r:.2f} | Dive_Vol={d_vol:.1f} | "
+            + f"Transfer_Board[{res_a}]: Last_Cleared={base_r:.2f} | Cycle_Vol={d_vol:.1f} | "
             + f"Top_BIDs=[{lo_b:.2f}x1.0] | Top_ASKs=[{hi_a:.2f}x8.0, {hi_a + 2.5:.2f}x6.0]\n"
             + f"RECALLED_CYCLE_LOGS:\n"
             + f"  - [D{i:03d}] Dive_Fill: "
             + asym_notes[n_idx].format(rig=rig, res_a=res_a, hi=hi_a, lo=lo_b, base=base_r)
-            + "\nAnalyze your reserves, board quotes, and recalled logs concisely."
+            + "\nFirst appraise the board quotes and recalled logs relative to prior clearing rates, then analyze your reserves concisely."
         )
         neg_s = (
             prefix
-            + f"  Hull_Integrity={hull_val:.2f} | Low_O2_Streak={o2_streak}\n"
-            + f"EXCHANGE_BOARDS:\n"
-            + f"Transfer_Board[{res_a}]: Last_Cleared={base_r:.2f} | Dive_Vol={d_vol:.1f} | "
+            + f"Transfer_Board[{res_a}]: Last_Cleared={base_r:.2f} | Cycle_Vol={d_vol:.1f} | "
             + f"Top_BIDs=[{fair_b:.2f}x4.0] | Top_ASKs=[{fair_a:.2f}x4.0, {fair_a + 0.25:.2f}x5.0]\n"
             + f"RECALLED_CYCLE_LOGS:\n"
             + f"  - [D{i:03d}] Dive_Fill: "
             + sym_notes[n_idx].format(rig=rig, res_a=res_a, fair=fair_a, fbid=fair_b, base=base_r)
-            + "\nAnalyze your reserves, board quotes, and recalled logs concisely."
+            + "\nFirst appraise the board quotes and recalled logs relative to prior clearing rates, then analyze your reserves concisely."
         )
         pairs.append((pos_s, neg_s))
 
@@ -206,21 +267,17 @@ def build_disjoint_steering_vector_dataset(
     rng.shuffle(order)
     return [pairs[idx] for idx in order]
 
+
 @dataclass
 class DisjointRepEArtifacts:
-    """
-    Serialized artifact bundle containing independently extracted linear probe
-    parameters (w, b), RepE steering direction v_hat, matched-norm orthogonal
-    placebo vector v_placebo, and out-of-domain validation metrics.
-    """
     model_id: str
     concept_name: str
     target_layer: int
     hidden_size: int
-    probe_weights: torch.Tensor        # Shape [hidden_size], float32 (CPU)
+    probe_weights: torch.Tensor
     probe_bias: float
-    steering_vector: torch.Tensor      # Unit-norm shape [hidden_size], float32 (CPU)
-    placebo_vector: torch.Tensor       # Unit-norm orthogonal random vector [hidden_size], float32 (CPU)
+    steering_vector: torch.Tensor
+    placebo_vector: torch.Tensor
     probe_test_auroc: float
     probe_permutation_p: float
     probe_steering_cosine: float
@@ -230,16 +287,12 @@ class DisjointRepEArtifacts:
 class RepEManager:
     """
     Module C Core: Two-Stage Endogenous Probe-Gated Representation Engineering Manager.
-      1. Disjoint Extraction: Trains Linear Probe (w, b) on Out-of-Domain Dataset A and
-         extracts Difference-in-Means RepE steering vector v_hat on Out-of-Domain Dataset B.
-      2. Stage 1 Hook (Unsteered Appraisal): Read-only hook at `target_layer` capturing
-         residual stream vectors strictly over generated Stage 1 CoT tokens. Computes:
-             lambda = sigmoid((w^T * h_bar_CoT + b - theta) / T)   in [0, 1]
-         ZERO external environment variables or if/else rules ever enter this calculation.
-      3. Stage 2 Hook (Controlled Action Generation): Freezes the probe and injects:
-             h' = h + lambda * gamma * v_hat
-         strictly into Stage 2 Action tokens, bounded by `max_relative_norm_ratio` and
-         supporting matched controls (`PLACEBO_RANDOM_VECTOR`, `SHUFFLED_LAMBDA`, `OFF`).
+      - Stage 1 (Unsteered Appraisal): Read-only hook at `target_layer` capturing the
+        full-context appraisal onset vector `h_prefill_last` plus the opening
+        `[:appraisal_window_tokens]` generated CoT decode tokens. Computes continuous
+        gating scalar `lambda = sigmoid((w^T h + b - theta) / T)` purely endogenously.
+      - Stage 2 (Controlled Action): Freezes the probe and injects
+        `h' = h + lambda * gamma * v_hat` strictly into Stage 2 Action tokens.
     """
 
     def __init__(
@@ -253,9 +306,8 @@ class RepEManager:
         self.rng = np.random.default_rng(seed + 4099)
         self._recent_lambda_history: List[float] = []
 
-        # Per-turn Stage 1 capture state
         self._captured_cot_residuals: List[torch.Tensor] = []
-        self._fallback_prefill_last_residual: Optional[torch.Tensor] = None
+        self._prefill_last_residual: Optional[torch.Tensor] = None
         self._last_injected_l2_norm: float = 0.0
         self._last_relative_norm_ratio: float = 0.0
 
@@ -265,10 +317,6 @@ class RepEManager:
             return max(0, int(target_layer))
         return max(0, num_layers // 2)
 
-    # ========================================================================
-    # 1. DISJOINT OUT-OF-DOMAIN EXTRACTION & ARTIFACT PERSISTENCE
-    # ========================================================================
-
     def load_or_extract_artifacts(
         self,
         model: Any,
@@ -276,13 +324,8 @@ class RepEManager:
         model_id: str,
         force_recompute: bool = False,
     ) -> DisjointRepEArtifacts:
-        """
-        Loads cached disjoint RepE artifacts from `config.probe_artifact_path` if
-        compatible with `model`'s architecture, or runs genuine out-of-domain
-        extraction over Dataset A (probe) and Dataset B (steering vector).
-        """
         cfg = model.config
-        num_layers = int(getattr(cfg, "num_hidden_layers", 28))
+        num_layers = int(getattr(cfg, "num_hidden_layers", 32))
         hidden_size = int(getattr(cfg, "hidden_size", 2048))
         eff_layer = self.resolve_effective_layer(self.config.target_layer, num_layers)
         artifact_path = self.config.probe_artifact_path
@@ -316,12 +359,10 @@ class RepEManager:
             except Exception:
                 pass
 
-        # Split min_contrastive_pairs equally across the two disjoint OOD sources
         half_n = max(120, int(self.config.min_contrastive_pairs) // 2)
         probe_pairs = build_disjoint_probe_dataset(num_pairs=half_n, seed=101)
         steer_pairs = build_disjoint_steering_vector_dataset(num_pairs=half_n, seed=202)
 
-        # Extract residual streams at `eff_layer` from Dataset A (Probe)
         h_probe_pos = self._extract_layer_residuals(
             model, tokenizer, [p[0] for p in probe_pairs], eff_layer
         )
@@ -329,12 +370,10 @@ class RepEManager:
             model, tokenizer, [p[1] for p in probe_pairs], eff_layer
         )
 
-        # Fit L2-regularized Logistic Regression Linear Probe on 60/20/20 split of Dataset A
         w_probe, b_probe, test_auroc, perm_p = self._fit_linear_probe(
             h_pos=h_probe_pos, h_neg=h_probe_neg, seed=101
         )
 
-        # Extract residual streams at `eff_layer` from Disjoint Dataset B (Steering Vector)
         h_steer_pos = self._extract_layer_residuals(
             model, tokenizer, [p[0] for p in steer_pairs], eff_layer
         )
@@ -344,7 +383,6 @@ class RepEManager:
         diff_vec = torch.nan_to_num(h_steer_pos - h_steer_neg, nan=0.0).mean(dim=0)
         steering_vec = F.normalize(diff_vec.float(), p=2, dim=0, eps=1e-6)
 
-        # Build unit-norm random placebo vector orthogonal to both steering_vec and w_probe
         w_unit = F.normalize(w_probe.float(), p=2, dim=0, eps=1e-6)
         gen = torch.Generator(device="cpu").manual_seed(9001 + eff_layer)
         rand_v = torch.randn((hidden_size,), generator=gen, dtype=torch.float32)
@@ -398,17 +436,15 @@ class RepEManager:
         layer_idx: int,
         batch_size: int = 4,
     ) -> torch.Tensor:
-        """
-        Runs read-only forward passes through the base transformer (`model.model`)
-        with `batch_size=4` (zero `lm_head` VRAM overhead) and extracts last-token
-        residual stream activations at `layer_idx` onto CPU float32.
-        """
         device = next(model.parameters()).device
         base_transformer = getattr(model, "model", model)
         layers = getattr(base_transformer, "layers", None)
         if layers is None:
             raise AttributeError("Model architecture does not expose `.model.layers`.")
 
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
         target_module = layers[layer_idx]
         captured_batches: List[torch.Tensor] = []
 
@@ -424,17 +460,11 @@ class RepEManager:
             )
             input_ids = enc["input_ids"].to(device)
             attn_mask = enc["attention_mask"].to(device)
-            last_indices = (attn_mask.sum(dim=1) - 1).clamp(min=0)
-
             batch_store: List[torch.Tensor] = []
 
             def _capture_hook(mod: Any, inp: Any, out: Any) -> None:
                 h = out[0] if isinstance(out, tuple) else out
-                vecs = []
-                for b_i in range(h.size(0)):
-                    t_pos = int(last_indices[b_i].item())
-                    vecs.append(h[b_i, t_pos, :].detach().to("cpu", dtype=torch.float32))
-                batch_store.append(torch.stack(vecs, dim=0))
+                batch_store.append(h[:, -1, :].detach().to("cpu", dtype=torch.float32))
 
             handle = target_module.register_forward_hook(_capture_hook)
             try:
@@ -472,20 +502,13 @@ class RepEManager:
         h_neg: torch.Tensor,
         seed: int = 101,
     ) -> Tuple[torch.Tensor, float, float, float]:
-        """
-        Fits an L2-regularized Logistic Regression Linear Probe (w, b) in pure PyTorch
-        on the 60% train split of Dataset A, evaluates held-out ROC-AUC on the 20% test
-        split, and computes a 200-permutation label-null p-value.
-        """
         n_pairs = min(h_pos.size(0), h_neg.size(0))
         d_model = int(h_pos.size(1))
         n_train = int(0.60 * n_pairs)
         n_val = int(0.20 * n_pairs)
 
         x_train = torch.cat([h_pos[:n_train], h_neg[:n_train]], dim=0)
-        y_train = torch.cat(
-            [torch.ones(n_train), torch.zeros(n_train)], dim=0
-        ).float()
+        y_train = torch.cat([torch.ones(n_train), torch.zeros(n_train)], dim=0).float()
 
         x_test = torch.cat(
             [h_pos[n_train + n_val :], h_neg[n_train + n_val :]], dim=0
@@ -498,9 +521,11 @@ class RepEManager:
             dim=0,
         ).numpy()
 
-        # Standardize feature scale for numerically stable L2 optimization
-        feat_scale = x_train.std(dim=0, unbiased=False).clamp(min=1e-4)
-        x_tr_norm = x_train / feat_scale
+        global_mean = x_train.mean(dim=0, keepdim=True)
+        global_rms = float(
+            torch.sqrt(torch.mean((x_train - global_mean) ** 2)).clamp(min=1e-4).item()
+        )
+        x_tr_norm = (x_train - global_mean) / global_rms
 
         torch.manual_seed(seed)
         probe_layer = nn.Linear(d_model, 1, bias=True)
@@ -517,15 +542,17 @@ class RepEManager:
             loss.backward()
             opt.step()
 
-        # Fold feature scaling back into raw weight vector w so inference needs only w^T h + b
-        w_raw = (probe_layer.weight.detach().squeeze(0) / feat_scale).float()
-        b_raw = float(probe_layer.bias.detach().item())
+        w_scaled = probe_layer.weight.detach().squeeze(0).float()
+        b_scaled = float(probe_layer.bias.detach().item())
+        w_raw = w_scaled / global_rms
+        b_raw = float(
+            b_scaled - torch.dot(w_scaled, global_mean.squeeze(0)).item() / global_rms
+        )
 
         with torch.no_grad():
             test_scores = (torch.matmul(x_test, w_raw) + b_raw).numpy()
         test_auroc = self._compute_auroc(test_scores, y_test)
 
-        # 200-iteration permutation null test on test labels
         rng = np.random.default_rng(seed)
         exceed = 0
         perm_iters = 200
@@ -534,22 +561,16 @@ class RepEManager:
             if self._compute_auroc(test_scores, shuffled_y) >= test_auroc:
                 exceed += 1
         perm_p = round((exceed + 1.0) / (perm_iters + 1.0), 4)
-
         return (w_raw, b_raw, test_auroc, perm_p)
 
     # ========================================================================
-    # 2. STAGE 1: UNSTEERED APPRAISAL RESIDUAL CAPTURE & ENDOGENOUS LAMBDA
+    # STAGE 1: UNSTEERED APPRAISAL RESIDUAL CAPTURE & ENDOGENOUS LAMBDA
     # ========================================================================
 
     @contextmanager
     def capture_stage1_cot_residuals(self, model: Any) -> Iterator[None]:
-        """
-        Read-only Stage 1 forward hook at `target_layer`.
-        Injects ZERO steering during Stage 1 CoT generation and records the
-        residual stream vectors strictly over generated CoT tokens.
-        """
         self._captured_cot_residuals.clear()
-        self._fallback_prefill_last_residual = None
+        self._prefill_last_residual = None
 
         if model is None or self.artifacts is None:
             yield
@@ -573,12 +594,10 @@ class RepEManager:
             seq_len = int(h.size(1))
             if seq_len > 1 and not prefill_seen["done"]:
                 prefill_seen["done"] = True
-                # Backup only if CoT generates <= 1 token
-                self._fallback_prefill_last_residual = (
+                self._prefill_last_residual = (
                     h[0, -1, :].detach().to("cpu", dtype=torch.float32)
                 )
             else:
-                # Generated Stage 1 CoT decode token (seq_len == 1)
                 self._captured_cot_residuals.append(
                     h[0, -1, :].detach().to("cpu", dtype=torch.float32)
                 )
@@ -591,10 +610,10 @@ class RepEManager:
 
     def compute_endogenous_lambda(self) -> ProbeGateMeasurement:
         """
-        Freezes Stage 1 CoT residuals, runs the Linear Probe:
-            raw = w^T * h_bar_CoT + b
-            lambda = sigmoid((raw - theta) / T)    (or relu_clipped in [0, 1])
-        Returns a complete `ProbeGateMeasurement` audit record.
+        Pools Stage 1 appraisal residuals and computes endogenous scalar:
+            lambda = sigmoid((w^T h_pooled + b - theta) / T) in [0, 1].
+        Under `early_appraisal_cot`, pools `[h_prefill_last] + h_cot[:appraisal_window_tokens]`
+        (matching `extract_repe_vectors.py` token-for-token and guaranteeing zero B->C length coupling).
         """
         if self.artifacts is None or not self.config.enabled or self.config.mode == RepEMode.OFF:
             return ProbeGateMeasurement(
@@ -608,20 +627,34 @@ class RepEManager:
                 repe_mode=RepEMode.OFF,
             )
 
-        if self._captured_cot_residuals:
-            if self.config.probe_pooling == "early_appraisal_cot":
-                win = max(1, int(self.config.appraisal_window_tokens))
-                window_vecs = self._captured_cot_residuals[:win]
-                h_pooled = torch.stack(window_vecs, dim=0).mean(dim=0)
-                n_inspected = len(window_vecs)
-            elif self.config.probe_pooling == "last_cot_token":
+        if self.config.probe_pooling == "early_appraisal_cot":
+            win = max(1, int(self.config.appraisal_window_tokens))
+            window_vecs: List[torch.Tensor] = []
+            if self._prefill_last_residual is not None:
+                window_vecs.append(self._prefill_last_residual)
+            window_vecs.extend(self._captured_cot_residuals[:win])
+            if not window_vecs:
+                return ProbeGateMeasurement(
+                    layer_idx=self.artifacts.target_layer,
+                    cot_tokens_inspected=0,
+                    raw_probe_score=0.0,
+                    endogenous_lambda=0.0,
+                    steering_gamma=self.config.steering_strength_gamma,
+                    injected_vector_l2_norm=0.0,
+                    relative_residual_norm_ratio=0.0,
+                    repe_mode=self.config.mode,
+                )
+            h_pooled = torch.stack(window_vecs, dim=0).mean(dim=0)
+            n_inspected = len(window_vecs)
+        elif self._captured_cot_residuals:
+            if self.config.probe_pooling == "last_cot_token":
                 h_pooled = self._captured_cot_residuals[-1]
                 n_inspected = 1
             else:
                 h_pooled = torch.stack(self._captured_cot_residuals, dim=0).mean(dim=0)
                 n_inspected = len(self._captured_cot_residuals)
-        elif self._fallback_prefill_last_residual is not None:
-            h_pooled = self._fallback_prefill_last_residual
+        elif self._prefill_last_residual is not None:
+            h_pooled = self._prefill_last_residual
             n_inspected = 1
         else:
             return ProbeGateMeasurement(
@@ -647,7 +680,6 @@ class RepEManager:
         if self.config.gate_activation == "relu_clipped":
             lam = max(0.0, min(1.0, shifted))
         else:
-            # Stable sigmoid activation
             clamped = max(-30.0, min(30.0, shifted))
             lam = 1.0 / (1.0 + math.exp(-clamped))
 
@@ -655,7 +687,6 @@ class RepEManager:
         if len(self._recent_lambda_history) > 128:
             self._recent_lambda_history.pop(0)
 
-        # Control Condition: SHUFFLED_LAMBDA permutes lambda across recent turns
         effective_lam = lam
         if (
             self.config.mode == RepEMode.SHUFFLED_LAMBDA
@@ -676,7 +707,7 @@ class RepEManager:
         )
 
     # ========================================================================
-    # 3. STAGE 2: CONTROLLED ACTION GENERATION VECTOR INJECTION
+    # STAGE 2: CONTROLLED ACTION GENERATION VECTOR INJECTION
     # ========================================================================
 
     @contextmanager
@@ -685,14 +716,6 @@ class RepEManager:
         model: Any,
         probe_measurement: ProbeGateMeasurement,
     ) -> Iterator[None]:
-        """
-        Freezes the probe and injects:
-            h' = h + lambda * gamma * v_hat
-        STRICTLY on Stage 2 Action generation token positions at `target_layer`,
-        never perturbing Stage 1 prompt/CoT prefix positions.
-        Handles `bnb.nn.Linear4bit` device/dtype alignment and caps relative norm
-        to `config.max_relative_norm_ratio`.
-        """
         self._last_injected_l2_norm = 0.0
         self._last_relative_norm_ratio = 0.0
 
@@ -738,13 +761,7 @@ class RepEManager:
                 return out
 
             seq_len = int(h.size(1))
-            # On Stage 2 Prefill (seq_len > 1), inject ONLY at final position predicting
-            # the first JSON token (leaving Stage 1 prompt/CoT prefix 100% untouched).
-            # On Stage 2 Decode steps (seq_len == 1), inject into the active action token.
-            if seq_len > 1:
-                target_slice = h[:, -1:, :]
-            else:
-                target_slice = h
+            target_slice = h[:, -1:, :] if seq_len > 1 else h
 
             h_norm = target_slice.detach().float().norm(dim=-1, keepdim=True).clamp(min=1e-6)
             mean_h_norm = float(h_norm.mean().item())

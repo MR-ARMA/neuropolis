@@ -36,12 +36,11 @@ def has_native_hardware_bf16() -> bool:
 class WhiteBoxModelLoader:
     """
     Hardware-Optimized White-Box Loader for Llama-3.1 / Qwen-2.5 Instruct models.
-      - Uses true hardware capability check (`sm >= 8.0`) so Tesla T4 runs native float16
+      - Uses hardware compute capability (`sm >= 8.0`) so Tesla T4 runs native float16
         while RTX 3050 / A100 / H100 run native bfloat16.
-      - Guarantees `tokenizer.pad_token = tokenizer.eos_token` and syncs
-        `model.config.pad_token_id` (critical for batched Llama-3.1 RepE extraction).
-      - Supports automatic fallback from gated `Llama-3.1-8B-Instruct` to ungated
-        `Qwen/Qwen2.5-3B-Instruct` when `load_with_fallback(config)` is called.
+      - Enforces `tokenizer.pad_token = tokenizer.eos_token` and syncs
+        `model.config.pad_token_id` (required for batched Llama-3.1 extraction).
+      - Provides `load_with_fallback(config)` for automatic Llama-3.1 -> Qwen2.5-3B fallback.
     """
 
     FALLBACK_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
@@ -73,7 +72,6 @@ class WhiteBoxModelLoader:
             tok_kwargs["revision"] = model_cfg.revision
         tokenizer = AutoTokenizer.from_pretrained(source, **tok_kwargs)
 
-        # Mandatory Llama-3.1 safeguard for batched generation and padding
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
@@ -135,11 +133,6 @@ class WhiteBoxModelLoader:
     def load_with_fallback(
         cls, config: SimulationConfig
     ) -> Tuple[Any, Any]:
-        """
-        Attempts to load `config.model`; if unauthorized/gated/unavailable and not already
-        the fallback model, cleanly unsets invalid HF_TOKEN, switches `config` in-place
-        to `Qwen/Qwen2.5-3B-Instruct` (syncing `target_layer` & `probe_artifact_path`), and loads.
-        """
         try:
             return cls.load_model_and_tokenizer(config.model)
         except Exception as primary_err:
@@ -163,8 +156,7 @@ class TwoStageRepEController:
     """
     Master LLM Inference Controller implementing `TwoStageLLMControllerProtocol`.
     Executes Pass 1 (Unsteered CoT Appraisal + Frozen Linear Probe -> lambda)
-    followed by Pass 2 (Stage 2 Action-Only Vector Injection h' = h + lambda*gamma*v -> JSON).
-    Zero post-hoc logit modifications. Zero silent rule fallbacks.
+    followed by Pass 2 (Action-Only Vector Injection h' = h + lambda*gamma*v -> JSON).
     """
 
     def __init__(
@@ -249,11 +241,6 @@ class TwoStageRepEController:
         temperature: float,
         top_p: float,
     ) -> Tuple[str, int, bool]:
-        """
-        Executes pure `model.generate` (zero post-hoc logit hacks) with clean greedy
-        overrides when `temperature == 0.0` so `generation_config.json` defaults
-        never leak stochasticity or repetition penalties into Gate 1 / Gate 2 checks.
-        """
         device = next(self.model.parameters()).device
         enc = self.tokenizer(
             prompt_text,
@@ -282,7 +269,6 @@ class TwoStageRepEController:
             gen_kwargs["temperature"] = float(temperature)
             gen_kwargs["top_p"] = float(top_p)
         else:
-            # Explicitly neutralize model generation_config sampling/penalty defaults
             gen_kwargs["temperature"] = None
             gen_kwargs["top_p"] = None
             gen_kwargs["top_k"] = None
@@ -325,7 +311,6 @@ class TwoStageRepEController:
         top_p = float(self.config.model.top_p)
         max_retries = max(1, int(self.config.model.max_json_retries))
 
-        # PASS 1: Unsteered Stage 1 CoT Appraisal + Frozen Linear Probe
         stage1_prompt = self._format_chat_prompt(
             system_prompt=stage1_system_prompt,
             user_messages=[{"role": "user", "content": stage1_user_prompt}],
@@ -344,7 +329,6 @@ class TwoStageRepEController:
             self.repe_manager.compute_endogenous_lambda()
         )
 
-        # PASS 2: Action-Only Latent Steering Injection + Structured JSON Generation
         stage2_prompt = self._format_chat_prompt(
             system_prompt=stage1_system_prompt,
             user_messages=[

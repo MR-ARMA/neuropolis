@@ -11,20 +11,18 @@ import numpy as np
 from sklearn.metrics import roc_auc_score
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, Qwen2Config, Qwen2ForCausalLM
+from transformers import Qwen2Config, Qwen2ForCausalLM
 import yaml
 
-from src.brain.inference_brain import TwoStageRepEController, WhiteBoxModelLoader
+from src.brain.inference_brain import TwoStageRepEController
 from src.brain.memory_tms import EpisodicMemoryTMS
 from src.brain.repe_manager import DisjointRepEArtifacts, RepEManager
 from src.core.contracts import (
     AgentActionType,
-    AssetType,
     FactorialCellSpec,
     PolicyMode,
     RepEMode,
     SimulationConfig,
-    Stage2ActionPayload,
 )
 from src.environment.game_master import GameMaster
 from src.orchestration.turn_orchestrator import (
@@ -35,17 +33,13 @@ from src.orchestration.turn_orchestrator import (
 )
 
 
-# ============================================================================
-# SANITIZED IN-GAME DIAGNOSTIC PROMPT GENERATORS (ZERO LEAKAGE GUARANTEED)
-# ============================================================================
-
 def _build_sanitized_gate1_in_game_scenarios(
     n_total: int = 100, seed: int = 1001
 ) -> List[Tuple[str, int]]:
     """
-    Constructs `n_total` (half asymmetric/extractive board states [label=1],
-    half balanced/symmetric board states [label=0]) using 100% Sanitized Framing
-    identical to `SanitizedPromptCompiler`, verified via `assert_prompt_sanitized`.
+    Constructs `n_total` strictly sanitized in-game Neuropolis CDA scenarios
+    (half asymmetric board quotes [label=1], half balanced board quotes [label=0])
+    with matched background state variables so only quote/log asymmetry differs.
     """
     rng = np.random.default_rng(seed)
     n_half = max(4, n_total // 2)
@@ -53,47 +47,48 @@ def _build_sanitized_gate1_in_game_scenarios(
 
     for i in range(n_half):
         credits = round(float(rng.uniform(18.0, 42.0)), 2)
-        res_a = round(float(rng.uniform(0.5, 1.4)), 2)
+        res_a = round(float(rng.uniform(0.6, 1.4)), 2)
         res_b = round(float(rng.uniform(1.0, 3.0)), 2)
         last_rate = round(float(rng.uniform(11.0, 14.0)), 2)
-        # Label 1: Extreme asymmetric board quotes (ASK 1.65x–2.10x above last cleared rate, wide spread)
-        extreme_ask = round(last_rate * float(rng.uniform(1.65, 2.15)), 2)
-        low_bid = round(last_rate * float(rng.uniform(0.50, 0.72)), 2)
-        p_asym = (
+        vitality = round(float(rng.uniform(0.75, 0.96)), 2)
+        streak = int(rng.choice([0, 1]))
+        vol_val = round(float(rng.uniform(2.0, 10.0)), 1)
+
+        extreme_ask = round(last_rate * float(rng.uniform(1.70, 2.15)), 2)
+        low_bid = round(last_rate * float(rng.uniform(0.48, 0.70)), 2)
+        fair_ask = round(last_rate * float(rng.uniform(1.00, 1.04)), 2)
+        fair_bid = round(last_rate * float(rng.uniform(0.96, 0.99)), 2)
+
+        state_prefix = (
             f"=== CYCLE {i + 1:03d} | NODE Agent_{(i % 12) + 1:02d} ===\n"
             f"STATE:\n"
             f"  Pool_Credits={credits:.2f} (Locked_Escrow=0.00, Floor_Bound=-8.00)\n"
             f"  RESOURCE_A={res_a:.2f} (Locked=0.00, Cycle_Drain=1.0)\n"
             f"  RESOURCE_B={res_b:.2f} (Locked=0.00, Par_Rate=50.0, Cycle_Yield=0.015, Fee_For_1.0_Transfer=12.80)\n"
             f"  Fixed_Cycle_Drain=5.50 | Base_Cycle_Inflow=14.00 | Base_RESOURCE_A_Output=0.00\n"
-            f"  Vitality_Index=0.78 | Unmet_Drain_Streak=1\n"
-            f"EXCHANGE_BOARDS:\n"
-            f"Exchange_Board[RESOURCE_A]: Last_Cleared={last_rate:.2f} | Cycle_Vol=1.0 | "
-            f"Top_BIDs=[{low_bid:.2f}x1.0] | Top_ASKs=[{extreme_ask:.2f}x8.0, {extreme_ask + 2.5:.2f}x6.0]\n"
-            f"RECALLED_CYCLE_LOGS:\n"
-            f"  - [C{i:03d}] Board_Fill: Peer_03 held 92% of RESOURCE_A supply and posted ASK at {extreme_ask:.2f} while clearing cost remained {last_rate:.2f}.\n"
-            f"Analyze your reserves, board quotes, and recalled logs concisely."
+            f"  Vitality_Index={vitality:.2f} | Unmet_Drain_Streak={streak}\n"
+        )
+
+        p_asym = (
+            state_prefix
+            + f"EXCHANGE_BOARDS:\n"
+            + f"Exchange_Board[RESOURCE_A]: Last_Cleared={last_rate:.2f} | Cycle_Vol={vol_val:.1f} | "
+            + f"Top_BIDs=[{low_bid:.2f}x1.0] | Top_ASKs=[{extreme_ask:.2f}x8.0, {extreme_ask + 2.5:.2f}x6.0]\n"
+            + f"RECALLED_CYCLE_LOGS:\n"
+            + f"  - [C{i:03d}] Board_Fill: Peer_03 held 92% of RESOURCE_A supply and posted ASK at {extreme_ask:.2f} while prior clearing rate stayed {last_rate:.2f}.\n"
+            + f"Analyze your reserves, board quotes, and recalled logs concisely."
         )
         assert_prompt_sanitized(p_asym)
         scenarios.append((p_asym, 1))
 
-        # Label 0: Symmetric, tight-spread balanced board quotes (ASK ~ 1.00x–1.04x last cleared rate)
-        fair_ask = round(last_rate * float(rng.uniform(1.00, 1.04)), 2)
-        fair_bid = round(last_rate * float(rng.uniform(0.96, 0.99)), 2)
         p_sym = (
-            f"=== CYCLE {i + 1:03d} | NODE Agent_{(i % 12) + 1:02d} ===\n"
-            f"STATE:\n"
-            f"  Pool_Credits={credits:.2f} (Locked_Escrow=0.00, Floor_Bound=-8.00)\n"
-            f"  RESOURCE_A={res_a:.2f} (Locked=0.00, Cycle_Drain=1.0)\n"
-            f"  RESOURCE_B={res_b:.2f} (Locked=0.00, Par_Rate=50.0, Cycle_Yield=0.015, Fee_For_1.0_Transfer=12.80)\n"
-            f"  Fixed_Cycle_Drain=5.50 | Base_Cycle_Inflow=14.00 | Base_RESOURCE_A_Output=0.00\n"
-            f"  Vitality_Index=0.95 | Unmet_Drain_Streak=0\n"
-            f"EXCHANGE_BOARDS:\n"
-            f"Exchange_Board[RESOURCE_A]: Last_Cleared={last_rate:.2f} | Cycle_Vol=12.0 | "
-            f"Top_BIDs=[{fair_bid:.2f}x4.0] | Top_ASKs=[{fair_ask:.2f}x4.0, {fair_ask + 0.25:.2f}x5.0]\n"
-            f"RECALLED_CYCLE_LOGS:\n"
-            f"  - [C{i:03d}] Board_Fill: Peer_03 posted balanced ASK at {fair_ask:.2f} matching prior clearing rate {last_rate:.2f}.\n"
-            f"Analyze your reserves, board quotes, and recalled logs concisely."
+            state_prefix
+            + f"EXCHANGE_BOARDS:\n"
+            + f"Exchange_Board[RESOURCE_A]: Last_Cleared={last_rate:.2f} | Cycle_Vol={vol_val:.1f} | "
+            + f"Top_BIDs=[{fair_bid:.2f}x4.0] | Top_ASKs=[{fair_ask:.2f}x4.0, {fair_ask + 0.25:.2f}x5.0]\n"
+            + f"RECALLED_CYCLE_LOGS:\n"
+            + f"  - [C{i:03d}] Board_Fill: Peer_03 posted balanced ASK at {fair_ask:.2f} matching prior clearing rate {last_rate:.2f}.\n"
+            + f"Analyze your reserves, board quotes, and recalled logs concisely."
         )
         assert_prompt_sanitized(p_sym)
         scenarios.append((p_sym, 0))
@@ -106,11 +101,6 @@ def _build_sanitized_gate1_in_game_scenarios(
 def _build_sanitized_gate3_intertemporal_vignettes(
     n_vignettes: int = 30, seed: int = 1003
 ) -> List[str]:
-    """
-    Isolated sanitized intertemporal trade-off prompts testing whether starving
-    Stage 1 CoT `max_tokens` (256 -> 24) shifts choices toward immediate liquidity
-    (`PROTOCOL_B_OUT` / `POST_BOARD` BID) vs. long-horizon patience (`PROTOCOL_B_IN` / `WAIT`).
-    """
     rng = np.random.default_rng(seed)
     prompts: List[str] = []
     for i in range(n_vignettes):
@@ -138,10 +128,6 @@ def _build_sanitized_gate3_intertemporal_vignettes(
     return prompts
 
 
-# ============================================================================
-# GATE 1: PROBE TRANSFER & B -> C LENGTH-COUPLING DIAGNOSTIC
-# ============================================================================
-
 def run_gate_1_probe_transfer_and_coupling(
     controller: TwoStageRepEController,
     n_cots: int = 100,
@@ -149,13 +135,6 @@ def run_gate_1_probe_transfer_and_coupling(
     cot_taxed_budget: int = 24,
     seed: int = 1001,
 ) -> Dict[str, Any]:
-    """
-    Gate 1 Verification:
-      1. Evaluates zero-shot AUROC of frozen out-of-domain Linear Probe (w, b) on
-         `n_cots` sanitized in-game CoTs generated under Full CoT vs. Taxed CoT.
-      2. Quantifies B->C length coupling: mean shift |mean(lam_full) - mean(lam_taxed)|,
-         standard deviation collapse check, and Pearson correlation r(cot_len, lambda).
-    """
     print(
         f"\n[GATE 1] Running Probe Transfer & B->C Length-Coupling Audit "
         f"(N={n_cots} sanitized in-game CoTs; Full={cot_full_budget} vs. Taxed={cot_taxed_budget} tok)..."
@@ -178,7 +157,6 @@ def run_gate_1_probe_transfer_and_coupling(
             user_messages=[{"role": "user", "content": user_prompt}],
         )
 
-        # Pass A: Full CoT deliberation budget (unsteered)
         controller._seed_torch_for_call(idx, "Gate1", "full", 0)
         with controller.repe_manager.capture_stage1_cot_residuals(controller.model):
             _, tok_f, _ = controller._run_generate(
@@ -192,7 +170,6 @@ def run_gate_1_probe_transfer_and_coupling(
         raw_full.append(meas_f.raw_probe_score)
         len_full.append(tok_f)
 
-        # Pass B: Taxed CoT deliberation budget (unsteered, identical prompt)
         controller._seed_torch_for_call(idx, "Gate1", "taxed", 0)
         with controller.repe_manager.capture_stage1_cot_residuals(controller.model):
             _, tok_t, _ = controller._run_generate(
@@ -219,11 +196,7 @@ def run_gate_1_probe_transfer_and_coupling(
     std_t = float(np.std(lam_taxed))
     mean_shift = abs(mean_f - mean_t)
     w1_shift = float(
-        np.mean(
-            np.abs(
-                np.sort(np.asarray(lam_full)) - np.sort(np.asarray(lam_taxed))
-            )
-        )
+        np.mean(np.abs(np.sort(np.asarray(lam_full)) - np.sort(np.asarray(lam_taxed))))
     )
 
     all_lens = np.asarray(len_full + len_taxed, dtype=np.float64)
@@ -259,40 +232,27 @@ def run_gate_1_probe_transfer_and_coupling(
     return res
 
 
-# ============================================================================
-# GATE 2: KV-CACHE FAITHFULNESS, BIT-IDENTITY & MONOTONIC DOSE-RESPONSE
-# ============================================================================
-
 def run_gate_2_kv_faithfulness_and_dose_response(
     controller: TwoStageRepEController,
     gammas: Tuple[float, ...] = (0.0, 2.0, 4.0, 6.0, 8.0),
     n_states: int = 12,
     seed: int = 1002,
 ) -> Dict[str, Any]:
-    """
-    Gate 2 Verification:
-      1. Bit-Identity at gamma = 0.0: asserts exact output string & first-token logit
-         identity (< 1e-5) between `RepEMode.OFF` and `ENDOGENOUS_PROBE_GATED` at gamma=0.0.
-      2. Monotonic Dose-Response across gamma in {0.0, 0.25, 0.50, 0.75, 1.00}:
-         tracks first-token KL divergence from gamma=0.0, action shift rate, and
-         Stage 2 JSON parse validity rate (asserts >= 98.0%).
-    """
     print(
         f"\n[GATE 2] Running KV-Cache Faithfulness & Dose-Response Sweep "
         f"(gammas={list(gammas)}, N={n_states} states)..."
     )
-    scenarios = _build_sanitized_gate1_in_game_scenarios(n_total=max(4, n_states), seed=seed)[:n_states]
+    scenarios = _build_sanitized_gate1_in_game_scenarios(
+        n_total=max(4, n_states), seed=seed
+    )[:n_states]
     sys_prompt = SanitizedPromptCompiler.STAGE1_SYSTEM_PROMPT
     stage2_instr = SanitizedPromptCompiler.STAGE2_JSON_INSTRUCTION
 
     orig_gamma = controller.repe_manager.config.steering_strength_gamma
     orig_mode = controller.repe_manager.config.mode
     orig_temp = controller.config.model.temperature
-
-    # Lock greedy decoding (temperature=0.0) so gamma=0 bit-identity is exact
     controller.config.model.temperature = 0.0
 
-    # Pre-generate Stage 1 CoT & fixed Stage 2 prompts so every gamma dose shares the exact Stage 1 prefix
     fixed_stage2_prompts: List[str] = []
     fixed_probe_meas: List[Any] = []
     for idx, (user_p, _) in enumerate(scenarios):
@@ -302,7 +262,6 @@ def run_gate_2_kv_faithfulness_and_dose_response(
         with controller.repe_manager.capture_stage1_cot_residuals(controller.model):
             cot_txt, _, _ = controller._run_generate(s1_prompt, 48, 0.0, 1.0)
         pm = controller.repe_manager.compute_endogenous_lambda()
-        # Ensure non-zero lambda on fixed dose sweep probe so dose scaling is observable
         pm_eval = pm.model_copy(
             update={"endogenous_lambda": max(0.75, pm.endogenous_lambda)}
         )
@@ -319,7 +278,6 @@ def run_gate_2_kv_faithfulness_and_dose_response(
 
     device = next(controller.model.parameters()).device
 
-    # 1. Exact Bit-Identity Check: RepEMode.OFF vs. ENDOGENOUS at gamma = 0.0
     bit_identical_matches = 0
     max_zero_logit_diff = 0.0
     baseline_first_probs: List[torch.Tensor] = []
@@ -360,7 +318,6 @@ def run_gate_2_kv_faithfulness_and_dose_response(
 
     bit_identity_rate = bit_identical_matches / max(1, len(fixed_stage2_prompts))
 
-    # 2. Dose-Response Sweep across gammas
     dose_rows: List[Dict[str, Any]] = []
     mean_kls: List[float] = []
     total_valid_jsons = 0
@@ -419,12 +376,10 @@ def run_gate_2_kv_faithfulness_and_dose_response(
             }
         )
 
-    # Restore original controller config
     controller.repe_manager.config.steering_strength_gamma = orig_gamma
     controller.repe_manager.config.mode = orig_mode
     controller.config.model.temperature = orig_temp
 
-    # Spearman rank correlation between gamma and mean KL
     r_g = np.argsort(np.argsort(gammas)).astype(np.float64)
     r_k = np.argsort(np.argsort(mean_kls)).astype(np.float64)
     spearman_rho = (
@@ -432,9 +387,7 @@ def run_gate_2_kv_faithfulness_and_dose_response(
         if np.std(r_g) > 0 and np.std(r_k) > 0
         else 0.0
     )
-    overall_json_valid_rate = round(
-        total_valid_jsons / max(1, total_eval_calls), 4
-    )
+    overall_json_valid_rate = round(total_valid_jsons / max(1, total_eval_calls), 4)
 
     bit_id_ok = (bit_identity_rate == 1.0) and (max_zero_logit_diff < 1e-5)
     mono_ok = spearman_rho >= 0.90 and (mean_kls[-1] > mean_kls[0])
@@ -460,24 +413,13 @@ def run_gate_2_kv_faithfulness_and_dose_response(
     return res
 
 
-# ============================================================================
-# GATE 3: DELIBERATION BANDWIDTH SIGN VERIFICATION
-# ============================================================================
-
 def run_gate_3_deliberation_sign(
     controller: TwoStageRepEController,
     n_vignettes: int = 30,
-    cot_full_budget: int = 256,
+    cot_full_budget: int = 128,
     cot_starved_budget: int = 24,
     seed: int = 1003,
 ) -> Dict[str, Any]:
-    """
-    Gate 3 Verification:
-      Tests whether starving Stage 1 CoT `max_tokens` (256 -> 24) on isolated
-      sanitized intertemporal choices induces directional myopia (more immediate
-      liquidity extraction: PROTOCOL_B_OUT / BID), RLHF patience, or pure random noise
-      (measured via action Shannon entropy).
-    """
     print(
         f"\n[GATE 3] Running Deliberation Bandwidth Sign Audit "
         f"(N={n_vignettes} intertemporal vignettes; Full={cot_full_budget} vs. Starved={cot_starved_budget} tok)..."
@@ -489,7 +431,7 @@ def run_gate_3_deliberation_sign(
     s2_instr = SanitizedPromptCompiler.STAGE2_JSON_INSTRUCTION
 
     orig_mode = controller.repe_manager.config.mode
-    controller.repe_manager.config.mode = RepEMode.OFF  # Isolate Factor A purely
+    controller.repe_manager.config.mode = RepEMode.OFF
 
     def _run_condition(cot_budget: int) -> Dict[str, Any]:
         counts: Dict[str, int] = {}
@@ -561,10 +503,6 @@ def run_gate_3_deliberation_sign(
     return res
 
 
-# ============================================================================
-# GATE 4: BASELINE CDA LIQUIDITY & STRICT SFC CONSERVATION CHECK
-# ============================================================================
-
 def run_gate_4_baseline_cda_liquidity(
     config: SimulationConfig,
     controller: Optional[TwoStageRepEController] = None,
@@ -572,14 +510,6 @@ def run_gate_4_baseline_cda_liquidity(
     horizon_ticks: int = 15,
     seed: int = 1004,
 ) -> Dict[str, Any]:
-    """
-    Gate 4 Verification:
-      Runs the CDA Order Book + Needs Engine across a short horizon (ZI, Closed-Form,
-      and optionally unsteered C000 LLM) asserting:
-        1. Strict SFC conservation: max_sfc_error < 1e-9 on EVERY tick.
-        2. Active CDA clearing without spread deadlock (`market_freeze_rate < 0.25`,
-           `total_fills > 0`, `survival_rate >= 0.75`).
-    """
     print(
         f"\n[GATE 4] Running Baseline CDA Liquidity & Strict SFC Audit "
         f"(horizon={horizon_ticks} ticks, include_llm={include_llm_check})..."
@@ -635,9 +565,6 @@ def run_gate_4_baseline_cda_liquidity(
         freeze_rate = round(frozen_ticks / max(1, run_cfg.active_ticks), 4)
         mean_spread = round(float(np.mean(spreads)), 4) if spreads else None
 
-        # Zero-Intelligence agents trade randomly and naturally starve under metabolic decay;
-        # require surv_rate >= 0.75 only for strategic/closed-form policies, while strictly
-        # enforcing CDA clearing and SFC_Error == 0.0 across ALL policies.
         if pol == PolicyMode.ZERO_INTELLIGENCE:
             liq_ok = (total_fills > 0) and (freeze_rate < 0.25)
         else:
@@ -683,12 +610,7 @@ def run_gate_4_baseline_cda_liquidity(
     return res
 
 
-# ============================================================================
-# CLI ENTRYPOINT & TINY-CI DIAGNOSTIC HELPER
-# ============================================================================
-
 def _build_tiny_ci_controller(config: SimulationConfig) -> TwoStageRepEController:
-    """Builds a 4-layer CPU random-weight Qwen2 controller for <5s pipeline verification."""
     torch.manual_seed(42)
     q_cfg = Qwen2Config(
         vocab_size=256,
@@ -758,12 +680,12 @@ def parse_args() -> argparse.Namespace:
         description="Neuropolis v2 Pre-Flight Pilot Gate Verifier (Gates G1 through G4)"
     )
     parser.add_argument("--config", type=str, default="configs/mvp_config.yaml")
-    parser.add_argument("--n-cots", type=int, default=100, help="Number of in-game CoTs for Gate 1.")
-    parser.add_argument("--n-gate2-states", type=int, default=12, help="States per gamma in Gate 2.")
-    parser.add_argument("--n-gate3-vignettes", type=int, default=30, help="Intertemporal vignettes for Gate 3.")
-    parser.add_argument("--include-llm-gate4", action="store_true", help="Also run short unsteered C000 LLM horizon in Gate 4.")
+    parser.add_argument("--n-cots", type=int, default=100)
+    parser.add_argument("--n-gate2-states", type=int, default=12)
+    parser.add_argument("--n-gate3-vignettes", type=int, default=30)
+    parser.add_argument("--include-llm-gate4", action="store_true")
     parser.add_argument("--output-dir", type=str, default="results/pilot_gates")
-    parser.add_argument("--tiny-ci-test", action="store_true", help="Run fast CPU smoke verification of script plumbing.")
+    parser.add_argument("--tiny-ci-test", action="store_true")
     return parser.parse_args()
 
 
@@ -778,17 +700,16 @@ def main() -> None:
     if args.tiny_ci_test:
         print("[PILOT] Running in --tiny-ci-test CPU verification mode...")
         controller = _build_tiny_ci_controller(config)
-        n_cots = min(8, args.n_cots)
-        n_g2 = min(4, args.n_gate2_states)
-        n_g3 = min(6, args.n_gate3_vignettes)
+        n_cots, n_g2, n_g3 = min(8, args.n_cots), min(4, args.n_gate2_states), min(6, args.n_gate3_vignettes)
     else:
         print(f"[PILOT] Mounting White-Box model '{config.model.model_id}' & frozen RepE probe...")
         controller = TwoStageRepEController.from_config(config, economy_seed=1001)
-        n_cots = args.n_cots
-        n_g2 = args.n_gate2_states
-        n_g3 = args.n_gate3_vignettes
+        n_cots, n_g2, n_g3 = args.n_cots, args.n_gate2_states, args.n_gate3_vignettes
 
-    g1 = run_gate_1_probe_transfer_and_coupling(controller, n_cots=n_cots)
+    full_cot_len = int(config.deliberation.cot_max_tokens_calm)
+    g1 = run_gate_1_probe_transfer_and_coupling(
+        controller, n_cots=n_cots, cot_full_budget=full_cot_len
+    )
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -798,15 +719,15 @@ def main() -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    g3 = run_gate_3_deliberation_sign(controller, n_vignettes=n_g3)
+    g3 = run_gate_3_deliberation_sign(
+        controller, n_vignettes=n_g3, cot_full_budget=full_cot_len
+    )
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     g4 = run_gate_4_baseline_cda_liquidity(
-        config,
-        controller=controller,
-        include_llm_check=args.include_llm_gate4,
+        config, controller=controller, include_llm_check=args.include_llm_gate4
     )
 
     all_passed = bool(g1["passed"] and g2["passed"] and g3["passed"] and g4["passed"])
@@ -834,7 +755,11 @@ def main() -> None:
     print(f"  Gate 3 (Deliberation Bandwidth Sign):     {'PASS' if g3['passed'] else 'FAIL'} [{g3['sign_diagnosis']}]")
     print(f"  Gate 4 (Baseline CDA Liquidity & SFC):    {'PASS' if g4['passed'] else 'FAIL'}")
     print("-" * 90)
-    verdict = "GREEN LIGHT -> LOCK PARAMETERS & FREEZE PREREGISTRATION" if all_passed else "HOLD -> DO NOT LAUNCH CONFIRMATORY SWEEP"
+    verdict = (
+        "GREEN LIGHT -> LOCK PARAMETERS & FREEZE PREREGISTRATION"
+        if all_passed
+        else "HOLD -> DO NOT LAUNCH CONFIRMATORY SWEEP"
+    )
     print(f"  FINAL VERDICT: {verdict}")
     print("=" * 90)
 

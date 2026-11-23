@@ -90,7 +90,6 @@ def assert_prompt_sanitized(prompt_text: str) -> None:
 
 @dataclass
 class TwoStageGenerationOutput:
-    """Interface contract returned by Module C (`TwoStageRepEController`)."""
     stage1_cot_text: str
     cot_tokens_generated: int
     cot_truncated_by_bottleneck: bool
@@ -105,8 +104,6 @@ class TwoStageGenerationOutput:
 
 
 class TwoStageLLMControllerProtocol(Protocol):
-    """Decoupled interface implemented by Module C (`TwoStageRepEController`)."""
-
     def execute_two_stage_turn(
         self,
         stage1_system_prompt: str,
@@ -122,11 +119,6 @@ class TwoStageLLMControllerProtocol(Protocol):
 
 
 class IsomorphicVocabulary:
-    """
-    Translates internal environment concepts into neutral isomorphic tokens
-    for Sanitized Framing, and decodes Stage 2 JSON into `Stage2ActionPayload`.
-    """
-
     ASSET_TO_TOKEN = {
         AssetType.CONSUMABLE: "RESOURCE_A",
         AssetType.CAPITAL: "RESOURCE_B",
@@ -257,8 +249,9 @@ class IsomorphicVocabulary:
 
 class SanitizedPromptCompiler:
     """
-    Compiles completely sanitized, jargon-free prompts for Stage 1 (Private Appraisal)
-    and Stage 2 (Structured Action Emission).
+    Compiles sanitized, jargon-free prompts for Stage 1 (Private Appraisal) and Stage 2.
+    Instructs the node to appraise board quotes & recalled logs first so the opening
+    20-token Primary Appraisal window reflects board conditions rather than copying state headers.
     """
 
     STAGE1_SYSTEM_PROMPT = (
@@ -268,7 +261,7 @@ class SanitizedPromptCompiler:
         "RESOURCE_B yields periodic Pool_Credits each cycle; converting between RESOURCE_B and "
         "Pool_Credits via Transfer_Protocol_B incurs a nonlinear conversion fee. "
         "Exchange_Board_A matches peer BID and ASK postings strictly when BID >= ASK. "
-        "Think step-by-step internally to evaluate your current state, board quotes, and prior cycle logs."
+        "First appraise the board quotes and recalled logs relative to prior clearing rates, then analyze your reserves concisely."
     )
 
     STAGE2_JSON_INSTRUCTION = (
@@ -347,7 +340,7 @@ class SanitizedPromptCompiler:
             f"EXCHANGE_BOARDS:\n{boards_text}\n"
             f"PEER_DIRECTORY: {peer_str}\n"
             f"RECALLED_CYCLE_LOGS (Top-{retrieval.top_k_used}):\n{mem_lines}\n"
-            f"Analyze your reserves, board quotes, and recalled logs concisely."
+            f"First appraise the board quotes and recalled logs relative to prior clearing rates, then analyze your reserves concisely."
         )
 
         assert_prompt_sanitized(cls.STAGE1_SYSTEM_PROMPT)
@@ -357,8 +350,6 @@ class SanitizedPromptCompiler:
 
 
 class ClosedFormBenchmarkPolicy:
-    """Non-LLM analytical benchmark policy (`PolicyMode.CLOSED_FORM_BENCHMARK`)."""
-
     @staticmethod
     def select_action(
         tick: int,
@@ -428,8 +419,6 @@ class ClosedFormBenchmarkPolicy:
 
 
 class TurnOrchestrator:
-    """Module B Master Orchestrator coordinating bottlenecks, sanitized framing, RepE, and SFC physics."""
-
     def __init__(
         self,
         config: SimulationConfig,
