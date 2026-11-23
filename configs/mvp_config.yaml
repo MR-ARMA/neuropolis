@@ -14,9 +14,9 @@ factorial_cell:
   policy_mode: "LLM_AGENT"
 
 model:
-  model_id: "Qwen/Qwen2.5-3B-Instruct"
+  model_id: "meta-llama/Llama-3.1-8B-Instruct"
   revision: "main"
-  local_dir: "./models/Qwen--Qwen2.5-3B-Instruct"
+  local_dir: "./models/meta-llama--Llama-3.1-8B-Instruct"
   load_in_4bit: true
   bnb_4bit_quant_type: "nf4"
   bnb_4bit_use_double_quant: true
@@ -57,7 +57,7 @@ cda:
 deliberation:
   enabled: true
   stress_activation_threshold: 0.0
-  cot_max_tokens_calm: 256
+  cot_max_tokens_calm: 128
   cot_min_tokens_stressed: 24
   stress_decay_steepness: 3.5
   action_json_max_tokens: 128
@@ -78,7 +78,7 @@ repe:
   mode: "ENDOGENOUS_PROBE_GATED"
   concept_name: "perceived_inequity"
   target_layer: 18
-  steering_strength_gamma: 1.50
+  steering_strength_gamma: 4.50
   probe_pooling: "early_appraisal_cot"
   appraisal_window_tokens: 24
   gate_activation: "sigmoid_centered"

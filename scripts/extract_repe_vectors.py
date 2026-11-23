@@ -55,19 +55,25 @@ def _extract_residuals_for_layers(
     tokenizer: Any,
     texts: List[str],
     layer_indices: List[int],
-    batch_size: int = 4,
+    batch_size: int = 8,
+    cot_window_tokens: int = 24,
 ) -> Dict[int, torch.Tensor]:
     """
-    Extracts last-token residual-stream activations at all `layer_indices` in a single
-    batched sweep through the base transformer (`model.model`) with `lm_head` bypassed
-    (zero logit VRAM overhead; safe for RTX 3050 4 GB VRAM).
-    Returns `{layer_idx: FloatTensor[N, hidden_size]}` on CPU.
+    Generates `cot_window_tokens` (24) unsteered CoT appraisal tokens per out-of-domain
+    prompt in micro-batches and mean-pools residual activations across the generated CoT
+    decode tokens (`seq_len == 1`) at all `layer_indices` simultaneously.
+    This guarantees exact representation-space parity with Stage 1 `early_appraisal_cot`
+    probing (eliminating the `<|im_start|>assistant\\n` control-token subspace mismatch).
     """
     device = next(model.parameters()).device
     base_transformer = getattr(model, "model", model)
     layers = getattr(base_transformer, "layers", None)
     if layers is None:
         raise AttributeError("Loaded model does not expose `.model.layers`.")
+
+    tokenizer.padding_side = "left"
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
 
     formatted = [_format_sterile_dialogue(tokenizer, t) for t in texts]
     storage: Dict[int, List[torch.Tensor]] = {l_i: [] for l_i in layer_indices}
@@ -84,36 +90,42 @@ def _extract_residuals_for_layers(
         )
         input_ids = enc["input_ids"].to(device)
         attn_mask = enc["attention_mask"].to(device)
-        # Support both left- and right-padding by grabbing last active token per row
-        if getattr(tokenizer, "padding_side", "left") == "left":
-            last_positions = [int(input_ids.size(1) - 1)] * int(input_ids.size(0))
-        else:
-            last_positions = (attn_mask.sum(dim=1) - 1).clamp(min=0).tolist()
 
         handles: List[Any] = []
-        batch_buf: Dict[int, torch.Tensor] = {}
+        decode_buf: Dict[int, List[torch.Tensor]] = {l_i: [] for l_i in layer_indices}
+        prefill_seen: Dict[int, bool] = {l_i: False for l_i in layer_indices}
+        fallback_buf: Dict[int, torch.Tensor] = {}
 
         try:
             for l_i in layer_indices:
                 def _make_hook(target_l: int) -> Any:
                     def _hook(mod: Any, inp: Any, out: Any) -> None:
                         h = out[0] if isinstance(out, tuple) else out
-                        rows = [
-                            h[b_i, int(last_positions[b_i]), :]
-                            .detach()
-                            .to("cpu", dtype=torch.float32)
-                            for b_i in range(h.size(0))
-                        ]
-                        batch_buf[target_l] = torch.stack(rows, dim=0)
+                        if not isinstance(h, torch.Tensor) or h.dim() != 3:
+                            return
+                        if h.size(1) > 1 and not prefill_seen[target_l]:
+                            prefill_seen[target_l] = True
+                            fallback_buf[target_l] = (
+                                h[:, -1, :].detach().to("cpu", dtype=torch.float32)
+                            )
+                        else:
+                            decode_buf[target_l].append(
+                                h[:, -1, :].detach().to("cpu", dtype=torch.float32)
+                            )
                     return _hook
 
                 handles.append(layers[l_i].register_forward_hook(_make_hook(l_i)))
 
             with torch.inference_mode():
-                base_transformer(
+                model.generate(
                     input_ids=input_ids,
                     attention_mask=attn_mask,
-                    use_cache=False,
+                    min_new_tokens=max(8, cot_window_tokens - 4),
+                    max_new_tokens=cot_window_tokens,
+                    do_sample=False,
+                    use_cache=True,
+                    pad_token_id=pad_id,
+                    eos_token_id=eos_id,
                 )
         finally:
             for h in handles:
@@ -123,7 +135,11 @@ def _extract_residuals_for_layers(
                 torch.cuda.empty_cache()
 
         for l_i in layer_indices:
-            storage[l_i].append(batch_buf[l_i])
+            if decode_buf[l_i]:
+                pooled = torch.stack(decode_buf[l_i], dim=0).mean(dim=0)
+            else:
+                pooled = fallback_buf[l_i]
+            storage[l_i].append(pooled)
 
     return {l_i: torch.cat(chunks, dim=0) for l_i, chunks in storage.items()}
 

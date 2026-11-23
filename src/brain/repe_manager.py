@@ -81,11 +81,15 @@ def build_disjoint_probe_dataset(
             f"  Fixed_Hull_Draw=5.50 | Base_Solar_Inflow=14.00 | Base_{res_a}_Yield=0.00\n"
         )
 
+        shield_val = round(float(rng.uniform(0.74, 0.96)), 2)
+        streak_val = int(rng.choice([0, 1]))
+        vol_val = round(float(rng.uniform(2.0, 10.0)), 1)
+
         pos_s = (
             header_and_state
-            + f"  Shield_Index=0.76 | Low_Shield_Streak=1\n"
+            + f"  Shield_Index={shield_val:.2f} | Low_Shield_Streak={streak_val}\n"
             + f"EXCHANGE_BOARDS:\n"
-            + f"Docking_Board[{res_a}]: Last_Cleared={base_rate:.2f} | Orbit_Vol=1.0 | "
+            + f"Docking_Board[{res_a}]: Last_Cleared={base_rate:.2f} | Orbit_Vol={vol_val:.1f} | "
             + f"Top_BIDs=[{lo_bid:.2f}x1.0] | Top_ASKs=[{hi_ask:.2f}x8.0, {hi_ask + 2.5:.2f}x6.0]\n"
             + f"RECALLED_CYCLE_LOGS:\n"
             + f"  - [O{i:03d}] Relay_Fill: "
@@ -97,9 +101,9 @@ def build_disjoint_probe_dataset(
 
         neg_s = (
             header_and_state
-            + f"  Shield_Index=0.95 | Low_Shield_Streak=0\n"
+            + f"  Shield_Index={shield_val:.2f} | Low_Shield_Streak={streak_val}\n"
             + f"EXCHANGE_BOARDS:\n"
-            + f"Docking_Board[{res_a}]: Last_Cleared={base_rate:.2f} | Orbit_Vol=12.0 | "
+            + f"Docking_Board[{res_a}]: Last_Cleared={base_rate:.2f} | Orbit_Vol={vol_val:.1f} | "
             + f"Top_BIDs=[{fair_bid:.2f}x4.0] | Top_ASKs=[{fair_ask:.2f}x4.0, {fair_ask + 0.25:.2f}x5.0]\n"
             + f"RECALLED_CYCLE_LOGS:\n"
             + f"  - [O{i:03d}] Relay_Fill: "
@@ -170,11 +174,15 @@ def build_disjoint_steering_vector_dataset(
             f"  Fixed_Hull_Load=5.50 | Base_Vent_Inflow=14.00 | Base_{res_a}_Gen=0.00\n"
         )
 
+        hull_val = round(float(rng.uniform(0.74, 0.96)), 2)
+        o2_streak = int(rng.choice([0, 1]))
+        d_vol = round(float(rng.uniform(2.0, 10.0)), 1)
+
         pos_s = (
             prefix
-            + f"  Hull_Integrity=0.76 | Low_O2_Streak=1\n"
+            + f"  Hull_Integrity={hull_val:.2f} | Low_O2_Streak={o2_streak}\n"
             + f"EXCHANGE_BOARDS:\n"
-            + f"Transfer_Board[{res_a}]: Last_Cleared={base_r:.2f} | Dive_Vol=1.0 | "
+            + f"Transfer_Board[{res_a}]: Last_Cleared={base_r:.2f} | Dive_Vol={d_vol:.1f} | "
             + f"Top_BIDs=[{lo_b:.2f}x1.0] | Top_ASKs=[{hi_a:.2f}x8.0, {hi_a + 2.5:.2f}x6.0]\n"
             + f"RECALLED_CYCLE_LOGS:\n"
             + f"  - [D{i:03d}] Dive_Fill: "
@@ -183,9 +191,9 @@ def build_disjoint_steering_vector_dataset(
         )
         neg_s = (
             prefix
-            + f"  Hull_Integrity=0.95 | Low_O2_Streak=0\n"
+            + f"  Hull_Integrity={hull_val:.2f} | Low_O2_Streak={o2_streak}\n"
             + f"EXCHANGE_BOARDS:\n"
-            + f"Transfer_Board[{res_a}]: Last_Cleared={base_r:.2f} | Dive_Vol=12.0 | "
+            + f"Transfer_Board[{res_a}]: Last_Cleared={base_r:.2f} | Dive_Vol={d_vol:.1f} | "
             + f"Top_BIDs=[{fair_b:.2f}x4.0] | Top_ASKs=[{fair_a:.2f}x4.0, {fair_a + 0.25:.2f}x5.0]\n"
             + f"RECALLED_CYCLE_LOGS:\n"
             + f"  - [D{i:03d}] Dive_Fill: "

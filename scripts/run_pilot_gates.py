@@ -265,7 +265,7 @@ def run_gate_1_probe_transfer_and_coupling(
 
 def run_gate_2_kv_faithfulness_and_dose_response(
     controller: TwoStageRepEController,
-    gammas: Tuple[float, ...] = (0.0, 0.25, 0.50, 0.75, 1.00),
+    gammas: Tuple[float, ...] = (0.0, 2.0, 4.0, 6.0, 8.0),
     n_states: int = 12,
     seed: int = 1002,
 ) -> Dict[str, Any]:
