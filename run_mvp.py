@@ -496,8 +496,23 @@ def main() -> None:
             from src.brain.inference_brain import TwoStageRepEController
             from src.brain.repe_manager import RepEManager
 
+            ckpt_path = os.path.join(args.output_dir, f"checkpoint_{cid}.json")
+            cached_by_seed: Dict[int, EconomySeedClusterMetrics] = {}
+            if os.path.exists(ckpt_path):
+                with open(ckpt_path, "r", encoding="utf-8") as cf:
+                    for row in json.load(cf):
+                        sc_obj = EconomySeedClusterMetrics(**row)
+                        cached_by_seed[sc_obj.economy_seed] = sc_obj
+                print(
+                    f"       [RESUME] Loaded {len(cached_by_seed)} cached seeds from {ckpt_path}"
+                )
+
             seed_results = []
             for s_idx, s_val in enumerate(seed_list, start=1):
+                if s_val in cached_by_seed:
+                    seed_results.append(cached_by_seed[s_val])
+                    continue
+
                 if cell_cfg.policy_mode == PolicyMode.LLM_AGENT:
                     repe_mgr = RepEManager(
                         config=cell_cfg.repe,
@@ -522,12 +537,24 @@ def main() -> None:
                     output_dir=turn_log_dir,
                 )
                 seed_results.append(res)
-                if s_idx % 5 == 0 or s_idx == len(seed_list):
+                cached_by_seed[s_val] = res
+                with open(ckpt_path, "w", encoding="utf-8") as cf:
+                    json.dump(
+                        [
+                            dataclasses.asdict(cached_by_seed[k])
+                            for k in sorted(cached_by_seed.keys())
+                        ],
+                        cf,
+                        indent=2,
+                    )
+
+                if s_idx % 3 == 0 or s_idx == len(seed_list):
                     print(
                         f"       Completed {s_idx}/{len(seed_list)} seeds "
                         f"(last seed={s_val}, Valid={res.json_valid_rate:.1%}, "
                         f"Freeze={res.consumable_market_freeze_rate:.1%}, "
-                        f"SFC_Err={res.max_sfc_conservation_error:.2e})"
+                        f"SFC_Err={res.max_sfc_conservation_error:.2e})",
+                        flush=True,
                     )
             clusters_by_cell[cid] = seed_results
 

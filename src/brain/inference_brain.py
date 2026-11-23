@@ -4,7 +4,7 @@ import gc
 import hashlib
 import os
 import time
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -22,15 +22,31 @@ from src.orchestration.turn_orchestrator import (
 )
 
 
+def has_native_hardware_bf16() -> bool:
+    """
+    Returns True strictly on Ampere+ GPUs (compute capability >= 8.0).
+    Tesla T4 (Turing sm_75) lacks native BF16 tensor cores and must use float16.
+    """
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability(0)
+    return major >= 8
+
+
 class WhiteBoxModelLoader:
     """
-    Hardware-Optimized White-Box Loader for Qwen-2.5 / Llama-3 / Mistral Instruct models.
-      - Supports 4-bit NF4 Double-Quant via `bitsandbytes` pinned to `cuda:0`
-        (e.g. Qwen2.5-3B-Instruct fits in ~2.2 GiB VRAM on an RTX 3050 4 GB GPU
-        with >1.1 GiB activation headroom and zero CPU offload bottlenecks).
-      - Supports native `bfloat16` / `float16` on 24 GB GPUs and `float32` on CPU CI.
-      - Strictly enforces `config.attn_implementation` as a single source of truth.
+    Hardware-Optimized White-Box Loader for Llama-3.1 / Qwen-2.5 Instruct models.
+      - Uses true hardware capability check (`sm >= 8.0`) so Tesla T4 runs native float16
+        while RTX 3050 / A100 / H100 run native bfloat16.
+      - Guarantees `tokenizer.pad_token = tokenizer.eos_token` and syncs
+        `model.config.pad_token_id` (critical for batched Llama-3.1 RepE extraction).
+      - Supports automatic fallback from gated `Llama-3.1-8B-Instruct` to ungated
+        `Qwen/Qwen2.5-3B-Instruct` when `load_with_fallback(config)` is called.
     """
+
+    FALLBACK_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
+    FALLBACK_LOCAL_DIR = "./models/Qwen--Qwen2.5-3B-Instruct"
+    FALLBACK_TARGET_LAYER = 18
 
     @staticmethod
     def resolve_local_or_hub_path(model_cfg: ModelRuntimeConfig) -> str:
@@ -52,21 +68,19 @@ class WhiteBoxModelLoader:
         source = cls.resolve_local_or_hub_path(model_cfg)
         has_cuda = torch.cuda.is_available()
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            source,
-            revision=model_cfg.revision if source == model_cfg.model_id else None,
-            trust_remote_code=True,
-        )
+        tok_kwargs: Dict[str, Any] = {"trust_remote_code": True}
+        if source == model_cfg.model_id:
+            tok_kwargs["revision"] = model_cfg.revision
+        tokenizer = AutoTokenizer.from_pretrained(source, **tok_kwargs)
+
+        # Mandatory Llama-3.1 safeguard for batched generation and padding
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
 
         if has_cuda:
             torch.cuda.empty_cache()
-            if (
-                model_cfg.compute_dtype == "bfloat16"
-                and torch.cuda.is_bf16_supported()
-            ):
+            if model_cfg.compute_dtype == "bfloat16" and has_native_hardware_bf16():
                 compute_dtype = torch.bfloat16
             elif model_cfg.compute_dtype == "float32":
                 compute_dtype = torch.float32
@@ -106,7 +120,9 @@ class WhiteBoxModelLoader:
         for p in model.parameters():
             p.requires_grad = False
 
-        # Single source of truth assertion for attention implementation
+        if getattr(model.config, "pad_token_id", None) is None:
+            model.config.pad_token_id = tokenizer.pad_token_id
+
         actual_impl = getattr(
             model.config, "_attn_implementation", model_cfg.attn_implementation
         )
@@ -115,29 +131,40 @@ class WhiteBoxModelLoader:
         )
         return (model, tokenizer)
 
+    @classmethod
+    def load_with_fallback(
+        cls, config: SimulationConfig
+    ) -> Tuple[Any, Any]:
+        """
+        Attempts to load `config.model`; if unauthorized/gated/unavailable and not already
+        the fallback model, cleanly unsets invalid HF_TOKEN, switches `config` in-place
+        to `Qwen/Qwen2.5-3B-Instruct` (syncing `target_layer` & `probe_artifact_path`), and loads.
+        """
+        try:
+            return cls.load_model_and_tokenizer(config.model)
+        except Exception as primary_err:
+            if config.model.model_id == cls.FALLBACK_MODEL_ID:
+                raise
+            print(
+                f"[LOADER WARN] Primary model '{config.model.model_id}' failed ({primary_err}). "
+                f"Falling back automatically to '{cls.FALLBACK_MODEL_ID}'..."
+            )
+            os.environ.pop("HF_TOKEN", None)
+            config.model.model_id = cls.FALLBACK_MODEL_ID
+            config.model.local_dir = cls.FALLBACK_LOCAL_DIR
+            config.repe.target_layer = cls.FALLBACK_TARGET_LAYER
+            config.repe.probe_artifact_path = (
+                f"artifacts/probes/inequity_probe_l{cls.FALLBACK_TARGET_LAYER}.pt"
+            )
+            return cls.load_model_and_tokenizer(config.model)
+
 
 class TwoStageRepEController:
     """
     Master LLM Inference Controller implementing `TwoStageLLMControllerProtocol`.
-    Executes the exact Two-Stage Endogenous Probe-Gated RepE Pipeline:
-
-      - PASS 1 (Stage 1 — Unsteered Appraisal):
-          Generates private Chain-of-Thought strictly bounded by `cot_max_tokens`
-          with ZERO steering hooks active. A read-only hook extracts the CoT residual
-          stream at `target_layer` and the Linear Probe computes continuous scalar
-          lambda = sigmoid((w^T h + b - theta) / T).
-
-      - PASS 2 (Stage 2 — Controlled Action Generation):
-          Freezes the probe. Conditioned on Stage 1 prompt + generated CoT + Stage 2
-          JSON instruction, generates the action JSON within the full, stress-invariant
-          `action_max_tokens` budget while injecting h' = h + lambda * gamma * v_hat
-          strictly into the Stage 2 action tokens.
-
-    STRICT SCIENTIFIC INVARIANTS:
-      - ZERO post-hoc logit modifications or probability shifts.
-      - ZERO external environment if/else triggers for steering.
-      - ZERO silent rule fallbacks: if Stage 2 JSON fails strict validation after
-        `max_json_retries`, emits explicit `ABSTAIN` (`json_valid=False, abstain=True`).
+    Executes Pass 1 (Unsteered CoT Appraisal + Frozen Linear Probe -> lambda)
+    followed by Pass 2 (Stage 2 Action-Only Vector Injection h' = h + lambda*gamma*v -> JSON).
+    Zero post-hoc logit modifications. Zero silent rule fallbacks.
     """
 
     def __init__(
@@ -163,8 +190,7 @@ class TwoStageRepEController:
         economy_seed: Optional[int] = None,
         force_recompute_probe: bool = False,
     ) -> "TwoStageRepEController":
-        """Convenience factory that mounts the 4-bit/bf16 model and disjoint RepE artifacts."""
-        model, tokenizer = WhiteBoxModelLoader.load_model_and_tokenizer(config.model)
+        model, tokenizer = WhiteBoxModelLoader.load_with_fallback(config)
         repe_mgr = RepEManager(
             config=config.repe,
             seed=economy_seed if economy_seed is not None else config.master_seed,
@@ -196,7 +222,7 @@ class TwoStageRepEController:
     def _format_chat_prompt(
         self,
         system_prompt: str,
-        user_messages: list[dict[str, str]],
+        user_messages: List[Dict[str, str]],
     ) -> str:
         messages = [{"role": "system", "content": system_prompt}] + user_messages
         if hasattr(self.tokenizer, "apply_chat_template"):
@@ -224,8 +250,9 @@ class TwoStageRepEController:
         top_p: float,
     ) -> Tuple[str, int, bool]:
         """
-        Executes pure, unmodified `model.generate` (ZERO post-hoc logit modification)
-        and returns `(decoded_text, num_tokens_generated, hit_token_limit)`.
+        Executes pure `model.generate` (zero post-hoc logit hacks) with clean greedy
+        overrides when `temperature == 0.0` so `generation_config.json` defaults
+        never leak stochasticity or repetition penalties into Gate 1 / Gate 2 checks.
         """
         device = next(self.model.parameters()).device
         enc = self.tokenizer(
@@ -254,15 +281,20 @@ class TwoStageRepEController:
         if do_sample:
             gen_kwargs["temperature"] = float(temperature)
             gen_kwargs["top_p"] = float(top_p)
+        else:
+            # Explicitly neutralize model generation_config sampling/penalty defaults
+            gen_kwargs["temperature"] = None
+            gen_kwargs["top_p"] = None
+            gen_kwargs["top_k"] = None
+            gen_kwargs["repetition_penalty"] = 1.0
 
         try:
             with torch.inference_mode():
                 out_ids = self.model.generate(**gen_kwargs)
             new_tokens = out_ids[0, prompt_len:].detach().cpu().tolist()
             num_gen = len(new_tokens)
-            hit_limit = (
-                num_gen >= int(max_new_tokens)
-                and (eos_id is None or (num_gen > 0 and new_tokens[-1] != eos_id))
+            hit_limit = num_gen >= int(max_new_tokens) and (
+                eos_id is None or (num_gen > 0 and new_tokens[-1] != eos_id)
             )
             decoded = self.tokenizer.decode(
                 new_tokens, skip_special_tokens=True
@@ -288,18 +320,12 @@ class TwoStageRepEController:
             [str], Tuple[Stage2ActionPayload, bool, Optional[str]]
         ] = IsomorphicVocabulary.parse_sanitized_action_json,
     ) -> TwoStageGenerationOutput:
-        """
-        Executes Pass 1 (Unsteered CoT + Linear Probe -> lambda) followed by
-        Pass 2 (Frozen Probe + Latent Vector Injection h' = h + lambda*gamma*v -> Action JSON).
-        """
         t0 = time.perf_counter()
         base_temp = float(self.config.model.temperature)
         top_p = float(self.config.model.top_p)
         max_retries = max(1, int(self.config.model.max_json_retries))
 
-        # ====================================================================
-        # PASS 1: UNSTEERED APPRAISAL (Bounded Deliberation CoT + Residual Probe)
-        # ====================================================================
+        # PASS 1: Unsteered Stage 1 CoT Appraisal + Frozen Linear Probe
         stage1_prompt = self._format_chat_prompt(
             system_prompt=stage1_system_prompt,
             user_messages=[{"role": "user", "content": stage1_user_prompt}],
@@ -314,14 +340,11 @@ class TwoStageRepEController:
                 top_p=top_p,
             )
 
-        # Compute endogenous continuous scalar lambda purely from Stage 1 CoT residuals
         probe_measurement: ProbeGateMeasurement = (
             self.repe_manager.compute_endogenous_lambda()
         )
 
-        # ====================================================================
-        # PASS 2: CONTROLLED ACTION GENERATION (Steered Action JSON Only)
-        # ====================================================================
+        # PASS 2: Action-Only Latent Steering Injection + Structured JSON Generation
         stage2_prompt = self._format_chat_prompt(
             system_prompt=stage1_system_prompt,
             user_messages=[
@@ -336,7 +359,6 @@ class TwoStageRepEController:
 
         for retry_idx in range(max_retries):
             self._seed_torch_for_call(tick, agent_id, "stage2_action", retry_idx)
-            # Slightly sharpen temperature on retry while keeping zero logit overrides
             retry_temp = base_temp if retry_idx == 0 else max(0.25, base_temp * 0.75)
 
             with self.repe_manager.inject_stage2_action_steering(
@@ -373,7 +395,6 @@ class TwoStageRepEController:
                     latency_ms=latency_ms,
                 )
 
-        # All retries exhausted -> explicit ABSTAIN (zero silent heuristic fallbacks)
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
         gc.collect()
         if torch.cuda.is_available():

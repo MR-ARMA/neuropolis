@@ -20,7 +20,7 @@ model:
   load_in_4bit: true
   bnb_4bit_quant_type: "nf4"
   bnb_4bit_use_double_quant: true
-  compute_dtype: "bfloat16"
+  compute_dtype: "float16"
   attn_implementation: "sdpa"
   temperature: 0.70
   top_p: 0.95
@@ -77,15 +77,15 @@ repe:
   enabled: true
   mode: "ENDOGENOUS_PROBE_GATED"
   concept_name: "perceived_inequity"
-  target_layer: 18
+  target_layer: 16
   steering_strength_gamma: 4.50
   probe_pooling: "early_appraisal_cot"
-  appraisal_window_tokens: 24
+  appraisal_window_tokens: 20
   gate_activation: "sigmoid_centered"
   probe_threshold_theta: 0.0
   probe_temperature: 1.0
   max_relative_norm_ratio: 0.25
-  probe_artifact_path: "artifacts/probes/inequity_probe_l18.pt"
+  probe_artifact_path: "artifacts/probes/inequity_probe_l16.pt"
   min_contrastive_pairs: 240
 
 shock:

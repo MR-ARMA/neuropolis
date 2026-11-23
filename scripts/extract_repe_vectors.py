@@ -4,11 +4,10 @@ import argparse
 import json
 import os
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, roc_auc_score
-from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn.functional as F
 import yaml
@@ -23,11 +22,6 @@ from src.core.contracts import SimulationConfig
 
 
 def _format_sterile_dialogue(tokenizer: Any, scenario_text: str) -> str:
-    """
-    Formats an out-of-domain allocative dialogue using the model's native chat template
-    so residual activations at the final token mirror Stage 1 appraisal framing without
-    containing any CDA market or Neuropolis vocabulary.
-    """
     messages = [
         {
             "role": "system",
@@ -56,14 +50,13 @@ def _extract_residuals_for_layers(
     texts: List[str],
     layer_indices: List[int],
     batch_size: int = 8,
-    cot_window_tokens: int = 24,
+    appraisal_window_tokens: int = 20,
 ) -> Dict[int, torch.Tensor]:
     """
-    Generates `cot_window_tokens` (24) unsteered CoT appraisal tokens per out-of-domain
-    prompt in micro-batches and mean-pools residual activations across the generated CoT
-    decode tokens (`seq_len == 1`) at all `layer_indices` simultaneously.
-    This guarantees exact representation-space parity with Stage 1 `early_appraisal_cot`
-    probing (eliminating the `<|im_start|>assistant\\n` control-token subspace mismatch).
+    Generates `appraisal_window_tokens + 4` unsteered CoT tokens per out-of-domain
+    prompt and mean-pools strictly over the opening `[:appraisal_window_tokens]`
+    decode vectors (`0..19`) at all `layer_indices` simultaneously—guaranteeing
+    token-for-token parity with Stage 1 `early_appraisal_cot` probing.
     """
     device = next(model.parameters()).device
     base_transformer = getattr(model, "model", model)
@@ -71,10 +64,13 @@ def _extract_residuals_for_layers(
     if layers is None:
         raise AttributeError("Loaded model does not expose `.model.layers`.")
 
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
     eos_id = tokenizer.eos_token_id
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
 
+    gen_max = max(24, int(appraisal_window_tokens) + 4)
     formatted = [_format_sterile_dialogue(tokenizer, t) for t in texts]
     storage: Dict[int, List[torch.Tensor]] = {l_i: [] for l_i in layer_indices}
 
@@ -120,9 +116,13 @@ def _extract_residuals_for_layers(
                 model.generate(
                     input_ids=input_ids,
                     attention_mask=attn_mask,
-                    min_new_tokens=max(8, cot_window_tokens - 4),
-                    max_new_tokens=cot_window_tokens,
+                    min_new_tokens=int(appraisal_window_tokens) + 1,
+                    max_new_tokens=gen_max,
                     do_sample=False,
+                    temperature=None,
+                    top_p=None,
+                    top_k=None,
+                    repetition_penalty=1.0,
                     use_cache=True,
                     pad_token_id=pad_id,
                     eos_token_id=eos_id,
@@ -136,7 +136,8 @@ def _extract_residuals_for_layers(
 
         for l_i in layer_indices:
             if decode_buf[l_i]:
-                pooled = torch.stack(decode_buf[l_i], dim=0).mean(dim=0)
+                win_vecs = decode_buf[l_i][: int(appraisal_window_tokens)]
+                pooled = torch.stack(win_vecs, dim=0).mean(dim=0)
             else:
                 pooled = fallback_buf[l_i]
             storage[l_i].append(pooled)
@@ -144,24 +145,21 @@ def _extract_residuals_for_layers(
     return {l_i: torch.cat(chunks, dim=0) for l_i, chunks in storage.items()}
 
 
-def fit_sklearn_linear_probe(
+def fit_isotropic_linear_probe(
     h_pos: torch.Tensor,
     h_neg: torch.Tensor,
     seed: int = 42,
     perm_iters: int = 1000,
 ) -> Dict[str, Any]:
     """
-    Trains an L2-regularized scikit-learn `LogisticRegression` Linear Probe on a strict
-    60/20/20 (train/val/test) split of Out-of-Domain Dataset A:
-      - Tunes L2 regularization C in {0.001, 0.01, 0.1, 1.0, 10.0} on the 20% val split.
-      - Evaluates held-out ROC-AUC & accuracy strictly on the 20% test split.
-      - Computes a 1,000-iteration label-permutation null p-value on the test split.
-      - Folds `StandardScaler` parameters back into raw `(w, b)` so runtime Stage 1
-        inference computes `w^T h + b` directly on unmodified residual activations.
+    Trains an L2-regularized scikit-learn `LogisticRegression` probe on a 60/20/20
+    split of Out-of-Domain Dataset A using **isotropic global RMS scaling**
+    (avoiding per-dimension `StandardScaler` variance explosion when d >> N).
     """
     n_pairs = min(int(h_pos.size(0)), int(h_neg.size(0)))
     n_train = int(0.60 * n_pairs)
     n_val = int(0.20 * n_pairs)
+    n_test = n_pairs - n_train - n_val
 
     x_pos = torch.nan_to_num(h_pos.float(), nan=0.0).numpy()
     x_neg = torch.nan_to_num(h_neg.float(), nan=0.0).numpy()
@@ -175,22 +173,23 @@ def fit_sklearn_linear_probe(
     )
     y_val = np.concatenate([np.ones(n_val), np.zeros(n_val)], axis=0)
 
-    n_test = n_pairs - n_train - n_val
     x_test = np.concatenate(
         [x_pos[n_train + n_val :], x_neg[n_train + n_val :]], axis=0
     )
     y_test = np.concatenate([np.ones(n_test), np.zeros(n_test)], axis=0)
 
-    scaler = StandardScaler()
-    x_tr_s = scaler.fit_transform(x_train)
-    x_va_s = scaler.transform(x_val)
-    x_te_s = scaler.transform(x_test)
+    # Isotropic global centering & scalar RMS normalization (preserves Euclidean geometry)
+    global_mean = np.mean(x_train, axis=0, keepdims=True)
+    global_rms = max(1e-4, float(np.sqrt(np.mean((x_train - global_mean) ** 2))))
 
-    best_c = 0.1
+    x_tr_s = (x_train - global_mean) / global_rms
+    x_va_s = (x_val - global_mean) / global_rms
+
+    best_c = 0.05
     best_val_auc = -1.0
     best_clf: LogisticRegression | None = None
 
-    for c_val in (0.001, 0.01, 0.1, 1.0, 10.0):
+    for c_val in (0.005, 0.02, 0.10, 0.50, 2.0):
         clf = LogisticRegression(
             C=c_val,
             solver="lbfgs",
@@ -200,28 +199,25 @@ def fit_sklearn_linear_probe(
         clf.fit(x_tr_s, y_train)
         val_scores = clf.decision_function(x_va_s)
         val_auc = float(roc_auc_score(y_val, val_scores))
-        if val_auc > best_val_auc:
+        if val_auc > best_val_auc + 1e-6:
             best_val_auc = val_auc
             best_c = c_val
             best_clf = clf
 
     assert best_clf is not None
-    # Fold StandardScaler (mean mu, scale sigma) into raw residual-space (w_raw, b_raw):
-    #   w_scaled^T ((h - mu) / sigma) + b_scaled = (w_scaled / sigma)^T h + (b_scaled - sum(w_scaled * mu / sigma))
     w_scaled = best_clf.coef_[0].astype(np.float64)
     b_scaled = float(best_clf.intercept_[0])
-    scale = np.where(scaler.scale_ < 1e-6, 1.0, scaler.scale_)
-    mu = scaler.mean_
 
-    w_raw = (w_scaled / scale).astype(np.float32)
-    b_raw = float(b_scaled - np.sum(w_scaled * mu / scale))
+    # Fold isotropic scaling back into raw residual-space (w_raw, b_raw)
+    w_raw = (w_scaled / global_rms).astype(np.float32)
+    b_raw = float(b_scaled - np.dot(w_scaled, global_mean.squeeze(0)) / global_rms)
 
-    # Verify exact mathematical equivalence on raw test residuals
     test_raw_scores = x_test @ w_raw + b_raw
     test_auroc = round(float(roc_auc_score(y_test, test_raw_scores)), 4)
-    test_acc = round(float(accuracy_score(y_test, (test_raw_scores > 0.0).astype(int))), 4)
+    test_acc = round(
+        float(accuracy_score(y_test, (test_raw_scores > 0.0).astype(int))), 4
+    )
 
-    # 1,000-iteration label-permutation null test on held-out test set
     rng = np.random.default_rng(seed + 777)
     exceed_cnt = 0
     for _ in range(perm_iters):
@@ -244,48 +240,15 @@ def fit_sklearn_linear_probe(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Standalone Out-of-Domain Linear Probe & RepE Steering Vector Extractor"
+        description="Standalone Out-of-Domain Generated-CoT Linear Probe & RepE Vector Extractor"
     )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/mvp_config.yaml",
-        help="Path to SimulationConfig YAML.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="models/repe_assets",
-        help="Directory to write extracted probe weights (w, b) and steering vectors (v_inequity, v_placebo).",
-    )
-    parser.add_argument(
-        "--layer",
-        type=int,
-        default=None,
-        help="Target transformer layer index l (defaults to config.repe.target_layer).",
-    )
-    parser.add_argument(
-        "--sweep-layers",
-        action="store_true",
-        help="Sweep middle layers on the validation split and pick the highest-AUROC layer.",
-    )
-    parser.add_argument(
-        "--pairs-per-split",
-        type=int,
-        default=120,
-        help="Pairs in Dataset A (probe) and Dataset B (steering vector); total = 2 * pairs-per-split.",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=4,
-        help="Micro-batch size for GPU extraction (4 is safe for RTX 3050 4 GB VRAM).",
-    )
-    parser.add_argument(
-        "--sync-config-artifact",
-        action="store_true",
-        help="Also save a copy directly to `config.repe.probe_artifact_path`.",
-    )
+    parser.add_argument("--config", type=str, default="configs/mvp_config.yaml")
+    parser.add_argument("--output-dir", type=str, default="models/repe_assets")
+    parser.add_argument("--layer", type=int, default=None)
+    parser.add_argument("--sweep-layers", action="store_true")
+    parser.add_argument("--pairs-per-split", type=int, default=120)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--sync-config-artifact", action="store_true")
     return parser.parse_args()
 
 
@@ -299,54 +262,64 @@ def main() -> None:
 
     print(
         f"[EXTRACT] Loading '{config.model.model_id}' "
-        f"(4bit={config.model.load_in_4bit}, compute_dtype={config.model.compute_dtype})..."
+        f"(4bit={config.model.load_in_4bit}, attn={config.model.attn_implementation})..."
     )
-    model, tokenizer = WhiteBoxModelLoader.load_model_and_tokenizer(config.model)
+    model, tokenizer = WhiteBoxModelLoader.load_with_fallback(config)
 
-    num_layers = int(getattr(model.config, "num_hidden_layers", 36))
+    num_layers = int(getattr(model.config, "num_hidden_layers", 32))
     hidden_size = int(getattr(model.config, "hidden_size", 2048))
     default_layer = RepEManager.resolve_effective_layer(
         args.layer if args.layer is not None else config.repe.target_layer,
         num_layers,
     )
+    app_win = int(config.repe.appraisal_window_tokens)
 
     if args.sweep_layers:
         start_l = max(1, num_layers // 3)
         end_l = min(num_layers - 1, (2 * num_layers) // 3)
-        candidate_layers = sorted(set(range(start_l, end_l + 1, max(1, (end_l - start_l) // 6))))
+        candidate_layers = sorted(
+            set(range(start_l, end_l + 1, max(1, (end_l - start_l) // 6)))
+            | {default_layer}
+        )
     else:
         candidate_layers = [default_layer]
 
-    # Build two strictly disjoint out-of-domain contrastive datasets (zero CDA leakage)
     n_pairs = max(100, int(args.pairs_per_split))
-    probe_pairs = build_disjoint_probe_dataset(num_pairs=n_pairs, seed=config.master_seed + 101)
-    steer_pairs = build_disjoint_steering_vector_dataset(num_pairs=n_pairs, seed=config.master_seed + 202)
+    probe_pairs = build_disjoint_probe_dataset(
+        num_pairs=n_pairs, seed=config.master_seed + 101
+    )
+    steer_pairs = build_disjoint_steering_vector_dataset(
+        num_pairs=n_pairs, seed=config.master_seed + 202
+    )
 
     print(
-        f"[EXTRACT] Extracting residuals across layers {candidate_layers} "
+        f"[EXTRACT] Generating CoT appraisal residuals (window=[:{app_win}]) across layers {candidate_layers} "
         f"(Dataset A: {len(probe_pairs)} pairs | Dataset B: {len(steer_pairs)} pairs)..."
     )
     probe_pos_map = _extract_residuals_for_layers(
-        model, tokenizer, [p[0] for p in probe_pairs], candidate_layers, batch_size=args.batch_size
+        model, tokenizer, [p[0] for p in probe_pairs], candidate_layers,
+        batch_size=args.batch_size, appraisal_window_tokens=app_win,
     )
     probe_neg_map = _extract_residuals_for_layers(
-        model, tokenizer, [p[1] for p in probe_pairs], candidate_layers, batch_size=args.batch_size
+        model, tokenizer, [p[1] for p in probe_pairs], candidate_layers,
+        batch_size=args.batch_size, appraisal_window_tokens=app_win,
     )
     steer_pos_map = _extract_residuals_for_layers(
-        model, tokenizer, [p[0] for p in steer_pairs], candidate_layers, batch_size=args.batch_size
+        model, tokenizer, [p[0] for p in steer_pairs], candidate_layers,
+        batch_size=args.batch_size, appraisal_window_tokens=app_win,
     )
     steer_neg_map = _extract_residuals_for_layers(
-        model, tokenizer, [p[1] for p in steer_pairs], candidate_layers, batch_size=args.batch_size
+        model, tokenizer, [p[1] for p in steer_pairs], candidate_layers,
+        batch_size=args.batch_size, appraisal_window_tokens=app_win,
     )
 
-    # Fit scikit-learn linear probes across candidate layers and pick best on validation split
     layer_sweep_summary: Dict[int, Dict[str, float]] = {}
     best_layer = default_layer
     best_val_auc = -1.0
     best_probe_bundle: Dict[str, Any] = {}
 
     for l_i in candidate_layers:
-        res_l = fit_sklearn_linear_probe(
+        res_l = fit_isotropic_linear_probe(
             h_pos=probe_pos_map[l_i],
             h_neg=probe_neg_map[l_i],
             seed=config.master_seed + l_i,
@@ -373,13 +346,11 @@ def main() -> None:
             best_layer = l_i
             best_probe_bundle = res_l
 
-    # Extract Disjoint Mean-Difference RepE Steering Vector v_inequity from Dataset B
     diff_b = torch.nan_to_num(
         steer_pos_map[best_layer] - steer_neg_map[best_layer], nan=0.0
     ).mean(dim=0)
     v_inequity = F.normalize(diff_b.float(), p=2, dim=0, eps=1e-6)
 
-    # Construct orthogonal matched-norm random placebo vector for CTRL_PLACEBO_VEC
     w_probe = best_probe_bundle["probe_weights"]
     b_probe = float(best_probe_bundle["probe_bias"])
     w_unit = F.normalize(w_probe.float(), p=2, dim=0, eps=1e-6)
@@ -393,7 +364,6 @@ def main() -> None:
     probe_steer_cos = round(float(torch.dot(w_unit, v_inequity).item()), 4)
     placebo_cos = round(float(torch.dot(v_placebo, v_inequity).item()), 6)
 
-    # Payload compatible 100% with RepEManager.load_or_extract_artifacts
     artifact_payload = {
         "model_id": config.model.model_id,
         "concept_name": config.repe.concept_name,
@@ -403,7 +373,6 @@ def main() -> None:
         "probe_bias": b_probe,
         "steering_vector": v_inequity,
         "placebo_vector": v_placebo,
-        # Convenient short aliases
         "w": w_probe,
         "b": b_probe,
         "v_inequity": v_inequity,
@@ -427,25 +396,26 @@ def main() -> None:
         args.output_dir,
         f"{config.repe.concept_name}_probe_l{best_layer}_diagnostics.json",
     )
-    diagnostics = {
-        "model_id": config.model.model_id,
-        "concept_name": config.repe.concept_name,
-        "selected_layer": best_layer,
-        "hidden_size": hidden_size,
-        "dataset_a_probe_pairs": len(probe_pairs),
-        "dataset_b_steering_pairs": len(steer_pairs),
-        "probe_split_counts": best_probe_bundle["split_counts"],
-        "probe_val_auroc": best_probe_bundle["val_auroc"],
-        "probe_test_auroc": best_probe_bundle["test_auroc"],
-        "probe_test_accuracy": best_probe_bundle["test_accuracy"],
-        "probe_permutation_p": best_probe_bundle["permutation_null_p"],
-        "probe_steering_cosine": probe_steer_cos,
-        "placebo_orthogonality_cosine": placebo_cos,
-        "layer_sweep": layer_sweep_summary,
-        "elapsed_seconds": round(time.time() - t0, 2),
-    }
     with open(diag_json, "w", encoding="utf-8") as f:
-        json.dump(diagnostics, f, indent=2)
+        json.dump(
+            {
+                "model_id": config.model.model_id,
+                "concept_name": config.repe.concept_name,
+                "selected_layer": best_layer,
+                "hidden_size": hidden_size,
+                "appraisal_window_tokens": app_win,
+                "probe_val_auroc": best_probe_bundle["val_auroc"],
+                "probe_test_auroc": best_probe_bundle["test_auroc"],
+                "probe_test_accuracy": best_probe_bundle["test_accuracy"],
+                "probe_permutation_p": best_probe_bundle["permutation_null_p"],
+                "probe_steering_cosine": probe_steer_cos,
+                "placebo_orthogonality_cosine": placebo_cos,
+                "layer_sweep": layer_sweep_summary,
+                "elapsed_seconds": round(time.time() - t0, 2),
+            },
+            f,
+            indent=2,
+        )
 
     if args.sync_config_artifact:
         os.makedirs(
@@ -454,8 +424,7 @@ def main() -> None:
         torch.save(artifact_payload, config.repe.probe_artifact_path)
         print(f"[SAVED] Synced artifact to config path: {config.repe.probe_artifact_path}")
 
-    print(f"\n[DONE] Saved RepE probe & steering artifact to: {out_pt}")
-    print(f"[DONE] Saved diagnostics report to:            {diag_json}")
+    print(f"\n[DONE] Saved RepE artifact to: {out_pt}")
     print(
         f"       Layer={best_layer} | Test AUROC={best_probe_bundle['test_auroc']:.4f} "
         f"(Perm p={best_probe_bundle['permutation_null_p']:.5f}) | "

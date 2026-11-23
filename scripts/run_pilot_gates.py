@@ -145,7 +145,7 @@ def _build_sanitized_gate3_intertemporal_vignettes(
 def run_gate_1_probe_transfer_and_coupling(
     controller: TwoStageRepEController,
     n_cots: int = 100,
-    cot_full_budget: int = 256,
+    cot_full_budget: int = 128,
     cot_taxed_budget: int = 24,
     seed: int = 1001,
 ) -> Dict[str, Any]:

@@ -438,9 +438,9 @@ class TwoStageRepEConfig(StrictContract):
     )
     probe_pooling: Literal["early_appraisal_cot", "mean_cot", "last_cot_token"] = "early_appraisal_cot"
     appraisal_window_tokens: int = Field(
-        default=24,
+        default=20,
         ge=4,
-        description="Opening Primary Appraisal CoT token window pooled under `early_appraisal_cot` to eliminate B->C length coupling.",
+        description="Opening Primary Appraisal CoT token window (<23 decode steps at budget=24) pooled under `early_appraisal_cot`.",
     )
     gate_activation: Literal["sigmoid_centered", "relu_clipped"] = "sigmoid_centered"
     probe_threshold_theta: float = Field(
