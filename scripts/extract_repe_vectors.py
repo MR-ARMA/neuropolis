@@ -177,7 +177,6 @@ def fit_sklearn_linear_probe(
     for c_val in (0.001, 0.01, 0.1, 1.0, 10.0):
         clf = LogisticRegression(
             C=c_val,
-            penalty="l2",
             solver="lbfgs",
             max_iter=1000,
             random_state=seed,
@@ -349,7 +348,11 @@ def main() -> None:
             f"Held-Out Test AUROC={res_l['test_auroc']:.4f} | "
             f"Acc={res_l['test_accuracy']:.4f} | Perm p={res_l['permutation_null_p']:.5f}"
         )
-        if res_l["val_auroc"] > best_val_auc:
+        is_better = (res_l["val_auroc"] > best_val_auc + 1e-6) or (
+            abs(res_l["val_auroc"] - best_val_auc) <= 1e-6
+            and abs(l_i - default_layer) < abs(best_layer - default_layer)
+        )
+        if is_better:
             best_val_auc = res_l["val_auroc"]
             best_layer = l_i
             best_probe_bundle = res_l

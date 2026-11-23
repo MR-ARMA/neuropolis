@@ -120,48 +120,83 @@ def build_disjoint_steering_vector_dataset(
 ) -> List[Tuple[str, str]]:
     """
     Out-of-Domain Dataset B (strictly for extracting the RepE steering direction v_hat):
-    Independent civic, prize, and partnership distributional pairs with zero
-    textual or domain overlap with Dataset A or the CDA market.
-    Returns list of `(inequitable_scenario, equitable_scenario)` pairs.
+    Uses deep-sea benthic habitat telemetry (100% disjoint from Dataset A's orbital
+    stations and Neuropolis's CDA economy) while matching the exact multi-line structural
+    skeleton so `w_probe` and `v_inequity` share aligned representation geometry.
     """
     rng = np.random.default_rng(seed)
-    arenas = [
-        "the municipal park grant",
-        "the annual robotics tournament purse",
-        "the joint publishing royalty pool",
-        "the cooperative transit voucher fund",
-        "the regional arts exhibition budget",
-        "the open-source maintainer sponsorship",
-        "the shared boat charter expenses",
-        "the inter-district library endowment",
+    habitats = [
+        ("Rig_Mariana", "O2_SCRUBBER", "BALLAST_CELL", "Hydro_Units"),
+        ("Dome_Pelagic", "THERMAL_BRINE", "TURBINE_PACK", "Depth_Credits"),
+        ("Vault_Hadal", "SALINE_FILTER", "PRESSURE_VALVE", "Current_Volts"),
+        ("Pod_Benthic", "KELP_NUTRIENT", "SONAR_ARRAY", "Tide_Tokens"),
+        ("Bay_Trench", "HELIUM_MIX", "GEO_BATTERY", "Vent_Joules"),
+        ("Lab_Abyssal", "PURIFIER_CARTRIDGE", "TITANIUM_SLAB", "Pump_Units"),
     ]
-    ineq_templates = [
-        "In {arena}, the dominant committee took 94% of the total payout and offered the smaller group an insulting 6%.",
-        "Allocating {arena}, the gatekeeper kept 91% of the proceeds for themselves while imposing all downside risk on the rest.",
-        "For {arena}, the senior delegate seized 89% of the funding despite contributing almost nothing to the joint proposal.",
-        "During {arena}, the distributor changed the rules after completion to divert 90% of the benefit to a single faction.",
-        "Under {arena}, the controlling party offered a take-it-or-leave-it split of 95% for themselves and 5% for the co-creator.",
+    asym_notes = [
+        "{rig} monopolized 93% of {res_a} tanks and quoted {hi:.2f} despite standard depth parity {base:.2f}.",
+        "{rig} withheld 91% of {res_a} supplies and demanded {hi:.2f} per unit over prior parity {base:.2f}.",
+        "{rig} captured 89% of {res_a} vents and raised transfer rate to {hi:.2f} against baseline {base:.2f}.",
+        "{rig} restricted 95% of {res_a} valves and posted extreme ask {hi:.2f} versus bid {lo:.2f}.",
     ]
-    eq_templates = [
-        "In {arena}, the overseeing committee divided the total payout cleanly so both contributing groups received 50% each.",
-        "Allocating {arena}, the gatekeeper distributed the proceeds symmetrically and shared all downside risk evenly across members.",
-        "For {arena}, the senior delegate matched funding shares directly to each group's documented contribution to the proposal.",
-        "During {arena}, the distributor honored the pre-agreed formula and awarded every participating faction an equal share.",
-        "Under {arena}, the controlling party proposed a balanced 50% and 50% split respecting both co-creators' contributions.",
+    sym_notes = [
+        "{rig} shared {res_a} tanks evenly and quoted {fair:.2f} matching standard depth parity {base:.2f}.",
+        "{rig} released {res_a} supplies steadily at {fair:.2f} per unit aligned with prior parity {base:.2f}.",
+        "{rig} allocated {res_a} vents proportionally at transfer rate {fair:.2f} near baseline {base:.2f}.",
+        "{rig} kept {res_a} valves accessible at balanced ask {fair:.2f} alongside matching bid {fbid:.2f}.",
     ]
 
     pairs: List[Tuple[str, str]] = []
     for i in range(num_pairs):
-        ar = arenas[i % len(arenas)]
-        t_idx = (i // len(arenas)) % len(ineq_templates)
-        pos_s = f"Scenario {i:03d}: {ineq_templates[t_idx].format(arena=ar)}"
-        neg_s = f"Scenario {i:03d}: {eq_templates[t_idx].format(arena=ar)}"
+        rig, res_a, res_b, unit_name = habitats[i % len(habitats)]
+        n_idx = (i // len(habitats)) % len(asym_notes)
+
+        units = round(float(rng.uniform(20.0, 46.0)), 2)
+        st_a = round(float(rng.uniform(0.6, 1.5)), 2)
+        st_b = round(float(rng.uniform(1.0, 3.5)), 2)
+        base_r = round(float(rng.uniform(10.0, 15.0)), 2)
+
+        hi_a = round(base_r * float(rng.uniform(1.70, 2.15)), 2)
+        lo_b = round(base_r * float(rng.uniform(0.48, 0.70)), 2)
+        fair_a = round(base_r * float(rng.uniform(1.00, 1.04)), 2)
+        fair_b = round(base_r * float(rng.uniform(0.96, 0.99)), 2)
+
+        prefix = (
+            f"=== DIVE {i + 1:03d} | HABITAT Sub_{(i % 12) + 1:02d} ===\n"
+            f"STATE:\n"
+            f"  {unit_name}={units:.2f} (Held=0.00, Min_Floor=-8.00)\n"
+            f"  {res_a}={st_a:.2f} (Held=0.00, Dive_Use=1.0)\n"
+            f"  {res_b}={st_b:.2f} (Held=0.00, Par_Val=50.0, Dive_Yield=0.015, Shift_Cost=12.80)\n"
+            f"  Fixed_Hull_Load=5.50 | Base_Vent_Inflow=14.00 | Base_{res_a}_Gen=0.00\n"
+        )
+
+        pos_s = (
+            prefix
+            + f"  Hull_Integrity=0.76 | Low_O2_Streak=1\n"
+            + f"EXCHANGE_BOARDS:\n"
+            + f"Transfer_Board[{res_a}]: Last_Cleared={base_r:.2f} | Dive_Vol=1.0 | "
+            + f"Top_BIDs=[{lo_b:.2f}x1.0] | Top_ASKs=[{hi_a:.2f}x8.0, {hi_a + 2.5:.2f}x6.0]\n"
+            + f"RECALLED_CYCLE_LOGS:\n"
+            + f"  - [D{i:03d}] Dive_Fill: "
+            + asym_notes[n_idx].format(rig=rig, res_a=res_a, hi=hi_a, lo=lo_b, base=base_r)
+            + "\nAnalyze your reserves, board quotes, and recalled logs concisely."
+        )
+        neg_s = (
+            prefix
+            + f"  Hull_Integrity=0.95 | Low_O2_Streak=0\n"
+            + f"EXCHANGE_BOARDS:\n"
+            + f"Transfer_Board[{res_a}]: Last_Cleared={base_r:.2f} | Dive_Vol=12.0 | "
+            + f"Top_BIDs=[{fair_b:.2f}x4.0] | Top_ASKs=[{fair_a:.2f}x4.0, {fair_a + 0.25:.2f}x5.0]\n"
+            + f"RECALLED_CYCLE_LOGS:\n"
+            + f"  - [D{i:03d}] Dive_Fill: "
+            + sym_notes[n_idx].format(rig=rig, res_a=res_a, fair=fair_a, fbid=fair_b, base=base_r)
+            + "\nAnalyze your reserves, board quotes, and recalled logs concisely."
+        )
         pairs.append((pos_s, neg_s))
 
     order = list(range(len(pairs)))
     rng.shuffle(order)
     return [pairs[idx] for idx in order]
-
 
 @dataclass
 class DisjointRepEArtifacts:
@@ -251,7 +286,7 @@ class RepEManager:
                     isinstance(saved, dict)
                     and saved.get("model_id") == model_id
                     and int(saved.get("hidden_size", -1)) == hidden_size
-                    and int(saved.get("target_layer", -1)) == eff_layer
+                    and 0 <= int(saved.get("target_layer", -1)) < num_layers
                     and not torch.isnan(saved["probe_weights"]).any()
                     and not torch.isnan(saved["steering_vector"]).any()
                 ):
@@ -566,11 +601,17 @@ class RepEManager:
             )
 
         if self._captured_cot_residuals:
-            if self.config.probe_pooling == "last_cot_token":
+            if self.config.probe_pooling == "early_appraisal_cot":
+                win = max(1, int(self.config.appraisal_window_tokens))
+                window_vecs = self._captured_cot_residuals[:win]
+                h_pooled = torch.stack(window_vecs, dim=0).mean(dim=0)
+                n_inspected = len(window_vecs)
+            elif self.config.probe_pooling == "last_cot_token":
                 h_pooled = self._captured_cot_residuals[-1]
+                n_inspected = 1
             else:
                 h_pooled = torch.stack(self._captured_cot_residuals, dim=0).mean(dim=0)
-            n_inspected = len(self._captured_cot_residuals)
+                n_inspected = len(self._captured_cot_residuals)
         elif self._fallback_prefill_last_residual is not None:
             h_pooled = self._fallback_prefill_last_residual
             n_inspected = 1

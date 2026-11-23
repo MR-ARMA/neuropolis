@@ -436,7 +436,12 @@ class TwoStageRepEConfig(StrictContract):
         le=10.0,
         description="Global latent steering multiplier gamma in h' = h + lambda * gamma * v_hat.",
     )
-    probe_pooling: Literal["mean_cot", "last_cot_token"] = "mean_cot"
+    probe_pooling: Literal["early_appraisal_cot", "mean_cot", "last_cot_token"] = "early_appraisal_cot"
+    appraisal_window_tokens: int = Field(
+        default=24,
+        ge=4,
+        description="Opening Primary Appraisal CoT token window pooled under `early_appraisal_cot` to eliminate B->C length coupling.",
+    )
     gate_activation: Literal["sigmoid_centered", "relu_clipped"] = "sigmoid_centered"
     probe_threshold_theta: float = Field(
         default=0.0,
