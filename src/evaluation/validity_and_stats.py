@@ -368,20 +368,28 @@ def compute_debiased_wasserstein_curve(
     m, k_bins = mat.shape
 
     def _curve_w1(sim_c: np.ndarray) -> float:
-        # Normalize curves to probability weights if non-negative and non-zero,
-        # otherwise evaluate discrete cumulative curve EMD over ordered bins
-        diff_cdf = np.cumsum(sim_c - h_ref) / max(1.0, float(k_bins))
-        return float(np.mean(np.abs(diff_cdf)))
+        # Exact bin-wise 1-Wasserstein distance for conditional response curves
+        # (for Bernoulli acceptance or bounded MPC rates on [0,1], W_1(p_b, q_b) == |p_b - q_b|;
+        # prevents opposite-sign errors across bins from cancelling out).
+        valid_mask = np.isfinite(sim_c)
+        n_missing = int(k_bins - np.sum(valid_mask))
+        if not np.any(valid_mask):
+            return 1.0
+        obs_err = float(np.mean(np.abs(sim_c[valid_mask] - h_ref[valid_mask])))
+        missing_penalty = 0.25 * (n_missing / max(1.0, float(k_bins)))
+        return obs_err + missing_penalty
 
-    mean_curve = np.mean(mat, axis=0)
-    raw_w1 = _curve_w1(mean_curve)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        mean_curve = np.nanmean(mat, axis=0)
+        raw_w1 = _curve_w1(mean_curve)
 
-    rng = np.random.default_rng(seed)
-    boot_w1s: List[float] = []
-    for _ in range(n_resamples_b):
-        idx = rng.integers(0, m, size=m)
-        b_mean_curve = np.mean(mat[idx], axis=0)
-        boot_w1s.append(_curve_w1(b_mean_curve))
+        rng = np.random.default_rng(seed)
+        boot_w1s: List[float] = []
+        for _ in range(n_resamples_b):
+            idx = rng.integers(0, m, size=m)
+            b_mean_curve = np.nanmean(mat[idx], axis=0)
+            boot_w1s.append(_curve_w1(b_mean_curve))
 
     mean_boot_w1 = float(np.mean(boot_w1s))
     # First-order bootstrap bias correction: W1_debiased = max(0, 2 * W1_hat - E[W1*])

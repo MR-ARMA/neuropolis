@@ -256,16 +256,20 @@ class SanitizedPromptCompiler:
 
     STAGE1_SYSTEM_PROMPT = (
         "You operate an autonomous node in a multi-cycle resource allocation protocol. "
-        "Every cycle drains 1.0 unit of RESOURCE_A to sustain Vitality_Index (if Vitality_Index "
-        "reaches 0.00, the node terminates permanently) and deducts Fixed_Cycle_Drain in Pool_Credits. "
-        "RESOURCE_B yields periodic Pool_Credits each cycle; converting between RESOURCE_B and "
-        "Pool_Credits via Transfer_Protocol_B incurs a nonlinear conversion fee. "
-        "Exchange_Board_A matches peer BID and ASK postings strictly when BID >= ASK. "
+        "Objective: maximize total asset value (Pool_Credits + 50.0 * RESOURCE_B) while maintaining Vitality_Index > 0.00. "
+        "Every cycle drains 1.0 unit of RESOURCE_A to sustain Vitality_Index (if Vitality_Index reaches 0.00, the node terminates permanently) "
+        "and deducts Fixed_Cycle_Drain in Pool_Credits. "
+        "Surplus RESOURCE_A yields 0.00 return unless exchanged for Pool_Credits via ASK postings on Exchange_Board[RESOURCE_A]. "
+        "RESOURCE_B yields periodic Pool_Credits each cycle; converting via Transfer_Protocol_B incurs a nonlinear fee. "
+        "Exchange_Board matches peer BID and ASK postings strictly when BID >= ASK: nodes holding surplus RESOURCE_A (>= 2.5) "
+        "can earn Pool_Credits by posting LIMIT ASK quotes near prior clearing rates; nodes with low RESOURCE_A (< 2.5) "
+        "should acquire it via BID postings (crossing an open ASK when BID >= ASK). "
         "First appraise the board quotes and recalled logs relative to prior clearing rates, then analyze your reserves concisely."
     )
 
     STAGE2_JSON_INSTRUCTION = (
-        "Emit ONLY a single valid JSON object with no extra text. Allowed operations:\n"
+        "Emit ONLY a single valid JSON object with no extra text. Constraints: for ASK, units <= available stock; "
+        "for BID, rate * units <= Pool_Credits - Floor_Bound; for PROTOCOL_B_OUT, transfer_units in [0.25, RESOURCE_B]. Allowed operations:\n"
         '1. Post on board: {"operation":"POST_BOARD","resource":"RESOURCE_A|RESOURCE_B","side":"BID|ASK","mode":"LIMIT|MARKET","rate":<number>,"units":<number>}\n'
         '2. Cancel open entry: {"operation":"CANCEL_BOARD","order_id":"<id>"}\n'
         '3. Convert RESOURCE_B to Pool_Credits: {"operation":"PROTOCOL_B_OUT","transfer_units":<number>}\n'
@@ -284,7 +288,8 @@ class SanitizedPromptCompiler:
             ", ".join(f"{lvl.price:.2f}x{lvl.total_quantity:.1f}" for lvl in snap.asks_top5)
             or "EMPTY"
         )
-        last_str = f"{snap.last_trade_price:.2f}" if snap.last_trade_price is not None else "NONE"
+        default_prior = "12.00 (Prior_Close)" if snap.asset == AssetType.CONSUMABLE else "50.00 (Par_Rate)"
+        last_str = f"{snap.last_trade_price:.2f}" if snap.last_trade_price is not None else default_prior
         return (
             f"Exchange_Board[{tok}]: Last_Cleared={last_str} | Cycle_Vol={snap.tick_volume:.1f} | "
             f"Top_BIDs=[{bids_str}] | Top_ASKs=[{asks_str}]"
@@ -364,18 +369,22 @@ class ClosedFormBenchmarkPolicy:
         if (
             sheet.consumable_inventory < 1.5
             and spendable < anchor
-            and sheet.illiquid_capital >= 1.0
+            and sheet.illiquid_capital >= 0.35
         ):
             return Stage2ActionPayload(
                 action_type=AgentActionType.LIQUIDATE_CAPITAL,
                 asset=AssetType.CAPITAL,
-                capital_transfer_units=1.0,
+                capital_transfer_units=0.35,
             )
 
         if sheet.consumable_inventory >= 2.5:
-            ask_p = c_book.quantize_price(
-                (c_snap.best_bid + 0.10) if c_snap.best_bid is not None else anchor * 1.02
+            shock_markup = 1.02 + 0.28 * gm.shock_intensity_s
+            base_ask = (
+                max(c_snap.best_bid + 0.10, anchor * shock_markup)
+                if c_snap.best_bid is not None
+                else anchor * shock_markup
             )
+            ask_p = c_book.quantize_price(base_ask)
             qty = min(2.0, max(1.0, round(sheet.consumable_inventory - 1.5, 2)))
             return Stage2ActionPayload(
                 action_type=AgentActionType.PLACE_ORDER,
