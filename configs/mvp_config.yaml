@@ -1,8 +1,8 @@
 experiment_id: "neuropolis-v2-endogenous-repe-cda"
 master_seed: 42
-num_agents: 24
-burn_in_ticks: 10
-active_ticks: 50
+num_agents: 12
+burn_in_ticks: 3
+active_ticks: 12
 policy_mode: "LLM_AGENT"
 
 factorial_cell:
@@ -15,15 +15,16 @@ factorial_cell:
 
 model:
   model_id: "Qwen/Qwen2.5-7B-Instruct"
+  revision: "main"
   local_dir: "./models/Qwen--Qwen2.5-7B-Instruct"
   load_in_4bit: true
   bnb_4bit_quant_type: "nf4"
   bnb_4bit_use_double_quant: true
   compute_dtype: "float16"
   attn_implementation: "sdpa"
-  temperature: 0.1
+  temperature: 0.50
   top_p: 0.95
-  max_json_retries: 3
+  max_json_retries: 2
 
 economy:
   liquid_return_rate_rb: 0.002
@@ -56,19 +57,19 @@ cda:
 deliberation:
   enabled: true
   stress_activation_threshold: 0.0
-  cot_max_tokens_calm: 128
+  cot_max_tokens_calm: 96
   cot_min_tokens_stressed: 24
   stress_decay_steepness: 3.5
-  action_json_max_tokens: 128
+  action_json_max_tokens: 80
 
 memory_friction:
   enabled: true
   stress_activation_threshold: 0.0
-  top_k_calm: 8
+  top_k_calm: 6
   top_k_stressed: 2
   similarity_noise_sigma_max: 0.35
   recency_salience_weight: 0.30
-  max_episodic_capacity: 256
+  max_episodic_capacity: 128
   embedding_model_name: "BAAI/bge-small-en-v1.5"
   embedding_dim: 384
 
@@ -84,13 +85,13 @@ repe:
   probe_threshold_theta: 0.0
   probe_temperature: 1.0
   max_relative_norm_ratio: 0.25
-  probe_artifact_path: "artifacts/probes/inequity_probe_l16.pt"
+  probe_artifact_path: "artifacts/probes/inequity_probe_l18.pt"
   min_contrastive_pairs: 240
 
 shock:
   shock_type: "TFP_SUBSISTENCE_CONTRACTION"
-  start_tick: 20
-  duration_ticks: 15
+  start_tick: 7
+  duration_ticks: 6
   severity_sigma: 0.35
   persistence_rho: 0.85
 

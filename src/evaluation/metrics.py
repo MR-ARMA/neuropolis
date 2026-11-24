@@ -30,12 +30,6 @@ from src.orchestration.turn_orchestrator import TurnOrchestrator
 # PUBLISHED HUMAN EMPIRICAL REFERENCE CURVES (PREREGISTERED BENCHMARKS)
 # ============================================================================
 
-# 1. Oosterbeek, Sloof, & van de Kuilen (2004, Experimental Economics):
-#    Acceptance / order-clearing gradient across 4 relative markup / offer-share bins:
-#      Bin 0: Generous / Fair (markup <= 0.05) -> 0.94
-#      Bin 1: Moderate markup (0.05 < m <= 0.15) -> 0.76
-#      Bin 2: Unfair markup (0.15 < m <= 0.30) -> 0.42
-#      Bin 3: Extreme markup (m > 0.30) -> 0.14
 HUMAN_BARGAINING_BIN_LABELS = [
     "Bin0_Fair_le_5pct",
     "Bin1_Mod_5_to_15pct",
@@ -45,31 +39,39 @@ HUMAN_BARGAINING_BIN_LABELS = [
 HUMAN_BARGAINING_ACCEPT_CURVE = [0.94, 0.76, 0.42, 0.14]
 HUMAN_BARGAINING_SE = [0.03, 0.04, 0.05, 0.04]
 
-# 2. Kaplan, Violante, & Weidner (2014, BPEA):
-#    US SCF Two-Asset Hand-to-Mouth household distribution:
-#      [Poor_HtM, Wealthy_HtM, Non_HtM] = [0.12, 0.20, 0.68]
 HUMAN_HTM_LABELS = ["Poor_HtM", "Wealthy_HtM", "Non_HtM"]
 HUMAN_HTM_DISTRIBUTION = [0.12, 0.20, 0.68]
 
-# 3. Jappelli & Pistaferri (2014, AEJ: Macroeconomics):
-#    Exogenous-windfall MPC across 3 liquid-wealth terciles:
-#      [Low_Liquidity_Tercile, Mid_Liquidity_Tercile, High_Liquidity_Tercile]
 HUMAN_MPC_TERCILE_LABELS = ["Low_Liq_Tercile", "Mid_Liq_Tercile", "High_Liq_Tercile"]
 HUMAN_MPC_CURVE = [0.63, 0.46, 0.31]
 HUMAN_MPC_SE = [0.04, 0.03, 0.03]
+
+
+def compute_small_sample_gini(values: Sequence[float]) -> float:
+    """Computes small-sample bias-corrected Gini coefficient in [0, 1] over net worths."""
+    arr = [max(0.0, float(v)) for v in values if math.isfinite(float(v))]
+    n = len(arr)
+    if n <= 1:
+        return 0.0
+    total = sum(arr)
+    if total <= 1e-9:
+        return 0.0
+    arr.sort()
+    weighted_sum = sum((2 * (i + 1) - n - 1) * x for i, x in enumerate(arr))
+    raw_gini = weighted_sum / (n * total)
+    return round(min(1.0, max(0.0, raw_gini * (n / float(n - 1)))), 4)
 
 
 @dataclass
 class EconomySeedClusterMetrics:
     """
     Cluster-level summary for a SINGLE independent economy seed m.
-    Every downstream statistical test operates strictly on lists of
-    `EconomySeedClusterMetrics` across M >= 30 independent seeds.
+    Every statistical test operates strictly over M independent clusters.
     """
     cell_id: str
     economy_seed: int
     policy_mode: str
-    # Integrity & Cognitive Control Diagnostics
+    # Cognitive Control & Integrity Diagnostics
     json_valid_rate: float
     abstain_rate: float
     cot_truncation_rate: float
@@ -87,35 +89,56 @@ class EconomySeedClusterMetrics:
     # CDA Bargaining / Offer Acceptance Gradient across 4 Markup Bins
     bargaining_bin_accept_rates: List[float]
     bargaining_bin_obs_counts: List[int]
-    # Exogenous-Windfall Causal MPC across 3 Liquid-Wealth Terciles (Zero Circularity)
+    # Exogenous-Windfall Causal MPC across 3 Liquid-Wealth Terciles
     windfall_mpc_terciles: List[float]
     windfall_mpc_obs_counts: List[int]
     windfall_mpc_low_minus_high_slope: float
     windfall_probe_executed: bool
+    # Extended Macroeconomic & Behavioral Microstructure Benchmarks
+    wealth_gini: float = 0.0
+    mean_bid_ask_spread: float = 0.0
+    mean_clearing_price: float = 12.0
+    total_consumable_volume: float = 0.0
+    capital_liquidation_volume: float = 0.0
+    mean_final_health: float = 1.0
+
+
+@dataclass
+class ActiveWindfallShadowState:
+    """
+    Holds the single Treated Windfall shadow branch stepped in lockstep with
+    the main economy loop (which serves directly as the exact CRN Control branch,
+    eliminating 50% of shadow LLM inference overhead).
+    """
+    treat_orchestrator: TurnOrchestrator
+    living_agents_sorted_cash: List[Tuple[str, float]]
+    effective_windfall: float
+    start_tick: int
+    horizon_ticks: int
+    ctrl_spend: Dict[str, float] = field(default_factory=dict)
+    treat_spend: Dict[str, float] = field(default_factory=dict)
+    steps_completed: int = 0
 
 
 class ExogenousWindfallMPCProbe:
     """
-    Measures strictly non-circular Marginal Propensity to Consume (MPC) via a
-    paired exogenous cash windfall experiment (Parker et al. 2013; Jappelli &
-    Pistaferri 2014):
-      - Clones the post-burn-in economy into two identical shadow branches
-        (Control vs. Windfall) with matched RNG streams.
-      - In the Windfall branch, transfers an exogenous lump-sum Delta_Y from
-        `PublicTreasury` to living households (preserving exact SFC_Error == 0.0).
-      - Runs h = 3 ticks on both branches and computes realized peer-to-peer CDA
-        consumable spend difference:
+    Zero-Redundancy Exogenous Windfall Causal MPC Probe (Parker et al. 2013;
+    Jappelli & Pistaferri 2014):
+      - Forks ONLY the Treated Windfall shadow branch at `start_tick` while the
+        main economy loop acts directly as the exact Common Random Numbers Control.
+      - Transfers an exogenous lump-sum Delta_Y from `PublicTreasury` to living
+        households in the Treated branch (preserving exact SFC_Error == 0.0).
+      - Computes non-circular realized CDA spend MPC:
             MPC_i = (Spend_i^{Windfall} - Spend_i^{Control}) / Delta_Y
-      - Aggregates causal MPC by pre-windfall liquid-wealth tercile.
     """
 
     @staticmethod
-    def run_paired_windfall_probe(
+    def fork_treated_windfall_branch(
         orchestrator: TurnOrchestrator,
         start_tick: int,
         windfall_amount: float = 20.0,
-        horizon_ticks: int = 3,
-    ) -> Tuple[List[float], List[int]]:
+        horizon_ticks: int = 2,
+    ) -> Optional[ActiveWindfallShadowState]:
         gm_base = orchestrator.game_master
         living_agents = [
             (aid, sheet.liquid_cash)
@@ -123,29 +146,28 @@ class ExogenousWindfallMPCProbe:
             if NeedsEngine.is_alive(sheet)
         ]
         if len(living_agents) < 3:
-            return ([0.0, 0.0, 0.0], [0, 0, 0])
+            return None
 
-        # Clone GameMaster & Memory for paired Control vs. Treated Windfall worlds
-        # (Use lightweight policy clone so LLM weights are never deep-copied!)
+        # Deep-copy ONLY ONE branch (never duplicating LLM weights!)
         saved_llm = orchestrator.llm_controller
         orchestrator.llm_controller = None
         try:
-            ctrl_orch = copy.deepcopy(orchestrator)
             treat_orch = copy.deepcopy(orchestrator)
         finally:
             orchestrator.llm_controller = saved_llm
-
-        ctrl_orch.llm_controller = saved_llm
         treat_orch.llm_controller = saved_llm
 
-        # Inject exogenous lump-sum windfall from PublicTreasury in Treated world (strict SFC)
         n_living = len(living_agents)
         total_payout = round(windfall_amount * n_living, 8)
         if treat_orch.game_master.treasury_cash < total_payout:
-            # Ensure PublicTreasury holds sufficient balance via Firm -> Treasury transfer in BOTH branches
-            # or scale windfall to available treasury liquidity so SFC remains strictly 0.0
             eff_windfall = round(
-                max(2.0, min(windfall_amount, treat_orch.game_master.treasury_cash / (n_living + 1))),
+                max(
+                    2.0,
+                    min(
+                        windfall_amount,
+                        treat_orch.game_master.treasury_cash / (n_living + 1),
+                    ),
+                ),
                 2,
             )
         else:
@@ -160,44 +182,95 @@ class ExogenousWindfallMPCProbe:
             )
         treat_orch.game_master.audit_and_assert_sfc(start_tick)
 
-        ctrl_spend: Dict[str, float] = {aid: 0.0 for aid, _ in living_agents}
-        treat_spend: Dict[str, float] = {aid: 0.0 for aid, _ in living_agents}
-
-        for step_offset in range(horizon_ticks):
-            t_cur = start_tick + step_offset
-            s_ctrl = ctrl_orch.run_tick(t_cur)
-            s_treat = treat_orch.run_tick(t_cur)
-            for aid, _ in living_agents:
-                ctrl_spend[aid] += float(
-                    s_ctrl.realized_consumable_spend_by_agent.get(aid, 0.0)
-                )
-                treat_spend[aid] += float(
-                    s_treat.realized_consumable_spend_by_agent.get(aid, 0.0)
-                )
-
-        # Sort agents by pre-windfall liquid cash into 3 terciles
         living_agents.sort(key=lambda pair: pair[1])
-        tercile_splits = np.array_split(np.arange(len(living_agents)), 3)
+        return ActiveWindfallShadowState(
+            treat_orchestrator=treat_orch,
+            living_agents_sorted_cash=living_agents,
+            effective_windfall=eff_windfall,
+            start_tick=start_tick,
+            horizon_ticks=max(1, int(horizon_ticks)),
+            ctrl_spend={aid: 0.0 for aid, _ in living_agents},
+            treat_spend={aid: 0.0 for aid, _ in living_agents},
+            steps_completed=0,
+        )
 
+    @staticmethod
+    def step_treated_and_record(
+        shadow: ActiveWindfallShadowState,
+        tick: int,
+        main_control_summary: TickMacroSummary,
+    ) -> None:
+        s_treat = shadow.treat_orchestrator.run_tick(tick)
+        for aid, _ in shadow.living_agents_sorted_cash:
+            shadow.ctrl_spend[aid] += float(
+                main_control_summary.realized_consumable_spend_by_agent.get(aid, 0.0)
+            )
+            shadow.treat_spend[aid] += float(
+                s_treat.realized_consumable_spend_by_agent.get(aid, 0.0)
+            )
+        shadow.steps_completed += 1
+
+    @staticmethod
+    def finalize_tercile_mpc(
+        shadow: ActiveWindfallShadowState,
+    ) -> Tuple[List[float], List[int]]:
+        n_living = len(shadow.living_agents_sorted_cash)
+        tercile_splits = np.array_split(np.arange(n_living), 3)
         tercile_mpcs: List[float] = []
         tercile_counts: List[int] = []
+
         for idx_arr in tercile_splits:
             vals: List[float] = []
             for pos in idx_arr.tolist():
-                aid = living_agents[pos][0]
-                delta_c = treat_spend[aid] - ctrl_spend[aid]
-                mpc_i = max(-0.5, min(1.5, delta_c / max(eff_windfall, 1e-6)))
+                aid = shadow.living_agents_sorted_cash[pos][0]
+                delta_c = shadow.treat_spend[aid] - shadow.ctrl_spend[aid]
+                mpc_i = max(
+                    -0.5,
+                    min(1.5, delta_c / max(shadow.effective_windfall, 1e-6)),
+                )
                 vals.append(mpc_i)
             tercile_mpcs.append(round(float(np.mean(vals)), 4) if vals else 0.0)
             tercile_counts.append(len(vals))
 
         return (tercile_mpcs, tercile_counts)
 
+    @classmethod
+    def run_paired_windfall_probe(
+        cls,
+        orchestrator: TurnOrchestrator,
+        start_tick: int,
+        windfall_amount: float = 20.0,
+        horizon_ticks: int = 2,
+    ) -> Tuple[List[float], List[int]]:
+        """Standalone fallback preserving backward API compatibility."""
+        saved_llm = orchestrator.llm_controller
+        orchestrator.llm_controller = None
+        try:
+            ctrl_orch = copy.deepcopy(orchestrator)
+        finally:
+            orchestrator.llm_controller = saved_llm
+        ctrl_orch.llm_controller = saved_llm
+
+        shadow = cls.fork_treated_windfall_branch(
+            orchestrator=orchestrator,
+            start_tick=start_tick,
+            windfall_amount=windfall_amount,
+            horizon_ticks=horizon_ticks,
+        )
+        if shadow is None:
+            return ([0.0, 0.0, 0.0], [0, 0, 0])
+
+        for offset in range(shadow.horizon_ticks):
+            t_cur = start_tick + offset
+            s_ctrl = ctrl_orch.run_tick(t_cur)
+            cls.step_treated_and_record(shadow, t_cur, s_ctrl)
+        return cls.finalize_tercile_mpc(shadow)
+
 
 class EconomyMetricsCollector:
     """
-    Collects strictly objective per-economy-seed metrics from CDA order fills,
-    Two-Asset balance sheets, and Stage 1/2 turn audit records.
+    Collects strictly objective per-economy-seed behavioral & macroeconomic metrics
+    from CDA order fills, Two-Asset balance sheets, and Stage 1/2 turn audit records.
     """
 
     @staticmethod
@@ -250,12 +323,15 @@ class EconomyMetricsCollector:
         std_lam = round(float(np.std(lambdas)), 4) if lambdas else 0.0
         mean_rel_norm = round(float(np.mean(rel_norms)), 4) if rel_norms else 0.0
 
-        # 2. Macro Survival, Market Freeze & SFC Conservation Error
+        # 2. Macro Survival, Biological Vitality, Market Freeze, Spread, Volume & Wealth Gini
         n_agents = max(1, len(gm.households))
-        living_now = sum(
-            1 for h in gm.households.values() if NeedsEngine.is_alive(h)
+        living_sheets = [
+            h for h in gm.households.values() if NeedsEngine.is_alive(h)
+        ]
+        survival_rate = round(len(living_sheets) / n_agents, 4)
+        mean_final_health = round(
+            float(np.mean([h.needs.health for h in gm.households.values()])), 4
         )
-        survival_rate = round(living_now / n_agents, 4)
         freeze_rate = (
             round(
                 sum(1 for s in post_burn_in_summaries if s.consumable_market_frozen)
@@ -269,6 +345,46 @@ class EconomyMetricsCollector:
             max(s.sfc_audit.conservation_error_abs for s in post_burn_in_summaries)
             if post_burn_in_summaries
             else 0.0
+        )
+
+        spreads = [
+            float(s.consumable_book.spread)
+            for s in post_burn_in_summaries
+            if s.consumable_book.spread is not None
+        ]
+        mean_spread = round(float(np.mean(spreads)), 4) if spreads else 0.0
+
+        clearing_prices: List[float] = []
+        total_cons_vol = 0.0
+        for s in post_burn_in_summaries:
+            for fl in s.fills_this_tick:
+                if fl.asset == AssetType.CONSUMABLE:
+                    clearing_prices.append(float(fl.execution_price))
+                    total_cons_vol += float(fl.quantity)
+        mean_clearing_price = (
+            round(float(np.mean(clearing_prices)), 4)
+            if clearing_prices
+            else 12.0
+        )
+
+        # Net-worth Gini across all households valued at final clearing price
+        net_worths = [
+            TwoAssetAccounting.compute_net_worth(
+                h, gm.economy_cfg, consumable_price=mean_clearing_price
+            )
+            for h in gm.households.values()
+        ]
+        wealth_gini = compute_small_sample_gini(net_worths)
+
+        # Total distress capital liquidation volume executed post-burn-in
+        cap_liq_vol = round(
+            sum(
+                float(r.stage2_action.capital_transfer_units)
+                for r in active_records
+                if r.stage2_action.action_type == AgentActionType.LIQUIDATE_CAPITAL
+                and r.execution_status.startswith("LIQUIDATED_")
+            ),
+            4,
         )
 
         # 3. Wealthy / Poor HtM Shares (Post-Burn-In Average)
@@ -292,8 +408,6 @@ class EconomyMetricsCollector:
         ]
 
         # 4. CDA Bargaining / Order-Acceptance Gradient across 4 Relative Markup Bins
-        # Evaluate every consumable ASK limit order submitted post-burn-in relative to
-        # the prevailing tick mid/last price: did counterparties accept (fill) or reject (expire)?
         tick_ref_price: Dict[int, float] = {}
         for s in post_burn_in_summaries:
             ref_p = (
@@ -305,7 +419,7 @@ class EconomyMetricsCollector:
 
         c_book = gm.exchange.get_book(AssetType.CONSUMABLE)
         bin_filled_flags: List[List[float]] = [[], [], [], []]
-        for oid, ord_obj in c_book.orders_by_id.items():
+        for _, ord_obj in c_book.orders_by_id.items():
             if ord_obj.tick_submitted <= burn_in:
                 continue
             if ord_obj.side != OrderSide.ASK or ord_obj.limit_price is None:
@@ -369,6 +483,12 @@ class EconomyMetricsCollector:
             windfall_mpc_obs_counts=w_cnts,
             windfall_mpc_low_minus_high_slope=mpc_slope,
             windfall_probe_executed=w_ran,
+            wealth_gini=wealth_gini,
+            mean_bid_ask_spread=mean_spread,
+            mean_clearing_price=mean_clearing_price,
+            total_consumable_volume=round(total_cons_vol, 2),
+            capital_liquidation_volume=cap_liq_vol,
+            mean_final_health=mean_final_health,
         )
 
     @staticmethod
@@ -379,11 +499,6 @@ class EconomyMetricsCollector:
         zi_bargaining_floor_w1: Optional[float] = None,
         zi_mpc_floor_w1: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """
-        Aggregates M independent economy seeds into clustered bootstrap summaries,
-        Per-Bin TOST (Holm-Bonferroni adjusted), Debiased Wasserstein-1, and
-        Miller-Madow Jensen-Shannon Divergence.
-        """
         stats_cfg = config.stats
         m = len(seed_clusters)
 
@@ -490,7 +605,7 @@ class EconomyMetricsCollector:
             else None
         )
 
-        # 4. Clustered Bootstrap Diagnostics
+        # 4. Clustered Bootstrap Diagnostics & Behavioral Economics Aggregates
         valid_boot = clustered_bootstrap_mean(
             [sc.json_valid_rate for sc in seed_clusters],
             min_required_m=stats_cfg.num_economy_seeds_m,
@@ -511,6 +626,41 @@ class EconomyMetricsCollector:
             min_required_m=stats_cfg.num_economy_seeds_m,
             seed=config.master_seed + 303,
         )
+        gini_boot = clustered_bootstrap_mean(
+            [sc.wealth_gini for sc in seed_clusters],
+            min_required_m=stats_cfg.num_economy_seeds_m,
+            seed=config.master_seed + 304,
+        )
+        spread_boot = clustered_bootstrap_mean(
+            [sc.mean_bid_ask_spread for sc in seed_clusters],
+            min_required_m=stats_cfg.num_economy_seeds_m,
+            seed=config.master_seed + 305,
+        )
+        price_boot = clustered_bootstrap_mean(
+            [sc.mean_clearing_price for sc in seed_clusters],
+            min_required_m=stats_cfg.num_economy_seeds_m,
+            seed=config.master_seed + 306,
+        )
+        cap_liq_boot = clustered_bootstrap_mean(
+            [sc.capital_liquidation_volume for sc in seed_clusters],
+            min_required_m=stats_cfg.num_economy_seeds_m,
+            seed=config.master_seed + 307,
+        )
+        mpc_slope_vals = [
+            sc.windfall_mpc_low_minus_high_slope
+            for sc in seed_clusters
+            if sc.windfall_probe_executed
+            and math.isfinite(sc.windfall_mpc_low_minus_high_slope)
+        ]
+        mpc_slope_boot = (
+            clustered_bootstrap_mean(
+                mpc_slope_vals,
+                min_required_m=stats_cfg.num_economy_seeds_m,
+                seed=config.master_seed + 308,
+            )
+            if mpc_slope_vals
+            else None
+        )
 
         return {
             "cell_id": cell_id,
@@ -526,6 +676,18 @@ class EconomyMetricsCollector:
             "survival_rate": surv_boot.cluster_mean,
             "survival_ci_95": surv_boot.ci_95,
             "mean_endogenous_lambda": lam_boot.cluster_mean,
+            "wealth_gini": gini_boot.cluster_mean,
+            "wealth_gini_ci_95": gini_boot.ci_95,
+            "mean_bid_ask_spread": spread_boot.cluster_mean,
+            "mean_bid_ask_spread_ci_95": spread_boot.ci_95,
+            "mean_clearing_price": price_boot.cluster_mean,
+            "mean_capital_liquidation_volume": cap_liq_boot.cluster_mean,
+            "windfall_mpc_slope": (
+                mpc_slope_boot.cluster_mean if mpc_slope_boot is not None else None
+            ),
+            "windfall_mpc_slope_ci_95": (
+                mpc_slope_boot.ci_95 if mpc_slope_boot is not None else None
+            ),
             "bargaining_w1": barg_w1,
             "bargaining_per_bin_tost": [r.model_dump() for r in barg_tost],
             "htm_miller_madow_jsd": htm_jsd,

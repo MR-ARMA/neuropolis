@@ -286,13 +286,13 @@ class DisjointRepEArtifacts:
 
 class RepEManager:
     """
-    Module C Core: Two-Stage Endogenous Probe-Gated Representation Engineering Manager.
-      - Stage 1 (Unsteered Appraisal): Read-only hook at `target_layer` capturing the
-        full-context appraisal onset vector `h_prefill_last` plus the opening
-        `[:appraisal_window_tokens]` generated CoT decode tokens. Computes continuous
-        gating scalar `lambda = sigmoid((w^T h + b - theta) / T)` purely endogenously.
-      - Stage 2 (Controlled Action): Freezes the probe and injects
-        `h' = h + lambda * gamma * v_hat` strictly into Stage 2 Action tokens.
+    Module C Core (Optimized): Zero-Sync GPU-Cached Batched Two-Stage Probe-Gated RepE.
+      - Stage 1: Accumulates the opening `appraisal_window_tokens` residuals strictly on GPU
+        for all B agents simultaneously, transferring ONE `[B, hidden_size]` tensor to CPU
+        after generation finishes (zero per-token CUDA sync stalls).
+      - Stage 2: Pre-moves `v_hat` and per-agent `[B, 1, 1]` magnitudes to GPU once before
+        generation; computes norm capping purely in GPU tensor ops with zero `.item()` calls.
+      - Fully backward-compatible with single-agent calls (`B=1`) in `scripts/run_pilot_gates.py`.
     """
 
     def __init__(
@@ -306,16 +306,34 @@ class RepEManager:
         self.rng = np.random.default_rng(seed + 4099)
         self._recent_lambda_history: List[float] = []
 
-        self._captured_cot_residuals: List[torch.Tensor] = []
-        self._prefill_last_residual: Optional[torch.Tensor] = None
-        self._last_injected_l2_norm: float = 0.0
-        self._last_relative_norm_ratio: float = 0.0
+        # Batched Stage 1 pooled residual cache [B, hidden_size] on CPU
+        self._batch_pooled_cpu: Optional[torch.Tensor] = None
+        self._batch_tokens_inspected: List[int] = []
+        # Device-cached steering / placebo tensors keyed by (mode, device, dtype)
+        self._device_vec_cache: Dict[Tuple[str, str, str], torch.Tensor] = {}
 
     @staticmethod
     def resolve_effective_layer(target_layer: int, num_layers: int) -> int:
         if target_layer < num_layers:
             return max(0, int(target_layer))
         return max(0, num_layers // 2)
+
+    def _get_cached_device_vector(
+        self, active_mode: RepEMode, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        assert self.artifacts is not None
+        vec_key = "placebo" if active_mode == RepEMode.PLACEBO_RANDOM_VECTOR else "steering"
+        cache_key = (vec_key, str(device), str(dtype))
+        cached = self._device_vec_cache.get(cache_key)
+        if cached is None:
+            src = (
+                self.artifacts.placebo_vector
+                if vec_key == "placebo"
+                else self.artifacts.steering_vector
+            )
+            cached = src.to(device=device, dtype=dtype).contiguous()
+            self._device_vec_cache[cache_key] = cached
+        return cached
 
     def load_or_extract_artifacts(
         self,
@@ -355,6 +373,7 @@ class RepEManager:
                         probe_steering_cosine=float(saved["probe_steering_cosine"]),
                         extracted_from_model=bool(saved["extracted_from_model"]),
                     )
+                    self._device_vec_cache.clear()
                     return self.artifacts
             except Exception:
                 pass
@@ -369,7 +388,6 @@ class RepEManager:
         h_probe_neg = self._extract_layer_residuals(
             model, tokenizer, [p[1] for p in probe_pairs], eff_layer
         )
-
         w_probe, b_probe, test_auroc, perm_p = self._fit_linear_probe(
             h_pos=h_probe_pos, h_neg=h_probe_neg, seed=101
         )
@@ -389,7 +407,6 @@ class RepEManager:
         rand_v = rand_v - torch.dot(rand_v, steering_vec) * steering_vec
         rand_v = rand_v - torch.dot(rand_v, w_unit) * w_unit
         placebo_vec = F.normalize(rand_v, p=2, dim=0, eps=1e-6)
-
         ps_cos = round(float(torch.dot(w_unit, steering_vec).item()), 4)
 
         artifacts = DisjointRepEArtifacts(
@@ -406,7 +423,6 @@ class RepEManager:
             probe_steering_cosine=ps_cos,
             extracted_from_model=True,
         )
-
         os.makedirs(os.path.dirname(artifact_path) or ".", exist_ok=True)
         torch.save(
             {
@@ -426,6 +442,7 @@ class RepEManager:
             artifact_path,
         )
         self.artifacts = artifacts
+        self._device_vec_cache.clear()
         return artifacts
 
     def _extract_layer_residuals(
@@ -434,7 +451,7 @@ class RepEManager:
         tokenizer: Any,
         texts: List[str],
         layer_idx: int,
-        batch_size: int = 4,
+        batch_size: int = 8,
     ) -> torch.Tensor:
         device = next(model.parameters()).device
         base_transformer = getattr(model, "model", model)
@@ -477,8 +494,6 @@ class RepEManager:
             finally:
                 handle.remove()
                 del input_ids, attn_mask
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
 
             if batch_store:
                 captured_batches.append(batch_store[0])
@@ -564,13 +579,18 @@ class RepEManager:
         return (w_raw, b_raw, test_auroc, perm_p)
 
     # ========================================================================
-    # STAGE 1: UNSTEERED APPRAISAL RESIDUAL CAPTURE & ENDOGENOUS LAMBDA
+    # STAGE 1: ZERO-SYNC GPU-ACCUMULATED BATCHED RESIDUAL CAPTURE
     # ========================================================================
 
     @contextmanager
     def capture_stage1_cot_residuals(self, model: Any) -> Iterator[None]:
-        self._captured_cot_residuals.clear()
-        self._prefill_last_residual = None
+        """
+        Accumulates Stage 1 appraisal residuals on GPU across all B agents in the batch
+        with ZERO per-token GPU->CPU transfers. Transfers one `[B, hidden_size]` pooled
+        tensor to CPU strictly once upon exiting the context manager.
+        """
+        self._batch_pooled_cpu = None
+        self._batch_tokens_inspected = []
 
         if model is None or self.artifacts is None:
             yield
@@ -585,150 +605,174 @@ class RepEManager:
         layer_idx = self.resolve_effective_layer(
             self.artifacts.target_layer, len(layers)
         )
-        prefill_seen = {"done": False}
+        pooling_mode = self.config.probe_pooling
+        app_win = max(1, int(self.config.appraisal_window_tokens))
+
+        state: Dict[str, Any] = {
+            "prefill_done": False,
+            "prefill_last_gpu": None,
+            "sum_gpu": None,
+            "last_gpu": None,
+            "decode_steps": 0,
+            "accum_count": 0,
+        }
 
         def _stage1_read_hook(mod: Any, inp: Any, out: Any) -> None:
             h = out[0] if isinstance(out, tuple) else out
             if not isinstance(h, torch.Tensor) or h.dim() != 3:
                 return
             seq_len = int(h.size(1))
-            if seq_len > 1 and not prefill_seen["done"]:
-                prefill_seen["done"] = True
-                self._prefill_last_residual = (
-                    h[0, -1, :].detach().to("cpu", dtype=torch.float32)
-                )
+            if seq_len > 1 and not state["prefill_done"]:
+                state["prefill_done"] = True
+                vec = h[:, -1, :].detach().float()
+                state["prefill_last_gpu"] = vec
+                if pooling_mode == "early_appraisal_cot":
+                    state["sum_gpu"] = vec.clone()
+                    state["accum_count"] = 1
             else:
-                self._captured_cot_residuals.append(
-                    h[0, -1, :].detach().to("cpu", dtype=torch.float32)
-                )
+                vec = h[:, -1, :].detach().float()
+                state["decode_steps"] += 1
+                state["last_gpu"] = vec
+                if pooling_mode == "early_appraisal_cot":
+                    if state["decode_steps"] <= app_win:
+                        if state["sum_gpu"] is None:
+                            state["sum_gpu"] = vec.clone()
+                        else:
+                            state["sum_gpu"].add_(vec)
+                        state["accum_count"] += 1
+                elif pooling_mode == "mean_cot":
+                    if state["sum_gpu"] is None:
+                        state["sum_gpu"] = vec.clone()
+                    else:
+                        state["sum_gpu"].add_(vec)
+                    state["accum_count"] += 1
 
         handle = layers[layer_idx].register_forward_hook(_stage1_read_hook)
         try:
             yield
         finally:
             handle.remove()
+            if pooling_mode == "last_cot_token" and state["last_gpu"] is not None:
+                pooled_gpu = state["last_gpu"]
+                cnt = 1
+            elif state["sum_gpu"] is not None and state["accum_count"] > 0:
+                pooled_gpu = state["sum_gpu"] / float(state["accum_count"])
+                cnt = int(state["accum_count"])
+            elif state["prefill_last_gpu"] is not None:
+                pooled_gpu = state["prefill_last_gpu"]
+                cnt = 1
+            else:
+                pooled_gpu = None
+                cnt = 0
 
-    def compute_endogenous_lambda(self) -> ProbeGateMeasurement:
-        """
-        Pools Stage 1 appraisal residuals and computes endogenous scalar:
-            lambda = sigmoid((w^T h_pooled + b - theta) / T) in [0, 1].
-        Under `early_appraisal_cot`, pools `[h_prefill_last] + h_cot[:appraisal_window_tokens]`
-        (matching `extract_repe_vectors.py` token-for-token and guaranteeing zero B->C length coupling).
-        """
-        if self.artifacts is None or not self.config.enabled or self.config.mode == RepEMode.OFF:
-            return ProbeGateMeasurement(
-                layer_idx=self.config.target_layer,
-                cot_tokens_inspected=len(self._captured_cot_residuals),
-                raw_probe_score=0.0,
-                endogenous_lambda=0.0,
-                steering_gamma=0.0,
-                injected_vector_l2_norm=0.0,
-                relative_residual_norm_ratio=0.0,
-                repe_mode=RepEMode.OFF,
-            )
+            if pooled_gpu is not None:
+                self._batch_pooled_cpu = pooled_gpu.to("cpu", dtype=torch.float32)
+                bsz = int(self._batch_pooled_cpu.size(0))
+                self._batch_tokens_inspected = [cnt] * bsz
 
-        if self.config.probe_pooling == "early_appraisal_cot":
-            win = max(1, int(self.config.appraisal_window_tokens))
-            window_vecs: List[torch.Tensor] = []
-            if self._prefill_last_residual is not None:
-                window_vecs.append(self._prefill_last_residual)
-            window_vecs.extend(self._captured_cot_residuals[:win])
-            if not window_vecs:
-                return ProbeGateMeasurement(
-                    layer_idx=self.artifacts.target_layer,
+    def compute_endogenous_lambda_batch(
+        self, batch_size: int
+    ) -> List[ProbeGateMeasurement]:
+        """Vectorized linear probe scoring across all B agents in the current batch."""
+        if (
+            self.artifacts is None
+            or not self.config.enabled
+            or self.config.mode == RepEMode.OFF
+            or self._batch_pooled_cpu is None
+        ):
+            return [
+                ProbeGateMeasurement(
+                    layer_idx=self.config.target_layer,
                     cot_tokens_inspected=0,
                     raw_probe_score=0.0,
                     endogenous_lambda=0.0,
-                    steering_gamma=self.config.steering_strength_gamma,
+                    steering_gamma=0.0,
+                    injected_vector_l2_norm=0.0,
+                    relative_residual_norm_ratio=0.0,
+                    repe_mode=RepEMode.OFF if not self.config.enabled else self.config.mode,
+                )
+                for _ in range(batch_size)
+            ]
+
+        h_clean = torch.nan_to_num(self._batch_pooled_cpu.float(), nan=0.0)
+        w = self.artifacts.probe_weights.float()
+        b = float(self.artifacts.probe_bias)
+        raw_scores = (torch.matmul(h_clean, w) + b).tolist()
+
+        theta = float(self.config.probe_threshold_theta)
+        temp = max(1e-4, float(self.config.probe_temperature))
+        gamma = float(self.config.steering_strength_gamma)
+        results: List[ProbeGateMeasurement] = []
+
+        for idx in range(min(batch_size, len(raw_scores))):
+            raw_s = float(raw_scores[idx])
+            shifted = (raw_s - theta) / temp
+            if self.config.gate_activation == "relu_clipped":
+                lam = max(0.0, min(1.0, shifted))
+            else:
+                lam = 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, shifted))))
+
+            self._recent_lambda_history.append(lam)
+            if len(self._recent_lambda_history) > 256:
+                self._recent_lambda_history.pop(0)
+
+            eff_lam = lam
+            if (
+                self.config.mode == RepEMode.SHUFFLED_LAMBDA
+                and len(self._recent_lambda_history) >= 2
+            ):
+                rand_i = int(self.rng.integers(0, len(self._recent_lambda_history)))
+                eff_lam = self._recent_lambda_history[rand_i]
+
+            n_insp = (
+                self._batch_tokens_inspected[idx]
+                if idx < len(self._batch_tokens_inspected)
+                else 0
+            )
+            results.append(
+                ProbeGateMeasurement(
+                    layer_idx=self.artifacts.target_layer,
+                    cot_tokens_inspected=n_insp,
+                    raw_probe_score=round(raw_s, 6),
+                    endogenous_lambda=round(float(eff_lam), 6),
+                    steering_gamma=gamma,
                     injected_vector_l2_norm=0.0,
                     relative_residual_norm_ratio=0.0,
                     repe_mode=self.config.mode,
                 )
-            h_pooled = torch.stack(window_vecs, dim=0).mean(dim=0)
-            n_inspected = len(window_vecs)
-        elif self._captured_cot_residuals:
-            if self.config.probe_pooling == "last_cot_token":
-                h_pooled = self._captured_cot_residuals[-1]
-                n_inspected = 1
-            else:
-                h_pooled = torch.stack(self._captured_cot_residuals, dim=0).mean(dim=0)
-                n_inspected = len(self._captured_cot_residuals)
-        elif self._prefill_last_residual is not None:
-            h_pooled = self._prefill_last_residual
-            n_inspected = 1
-        else:
-            return ProbeGateMeasurement(
-                layer_idx=self.artifacts.target_layer,
-                cot_tokens_inspected=0,
-                raw_probe_score=0.0,
-                endogenous_lambda=0.0,
-                steering_gamma=self.config.steering_strength_gamma,
-                injected_vector_l2_norm=0.0,
-                relative_residual_norm_ratio=0.0,
-                repe_mode=self.config.mode,
             )
+        return results
 
-        h_clean = torch.nan_to_num(h_pooled.float(), nan=0.0)
-        w = self.artifacts.probe_weights.float()
-        b = float(self.artifacts.probe_bias)
-
-        raw_score = float(torch.dot(w, h_clean).item() + b)
-        shifted = (raw_score - float(self.config.probe_threshold_theta)) / max(
-            1e-4, float(self.config.probe_temperature)
-        )
-
-        if self.config.gate_activation == "relu_clipped":
-            lam = max(0.0, min(1.0, shifted))
-        else:
-            clamped = max(-30.0, min(30.0, shifted))
-            lam = 1.0 / (1.0 + math.exp(-clamped))
-
-        self._recent_lambda_history.append(lam)
-        if len(self._recent_lambda_history) > 128:
-            self._recent_lambda_history.pop(0)
-
-        effective_lam = lam
-        if (
-            self.config.mode == RepEMode.SHUFFLED_LAMBDA
-            and len(self._recent_lambda_history) >= 2
-        ):
-            rand_idx = int(self.rng.integers(0, len(self._recent_lambda_history)))
-            effective_lam = self._recent_lambda_history[rand_idx]
-
-        return ProbeGateMeasurement(
-            layer_idx=self.artifacts.target_layer,
-            cot_tokens_inspected=n_inspected,
-            raw_probe_score=round(raw_score, 6),
-            endogenous_lambda=round(float(effective_lam), 6),
-            steering_gamma=float(self.config.steering_strength_gamma),
-            injected_vector_l2_norm=0.0,
-            relative_residual_norm_ratio=0.0,
-            repe_mode=self.config.mode,
-        )
+    def compute_endogenous_lambda(self) -> ProbeGateMeasurement:
+        """Single-agent convenience wrapper (used by `scripts/run_pilot_gates.py`)."""
+        return self.compute_endogenous_lambda_batch(1)[0]
 
     # ========================================================================
-    # STAGE 2: CONTROLLED ACTION GENERATION VECTOR INJECTION
+    # STAGE 2: ZERO-SYNC GPU-CACHED BATCHED VECTOR INJECTION
     # ========================================================================
 
     @contextmanager
-    def inject_stage2_action_steering(
+    def inject_stage2_action_steering_batch(
         self,
         model: Any,
-        probe_measurement: ProbeGateMeasurement,
+        probe_measurements: List[ProbeGateMeasurement],
     ) -> Iterator[None]:
-        self._last_injected_l2_norm = 0.0
-        self._last_relative_norm_ratio = 0.0
-
-        lam = float(probe_measurement.endogenous_lambda)
-        gamma = float(self.config.steering_strength_gamma)
+        """
+        Pre-places `v_hat` and per-agent `[B, 1, 1]` magnitudes on GPU ONCE before
+        generation. Performs norm-capped latent injection purely on GPU with ZERO
+        `.item()` CPU sync stalls inside the forward hook.
+        """
         active_mode = self.config.mode
+        gamma = float(self.config.steering_strength_gamma)
+        raw_mags = [float(pm.endogenous_lambda) * gamma for pm in probe_measurements]
 
         if (
             model is None
             or self.artifacts is None
             or not self.config.enabled
             or active_mode == RepEMode.OFF
-            or abs(lam * gamma) <= 1e-8
+            or not raw_mags
+            or all(abs(m) <= 1e-8 for m in raw_mags)
         ):
             yield
             return
@@ -742,13 +786,18 @@ class RepEManager:
         layer_idx = self.resolve_effective_layer(
             self.artifacts.target_layer, len(layers)
         )
-        base_vec_cpu = (
-            self.artifacts.placebo_vector
-            if active_mode == RepEMode.PLACEBO_RANDOM_VECTOR
-            else self.artifacts.steering_vector
-        )
+        first_param = next(layers[layer_idx].parameters())
+        layer_dev = first_param.device
         max_rel_ratio = float(self.config.max_relative_norm_ratio)
-        raw_mag = lam * gamma
+
+        # Pre-allocate per-agent magnitudes on GPU once [B, 1, 1]
+        raw_mags_gpu = torch.tensor(
+            raw_mags, device=layer_dev, dtype=torch.float32
+        ).view(-1, 1, 1)
+        last_stats: Dict[str, Optional[torch.Tensor]] = {
+            "capped": None,
+            "rel_ratio": None,
+        }
 
         def _stage2_inject_hook(mod: Any, inp: Any, out: Any) -> Any:
             is_tuple = isinstance(out, tuple)
@@ -756,30 +805,34 @@ class RepEManager:
             if not isinstance(h, torch.Tensor) or h.dim() != 3:
                 return out
 
-            v_dev = base_vec_cpu.to(device=h.device, dtype=h.dtype)
-            if v_dev.size(-1) != h.size(-1):
+            bsz, seq_len, hidden_dim = h.shape
+            v_dev = self._get_cached_device_vector(active_mode, h.device, h.dtype)
+            if v_dev.size(-1) != hidden_dim:
                 return out
 
-            seq_len = int(h.size(1))
-            target_slice = h[:, -1:, :] if seq_len > 1 else h
-
-            h_norm = target_slice.detach().float().norm(dim=-1, keepdim=True).clamp(min=1e-6)
-            mean_h_norm = float(h_norm.mean().item())
-            max_allowed_mag = max_rel_ratio * mean_h_norm
-
-            capped_mag = math.copysign(min(abs(raw_mag), max_allowed_mag), raw_mag)
-            delta = (v_dev * capped_mag).view(1, 1, -1)
-
-            h_mod = h.clone()
-            if seq_len > 1:
-                h_mod[:, -1:, :] = h_mod[:, -1:, :] + delta
-            else:
-                h_mod = h_mod + delta
-
-            self._last_injected_l2_norm = round(abs(capped_mag), 6)
-            self._last_relative_norm_ratio = round(
-                abs(capped_mag) / max(mean_h_norm, 1e-6), 6
+            mags_b = (
+                raw_mags_gpu
+                if raw_mags_gpu.size(0) == bsz
+                else raw_mags_gpu[:bsz]
             )
+            if mags_b.device != h.device:
+                mags_b = mags_b.to(h.device)
+
+            target_slice = h[:, -1:, :] if seq_len > 1 else h
+            h_norm = target_slice.detach().float().norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            max_mag = max_rel_ratio * h_norm
+            capped_mag = torch.sign(mags_b) * torch.minimum(mags_b.abs(), max_mag)
+
+            last_stats["capped"] = capped_mag.detach().abs().view(-1)
+            last_stats["rel_ratio"] = (capped_mag.detach().abs() / h_norm).view(-1)
+
+            delta = capped_mag.to(h.dtype) * v_dev.view(1, 1, -1)
+            if seq_len == 1:
+                h_mod = h + delta
+            else:
+                h_mod = h.clone()
+                h_mod[:, -1:, :] = h_mod[:, -1:, :] + delta
+
             return (h_mod,) + out[1:] if is_tuple else h_mod
 
         handle = layers[layer_idx].register_forward_hook(_stage2_inject_hook)
@@ -787,7 +840,20 @@ class RepEManager:
             yield
         finally:
             handle.remove()
-            probe_measurement.injected_vector_l2_norm = self._last_injected_l2_norm
-            probe_measurement.relative_residual_norm_ratio = (
-                self._last_relative_norm_ratio
-            )
+            if last_stats["capped"] is not None and last_stats["rel_ratio"] is not None:
+                cap_list = last_stats["capped"].cpu().tolist()
+                rel_list = last_stats["rel_ratio"].cpu().tolist()
+                for idx, pm in enumerate(probe_measurements):
+                    if idx < len(cap_list):
+                        pm.injected_vector_l2_norm = round(float(cap_list[idx]), 6)
+                        pm.relative_residual_norm_ratio = round(float(rel_list[idx]), 6)
+
+    @contextmanager
+    def inject_stage2_action_steering(
+        self,
+        model: Any,
+        probe_measurement: ProbeGateMeasurement,
+    ) -> Iterator[None]:
+        """Single-agent convenience wrapper (used by `scripts/run_pilot_gates.py`)."""
+        with self.inject_stage2_action_steering_batch(model, [probe_measurement]):
+            yield

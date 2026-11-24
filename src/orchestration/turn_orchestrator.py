@@ -442,18 +442,216 @@ class TurnOrchestrator:
 
     def run_tick(self, tick: int) -> TickMacroSummary:
         self.game_master.begin_tick(tick)
-        arrival_order = list(self.game_master.households.keys())
+        arrival_order = [
+            aid
+            for aid in self.game_master.households.keys()
+            if NeedsEngine.is_alive(self.game_master.households[aid])
+        ]
         self.rng.shuffle(arrival_order)
 
-        for agent_id in arrival_order:
-            sheet = self.game_master.households[agent_id]
-            if not NeedsEngine.is_alive(sheet):
-                continue
-            self._execute_single_agent_turn(tick, agent_id)
+        if (
+            self.config.policy_mode == PolicyMode.LLM_AGENT
+            and self.llm_controller is not None
+            and hasattr(self.llm_controller, "execute_two_stage_batch")
+            and len(arrival_order) > 1
+        ):
+            # Process living agents in GPU batches of up to 12 simultaneously
+            batch_sz = 12
+            for start_i in range(0, len(arrival_order), batch_sz):
+                self._execute_batched_llm_wave(
+                    tick, arrival_order[start_i : start_i + batch_sz]
+                )
+        else:
+            for agent_id in arrival_order:
+                self._execute_single_agent_turn(tick, agent_id)
 
         summary = self.game_master.step_end_of_tick_physics(tick)
         self._record_post_tick_sanitized_episodes(tick, summary)
         return summary
+
+    def _execute_batched_llm_wave(self, tick: int, wave_agent_ids: List[str]) -> None:
+        snapshots = self.game_master.exchange.get_all_snapshots(tick)
+        c_snap = snapshots[AssetType.CONSUMABLE]
+
+        pre_states: List[Tuple[float, float, float, float, float]] = []
+        allocs: List[DeliberationAllocation] = []
+        retrievals: List[RetrievalResult] = []
+        sys_prompts: List[str] = []
+        user_prompts: List[str] = []
+        cot_budgets: List[int] = []
+
+        for agent_id in wave_agent_ids:
+            sheet = self.game_master.households[agent_id]
+            pre_states.append(
+                (
+                    sheet.liquid_cash,
+                    sheet.illiquid_capital,
+                    sheet.consumable_inventory,
+                    sheet.needs.health,
+                    sheet.needs.composite_stress,
+                )
+            )
+            alloc = self.deliberation_ctrl.compute_allocation(sheet.needs)
+            allocs.append(alloc)
+            cot_budgets.append(alloc.cot_max_tokens)
+
+            mem_handle = self.memory_tms.get_scoped_handle(agent_id)
+            query_str = (
+                f"Cycle {tick} RESOURCE_A={sheet.consumable_inventory:.1f} "
+                f"Pool_Credits={sheet.liquid_cash:.1f} Vitality={sheet.needs.health:.2f} "
+                f"Board_Last={c_snap.last_trade_price}"
+            )
+            ret = mem_handle.retrieve(
+                agent_id=agent_id,
+                query_text=query_str,
+                current_tick=tick,
+                stress_index=sheet.needs.composite_stress,
+                rng=self.rng,
+            )
+            retrievals.append(ret)
+            peer_dir = mem_handle.get_top_peers_summary(agent_id=agent_id, max_peers=3)
+            open_orders = []
+            for book in self.game_master.exchange.books.values():
+                open_orders.extend(book.get_open_orders_for_agent(agent_id))
+
+            sp, up = SanitizedPromptCompiler.compile_stage1_prompt(
+                tick=tick,
+                sheet=sheet,
+                board_snapshots=snapshots,
+                open_orders=open_orders,
+                retrieval=ret,
+                peer_directory=peer_dir,
+                cfg=self.config,
+            )
+            sys_prompts.append(sp)
+            user_prompts.append(up)
+
+        # Single fused GPU batch for Stage 1 CoT + Stage 2 Steered Action JSON
+        gen_outputs: List[TwoStageGenerationOutput] = (
+            self.llm_controller.execute_two_stage_batch(  # type: ignore[union-attr]
+                stage1_system_prompts=sys_prompts,
+                stage1_user_prompts=user_prompts,
+                stage2_instruction=SanitizedPromptCompiler.STAGE2_JSON_INSTRUCTION,
+                cot_max_tokens_list=cot_budgets,
+                action_max_tokens=allocs[0].action_json_max_tokens,
+                agent_ids=wave_agent_ids,
+                tick=tick,
+                parse_action_fn=IsomorphicVocabulary.parse_sanitized_action_json,
+            )
+        )
+
+        # Submit actions sequentially in shuffled arrival order to preserve CDA Price-Time Priority
+        for i, agent_id in enumerate(wave_agent_ids):
+            pre_cash, pre_cap, pre_cons, pre_health, pre_stress = pre_states[i]
+            gen_out = gen_outputs[i]
+            exec_outcome = self.game_master.execute_agent_action(
+                tick=tick, agent_id=agent_id, payload=gen_out.stage2_action
+            )
+            self._record_execution_and_turn_log(
+                tick=tick,
+                agent_id=agent_id,
+                pre_cash=pre_cash,
+                pre_cap=pre_cap,
+                pre_cons=pre_cons,
+                pre_health=pre_health,
+                pre_stress=pre_stress,
+                alloc=allocs[i],
+                retrieval=retrievals[i],
+                gen_out=gen_out,
+                exec_outcome=exec_outcome,
+            )
+
+    def _record_execution_and_turn_log(
+        self,
+        tick: int,
+        agent_id: str,
+        pre_cash: float,
+        pre_cap: float,
+        pre_cons: float,
+        pre_health: float,
+        pre_stress: float,
+        alloc: DeliberationAllocation,
+        retrieval: RetrievalResult,
+        gen_out: TwoStageGenerationOutput,
+        exec_outcome: ActionExecutionOutcome,
+    ) -> AgentTurnRecord:
+        mem_handle = self.memory_tms.get_scoped_handle(agent_id)
+        for fill in exec_outcome.fills:
+            tok = IsomorphicVocabulary.ASSET_TO_TOKEN[fill.asset]
+            buyer_handle = self.memory_tms.get_scoped_handle(fill.buyer_id)
+            seller_handle = self.memory_tms.get_scoped_handle(fill.seller_id)
+
+            buyer_handle.write_episode(
+                agent_id=fill.buyer_id,
+                tick=tick,
+                event_type="TRADE_FILL",
+                summary_text=(
+                    f"[C{tick:03d}] Fill BID {tok} {fill.quantity:.1f}@{fill.execution_price:.2f} Peer={fill.seller_id}"
+                ),
+                salience_score=1.35,
+            )
+            seller_handle.write_episode(
+                agent_id=fill.seller_id,
+                tick=tick,
+                event_type="TRADE_FILL",
+                summary_text=(
+                    f"[C{tick:03d}] Fill ASK {tok} {fill.quantity:.1f}@{fill.execution_price:.2f} Peer={fill.buyer_id}"
+                ),
+                salience_score=1.35,
+            )
+            buyer_handle.update_peer_reliability(fill.buyer_id, fill.seller_id, 1.0, tick)
+            seller_handle.update_peer_reliability(fill.seller_id, fill.buyer_id, 1.0, tick)
+
+        if exec_outcome.accepted and exec_outcome.action_type in (
+            AgentActionType.LIQUIDATE_CAPITAL,
+            AgentActionType.INVEST_CAPITAL,
+        ):
+            proto_label = (
+                "PROTOCOL_B_OUT"
+                if exec_outcome.action_type == AgentActionType.LIQUIDATE_CAPITAL
+                else "PROTOCOL_B_IN"
+            )
+            mem_handle.write_episode(
+                agent_id=agent_id,
+                tick=tick,
+                event_type="CAPITAL_TRANSFER",
+                summary_text=(
+                    f"[C{tick:03d}] {proto_label} {gen_out.stage2_action.capital_transfer_units:.1f}u "
+                    f"Fee={exec_outcome.kmv_fee_paid:.2f} dCr={exec_outcome.net_cash_delta:+.2f}"
+                ),
+                salience_score=1.60,
+            )
+
+        record = AgentTurnRecord(
+            run_id=self.run_id,
+            economy_seed=self.economy_seed,
+            tick=tick,
+            agent_id=agent_id,
+            policy_mode=self.config.policy_mode,
+            factorial_cell_id=self.config.factorial_cell.cell_id,
+            pre_turn_cash=pre_cash,
+            pre_turn_capital=pre_cap,
+            pre_turn_consumable=pre_cons,
+            pre_turn_health=pre_health,
+            pre_turn_stress=pre_stress,
+            rag_top_k_used=retrieval.top_k_used,
+            rag_noise_sigma_used=retrieval.noise_sigma_used,
+            cot_token_budget_allocated=alloc.cot_max_tokens,
+            cot_tokens_generated=gen_out.cot_tokens_generated,
+            cot_truncated_by_bottleneck=gen_out.cot_truncated_by_bottleneck,
+            stage1_cot_text=gen_out.stage1_cot_text,
+            probe_measurement=gen_out.probe_measurement,
+            stage2_raw_json=gen_out.stage2_raw_json,
+            stage2_action=gen_out.stage2_action,
+            json_valid=gen_out.json_valid,
+            abstain=gen_out.abstain,
+            retries_used=gen_out.retries_used,
+            action_tokens_generated=gen_out.action_tokens_generated,
+            latency_ms=gen_out.latency_ms,
+            execution_status=exec_outcome.reason,
+        )
+        self.turn_records.append(record)
+        return record
 
     def _execute_single_agent_turn(self, tick: int, agent_id: str) -> AgentTurnRecord:
         t_start = time.perf_counter()

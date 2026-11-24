@@ -421,32 +421,74 @@ def plot_fig4_two_asset_htm_distribution(
 
 
 def export_latex_summary_table(report: Dict[str, Any], out_dir: str, is_synthetic: bool) -> str:
+    import csv
+
     status_note = "SYNTHETIC PIPELINE TEST" if is_synthetic else "EXECUTED FROM CLUSTERED ARTIFACTS"
     lines = [
-        r"\begin{table}[htbp]",
+        r"\begin{table*}[htbp]",
         r"\centering",
-        rf"\caption{{Neuropolis v2 $2^3$ Factorial Clustered Evaluation ({status_note})}}",
-        r"\begin{tabular}{lrrrrrr}",
+        rf"\caption{{Neuropolis v2 $2^3$ Factorial Behavioral Economics Benchmark Summary ({status_note})}}",
+        r"\resizebox{\textwidth}{!}{%",
+        r"\begin{tabular}{lrrrrrrrrr}",
         r"\toprule",
-        r"Condition & $M$ & Valid \% & Freeze \% & Barg. $W_1$ (95\% CI) & HtM JSD & Max SFC Err \\",
+        r"Condition & $M$ & Valid\% & Frz\% & Gini & Spread & W-HtM\% & HtM JSD & Barg. $W_1$ (95\% CI) & MPC Slope \\",
         r"\midrule",
     ]
+
+    csv_rows: List[Dict[str, Any]] = []
     for cid, rep in report["cell_reports"].items():
         w1 = rep["bargaining_w1"]
         jsd = rep["htm_miller_madow_jsd"]["debiased_jsd"]
+        whtm_bin = next(
+            (b for b in rep.get("htm_per_bin_tost", []) if b["bin_label"] == "Wealthy_HtM"),
+            None,
+        )
+        whtm_pct = (float(whtm_bin["sim_cluster_mean"]) * 100.0) if whtm_bin else 0.0
+        gini_v = float(rep.get("wealth_gini", 0.0))
+        sprd_v = float(rep.get("mean_bid_ask_spread", 0.0))
+        mpc_s = rep.get("windfall_mpc_slope")
+        mpc_str = f"{float(mpc_s):+.3f}" if mpc_s is not None else "--"
+
         safe_cid = cid.replace("_", r"\_")
         lines.append(
             f"{safe_cid} & {rep['n_economy_seeds_m']} & {rep['json_valid_rate']*100:.1f}\\% & "
-            f"{rep['market_freeze_rate']*100:.1f}\\% & "
+            f"{rep['market_freeze_rate']*100:.1f}\\% & {gini_v:.3f} & {sprd_v:.2f} & "
+            f"{whtm_pct:.1f}\\% & {jsd:.4f} & "
             f"{w1['debiased_w1']:.3f} [{w1['ci_95'][0]:.3f}, {w1['ci_95'][1]:.3f}] & "
-            f"{jsd:.4f} & {rep['max_sfc_conservation_error']:.1e} \\\\"
+            f"{mpc_str} \\\\"
         )
-    lines.extend([r"\bottomrule", r"\end{tabular}", r"\end{table}"])
+        csv_rows.append(
+            {
+                "condition": cid,
+                "n_seeds_m": rep["n_economy_seeds_m"],
+                "json_valid_rate": rep["json_valid_rate"],
+                "survival_rate": rep.get("survival_rate", 1.0),
+                "market_freeze_rate": rep["market_freeze_rate"],
+                "wealth_gini": gini_v,
+                "mean_bid_ask_spread": sprd_v,
+                "wealthy_htm_pct": round(whtm_pct, 2),
+                "htm_debiased_jsd": jsd,
+                "bargaining_debiased_w1": w1["debiased_w1"],
+                "bargaining_w1_ci95_lo": w1["ci_95"][0],
+                "bargaining_w1_ci95_hi": w1["ci_95"][1],
+                "windfall_mpc_slope": mpc_s if mpc_s is not None else "",
+                "max_sfc_error": rep["max_sfc_conservation_error"],
+            }
+        )
+
+    lines.extend([r"\bottomrule", r"\end{tabular}%", r"}", r"\end{table*}"])
     out_tex = os.path.join(out_dir, "table_factorial_summary.tex")
     with open(out_tex, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
-    return out_tex
 
+    if csv_rows:
+        out_csv = os.path.join(out_dir, "table_factorial_summary.csv")
+        with open(out_csv, "w", newline="", encoding="utf-8") as cf:
+            writer = csv.DictWriter(cf, fieldnames=list(csv_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(csv_rows)
+
+    return out_tex
 
 def _build_synthetic_pipeline_test_report() -> Dict[str, Any]:
     """Strictly for unit-testing the plotting pipeline with visible SYNTHETIC watermark."""

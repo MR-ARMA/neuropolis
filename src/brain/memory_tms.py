@@ -165,9 +165,12 @@ class ScopedMemoryHandle:
 
 class EpisodicMemoryTMS:
     """
-    Factor B (Domain-General Cognitive Bottleneck): Episodic Memory Friction &
-    Transactive Memory System (TMS) SQLite WAL Store.
+    Factor B (Optimized): Episodic Memory Friction & TMS Store with Vectorized
+    In-Memory NumPy Cache and Hard 15-Tick Context Truncation.
     """
+
+    MAX_SUMMARY_CHARS = 110
+    MAX_RETENTION_TICKS = 15
 
     def __init__(
         self,
@@ -187,6 +190,8 @@ class EpisodicMemoryTMS:
         )
         if self._shared_conn is not None:
             self._shared_conn.row_factory = sqlite3.Row
+        # Fast vectorized cache: agent_id -> list of (record, float32[dim])
+        self._mem_cache: Dict[str, List[Tuple[EpisodicMemoryRecord, np.ndarray]]] = {}
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -235,19 +240,17 @@ class EpisodicMemoryTMS:
             self._close_if_not_shared(conn)
 
     def __deepcopy__(self, memo: Dict[int, Any]) -> "EpisodicMemoryTMS":
-        """
-        Safely clones `EpisodicMemoryTMS` (including its `:memory:` SQLite database)
-        via `conn.iterdump()` so paired exogenous-windfall shadow worlds can run
-        without triggering `TypeError: cannot pickle 'sqlite3.Connection' object`.
-        """
         cls = self.__class__
         new_obj = cls.__new__(cls)
         memo[id(self)] = new_obj
 
         new_obj.config = copy.deepcopy(self.config, memo)
         new_obj.db_path = ":memory:"
-        # Embedder is stateless/read-only; share safely without duplicating model weights
         new_obj.embedder = self.embedder
+        new_obj._mem_cache = {
+            aid: [(rec.model_copy(), emb.copy()) for rec, emb in entries]
+            for aid, entries in self._mem_cache.items()
+        }
 
         src_conn = self._connect()
         try:
@@ -270,11 +273,11 @@ class EpisodicMemoryTMS:
         self, stress_index: float
     ) -> Tuple[int, float]:
         s = max(0.0, min(1.0, float(stress_index)))
+        # Cap effective calm Top-K at 5 so prompt context remains strictly bounded across 15 ticks
+        k_max = min(5, int(self.config.top_k_calm))
+        k_min = min(k_max, int(self.config.top_k_stressed))
         if not self.config.enabled:
-            return (int(self.config.top_k_calm), 0.0)
-
-        k_max = int(self.config.top_k_calm)
-        k_min = int(self.config.top_k_stressed)
+            return (k_max, 0.0)
         eff_k = max(k_min, int(math.floor(k_max - (k_max - k_min) * s)))
         eff_sigma = round(float(self.config.similarity_noise_sigma_max) * s, 6)
         return (eff_k, eff_sigma)
@@ -287,8 +290,8 @@ class EpisodicMemoryTMS:
         summary_text: str,
         salience_score: float = 1.0,
     ) -> EpisodicMemoryRecord:
-        emb = self.embedder.embed(summary_text)
-        emb_list = [round(float(x), 6) for x in emb.tolist()]
+        safe_summary = summary_text.strip()[: self.MAX_SUMMARY_CHARS]
+        emb = self.embedder.embed(safe_summary)
         mem_id = f"ep_{tick:04d}_{uuid.uuid4().hex[:8]}"
         sal = max(0.05, float(salience_score))
 
@@ -297,11 +300,23 @@ class EpisodicMemoryTMS:
             agent_id=agent_id,
             tick=tick,
             event_type=event_type,  # type: ignore[arg-type]
-            summary_text=summary_text,
+            summary_text=safe_summary,
             salience_score=sal,
-            embedding=emb_list,
+            embedding=None,
         )
 
+        # Update vectorized in-memory cache with strict 15-tick & 48-record rolling cap
+        cap = min(48, int(self.config.max_episodic_capacity))
+        bucket = self._mem_cache.setdefault(agent_id, [])
+        bucket.append((record, emb))
+        min_keep_tick = tick - self.MAX_RETENTION_TICKS
+        if len(bucket) > cap or (bucket and bucket[0][0].tick < min_keep_tick):
+            bucket = [
+                (r, e) for r, e in bucket if r.tick >= min_keep_tick
+            ][-cap:]
+            self._mem_cache[agent_id] = bucket
+
+        # Persist summary to SQLite (skip serializing 384 floats as JSON when in-memory cache is active)
         conn = self._connect()
         try:
             conn.execute(
@@ -317,21 +332,8 @@ class EpisodicMemoryTMS:
                     record.event_type,
                     record.summary_text,
                     record.salience_score,
-                    json.dumps(emb_list),
+                    "[]",
                 ),
-            )
-            cap = int(self.config.max_episodic_capacity)
-            conn.execute(
-                """
-                DELETE FROM episodic_memory
-                WHERE agent_id = ? AND mem_id NOT IN (
-                    SELECT mem_id FROM episodic_memory
-                    WHERE agent_id = ?
-                    ORDER BY tick DESC, salience_score DESC
-                    LIMIT ?
-                );
-                """,
-                (agent_id, agent_id, cap),
             )
             conn.commit()
         finally:
@@ -347,8 +349,18 @@ class EpisodicMemoryTMS:
         rng: np.random.Generator,
     ) -> RetrievalResult:
         eff_k, eff_sigma = self.compute_effective_top_k_and_sigma(stress_index)
-        q_vec = self.embedder.embed(query_text)
+        entries = self._mem_cache.get(agent_id, [])
+        if not entries:
+            return RetrievalResult(
+                agent_id=agent_id,
+                records=[],
+                top_k_used=eff_k,
+                noise_sigma_used=eff_sigma,
+                friction_enabled=self.config.enabled,
+                total_candidate_pool=0,
+            )
 
+        q_vec = self.embedder.embed(query_text)
         if self.config.enabled and eff_sigma > 1e-8:
             emb_noise = rng.normal(
                 0.0,
@@ -360,29 +372,13 @@ class EpisodicMemoryTMS:
             if q_norm > 1e-8:
                 q_vec = q_noisy / q_norm
 
-        conn = self._connect()
-        try:
-            rows = conn.execute(
-                """
-                SELECT mem_id, agent_id, tick, event_type, summary_text, salience_score, embedding_json
-                FROM episodic_memory
-                WHERE agent_id = ?
-                ORDER BY tick DESC;
-                """,
-                (agent_id,),
-            ).fetchall()
-        finally:
-            self._close_if_not_shared(conn)
-
-        if not rows:
-            return RetrievalResult(
-                agent_id=agent_id,
-                records=[],
-                top_k_used=eff_k,
-                noise_sigma_used=eff_sigma,
-                friction_enabled=self.config.enabled,
-                total_candidate_pool=0,
-            )
+        # Single vectorized dot-product across all cached memories (<0.05 ms)
+        e_mat = np.stack([e for _, e in entries], axis=0)
+        cos_sims = e_mat @ q_vec
+        ticks_arr = np.asarray([r.tick for r, _ in entries], dtype=np.float32)
+        sals_arr = np.asarray([r.salience_score for r, _ in entries], dtype=np.float32)
+        delta_t = np.maximum(0.0, float(current_tick) - ticks_arr)
+        sal_recency = sals_arr * np.exp(-0.15 * delta_t)
 
         w_sal = float(self.config.recency_salience_weight)
         eff_w_sal = (
@@ -390,38 +386,12 @@ class EpisodicMemoryTMS:
             if self.config.enabled
             else w_sal
         )
+        scores = (1.0 - eff_w_sal) * cos_sims + eff_w_sal * sal_recency
+        if self.config.enabled and eff_sigma > 1e-8:
+            scores = scores + rng.normal(0.0, eff_sigma, size=scores.shape)
 
-        scored: List[Tuple[float, EpisodicMemoryRecord]] = []
-        for r in rows:
-            emb_list = json.loads(r["embedding_json"])
-            m_vec = np.asarray(emb_list, dtype=np.float32)
-            cos_sim = float(np.dot(q_vec, m_vec))
-            delta_t = max(0, current_tick - int(r["tick"]))
-            sal_recency = float(r["salience_score"]) * math.exp(-0.15 * delta_t)
-
-            score_noise = (
-                float(rng.normal(0.0, eff_sigma))
-                if (self.config.enabled and eff_sigma > 1e-8)
-                else 0.0
-            )
-            total_score = (
-                (1.0 - eff_w_sal) * cos_sim
-                + eff_w_sal * sal_recency
-                + score_noise
-            )
-            rec = EpisodicMemoryRecord(
-                mem_id=r["mem_id"],
-                agent_id=r["agent_id"],
-                tick=int(r["tick"]),
-                event_type=r["event_type"],
-                summary_text=r["summary_text"],
-                salience_score=float(r["salience_score"]),
-                embedding=None,
-            )
-            scored.append((total_score, rec))
-
-        scored.sort(key=lambda item: item[0], reverse=True)
-        selected = [rec for _, rec in scored[:eff_k]]
+        top_indices = np.argsort(scores)[::-1][:eff_k]
+        selected = [entries[int(i)][0] for i in top_indices]
 
         return RetrievalResult(
             agent_id=agent_id,
@@ -429,7 +399,7 @@ class EpisodicMemoryTMS:
             top_k_used=eff_k,
             noise_sigma_used=eff_sigma,
             friction_enabled=self.config.enabled,
-            total_candidate_pool=len(rows),
+            total_candidate_pool=len(entries),
         )
 
     def _update_peer_directory(
