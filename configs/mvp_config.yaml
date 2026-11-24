@@ -57,7 +57,7 @@ cda:
 deliberation:
   enabled: true
   stress_activation_threshold: 0.0
-  cot_max_tokens_calm: 96
+  cot_max_tokens_calm: 72
   cot_min_tokens_stressed: 24
   stress_decay_steepness: 3.5
   action_json_max_tokens: 80
