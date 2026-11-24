@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import csv
 import dataclasses
 import hashlib
 import json
@@ -20,6 +21,7 @@ from src.core.contracts import (
 )
 from src.environment.game_master import GameMaster, TickMacroSummary
 from src.evaluation.metrics import (
+    ActiveWindfallShadowState,
     EconomyMetricsCollector,
     EconomySeedClusterMetrics,
     ExogenousWindfallMPCProbe,
@@ -36,13 +38,6 @@ from src.orchestration.turn_orchestrator import TurnOrchestrator
 # ============================================================================
 
 def build_full_factorial_and_control_specs() -> Dict[str, FactorialCellSpec]:
-    """
-    Constructs all 8 cells of the 2^3 Factorial Ablation Matrix (C000..C111)
-    plus the 4 mandatory mechanistic and non-LLM baselines:
-    - Factor A: Bounded Deliberation Budget (B_CoT)
-    - Factor B: Episodic Memory Friction (M_RAG)
-    - Factor C: Two-Stage Endogenous Probe-Gated RepE (R_RepE)
-    """
     specs: Dict[str, FactorialCellSpec] = {}
     for a in (0, 1):
         for b in (0, 1):
@@ -59,7 +54,6 @@ def build_full_factorial_and_control_specs() -> Dict[str, FactorialCellSpec]:
                     policy_mode=PolicyMode.LLM_AGENT,
                 )
 
-    # Mandatory Mechanistic Controls (Paired on identical seeds)
     specs["CTRL_PLACEBO_VEC"] = FactorialCellSpec(
         cell_id="CTRL_PLACEBO_VEC",
         deliberation_bottleneck=True,
@@ -76,8 +70,6 @@ def build_full_factorial_and_control_specs() -> Dict[str, FactorialCellSpec]:
         repe_mode=RepEMode.SHUFFLED_LAMBDA,
         policy_mode=PolicyMode.LLM_AGENT,
     )
-
-    # Non-LLM Baseline Comparators (Empirical Null Floor & Closed-Form Reference)
     specs["BASE_ZERO_INTELLIGENCE"] = FactorialCellSpec(
         cell_id="BASE_ZERO_INTELLIGENCE",
         deliberation_bottleneck=False,
@@ -98,7 +90,7 @@ def build_full_factorial_and_control_specs() -> Dict[str, FactorialCellSpec]:
 
 
 # ============================================================================
-# 2. SINGLE ECONOMY SEED EXECUTOR (ISOLATED CLUSTER WORKER)
+# 2. SINGLE ECONOMY SEED EXECUTOR (ZERO-REDUNDANCY WINDFALL SHADOW PROBE)
 # ============================================================================
 
 def execute_single_economy_seed(
@@ -106,12 +98,9 @@ def execute_single_economy_seed(
     economy_seed: int,
     llm_controller: Any = None,
     eval_windfall_mpc: bool = True,
+    windfall_horizon: int = 2,
     output_dir: Optional[str] = None,
 ) -> EconomySeedClusterMetrics:
-    """
-    Runs one completely self-contained economy cluster (burn_in + active ticks)
-    for `(cell_cfg.factorial_cell.cell_id, economy_seed)`.
-    """
     cell_id = cell_cfg.factorial_cell.cell_id
     run_id = f"{cell_cfg.experiment_id}__{cell_id}__seed{economy_seed:03d}"
 
@@ -135,27 +124,43 @@ def execute_single_economy_seed(
 
     windfall_mpcs: Optional[List[float]] = None
     windfall_counts: Optional[List[int]] = None
+    active_shadow: Optional[ActiveWindfallShadowState] = None
+
     windfall_trigger_tick = cell_cfg.burn_in_ticks + max(
-        1, min(5, cell_cfg.active_ticks // 2)
+        1, min(4, max(1, cell_cfg.active_ticks - windfall_horizon))
     )
 
     for tick in range(1, total_ticks + 1):
-        # Execute paired exogenous windfall MPC probe cleanly without mutating main economy
         if eval_windfall_mpc and tick == windfall_trigger_tick:
-            windfall_mpcs, windfall_counts = (
-                ExogenousWindfallMPCProbe.run_paired_windfall_probe(
-                    orchestrator=orch,
-                    start_tick=tick,
-                    windfall_amount=20.0,
-                    horizon_ticks=3,
-                )
+            active_shadow = ExogenousWindfallMPCProbe.fork_treated_windfall_branch(
+                orchestrator=orch,
+                start_tick=tick,
+                windfall_amount=20.0,
+                horizon_ticks=windfall_horizon,
             )
 
         summary = orch.run_tick(tick)
         if tick > cell_cfg.burn_in_ticks:
             post_burn_in_summaries.append(summary)
 
-    # Persist turn-level audit log if requested
+        if active_shadow is not None:
+            ExogenousWindfallMPCProbe.step_treated_and_record(
+                shadow=active_shadow,
+                tick=tick,
+                main_control_summary=summary,
+            )
+            if active_shadow.steps_completed >= active_shadow.horizon_ticks:
+                windfall_mpcs, windfall_counts = (
+                    ExogenousWindfallMPCProbe.finalize_tercile_mpc(active_shadow)
+                )
+                active_shadow = None
+
+    if active_shadow is not None:
+        windfall_mpcs, windfall_counts = (
+            ExogenousWindfallMPCProbe.finalize_tercile_mpc(active_shadow)
+        )
+        active_shadow = None
+
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
         turn_log_path = os.path.join(
@@ -176,17 +181,111 @@ def execute_single_economy_seed(
 
 
 def _parallel_non_llm_worker(
-    args_tuple: Tuple[Dict[str, Any], int, bool, Optional[str]]
+    args_tuple: Tuple[Dict[str, Any], int, bool, int, Optional[str]]
 ) -> EconomySeedClusterMetrics:
-    raw_cfg, seed, eval_mpc, out_dir = args_tuple
+    raw_cfg, seed, eval_mpc, wf_h, out_dir = args_tuple
     cfg = SimulationConfig(**raw_cfg)
     return execute_single_economy_seed(
         cell_cfg=cfg,
         economy_seed=seed,
         llm_controller=None,
         eval_windfall_mpc=eval_mpc,
+        windfall_horizon=wf_h,
         output_dir=out_dir,
     )
+
+
+def _load_checkpoint_safely(ckpt_path: str) -> Dict[int, EconomySeedClusterMetrics]:
+    cached: Dict[int, EconomySeedClusterMetrics] = {}
+    if not os.path.exists(ckpt_path):
+        return cached
+    valid_fields = {f.name for f in dataclasses.fields(EconomySeedClusterMetrics)}
+    with open(ckpt_path, "r", encoding="utf-8") as cf:
+        for row in json.load(cf):
+            filtered = {k: v for k, v in row.items() if k in valid_fields}
+            sc_obj = EconomySeedClusterMetrics(**filtered)
+            cached[sc_obj.economy_seed] = sc_obj
+    return cached
+
+
+def _export_benchmark_csv(
+    cell_reports: Dict[str, Dict[str, Any]], output_dir: str
+) -> str:
+    csv_path = os.path.join(output_dir, "benchmark_summary_table.csv")
+    fieldnames = [
+        "cell_id",
+        "n_economy_seeds_m",
+        "json_valid_rate",
+        "survival_rate",
+        "market_freeze_rate",
+        "wealth_gini",
+        "mean_bid_ask_spread",
+        "mean_clearing_price",
+        "mean_capital_liquidation_volume",
+        "poor_htm_share",
+        "wealthy_htm_share",
+        "non_htm_share",
+        "htm_debiased_jsd",
+        "bargaining_debiased_w1",
+        "bargaining_w1_ci95_lo",
+        "bargaining_w1_ci95_hi",
+        "bargaining_tost_equiv_bins",
+        "htm_tost_equiv_bins",
+        "windfall_mpc_slope",
+        "mpc_tost_equiv_bins",
+        "mean_endogenous_lambda",
+        "max_sfc_conservation_error",
+    ]
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for cid, rep in cell_reports.items():
+            htm_map = {
+                b["bin_label"]: b["sim_cluster_mean"]
+                for b in rep.get("htm_per_bin_tost", [])
+            }
+            w1 = rep["bargaining_w1"]
+            writer.writerow(
+                {
+                    "cell_id": cid,
+                    "n_economy_seeds_m": rep["n_economy_seeds_m"],
+                    "json_valid_rate": rep["json_valid_rate"],
+                    "survival_rate": rep["survival_rate"],
+                    "market_freeze_rate": rep["market_freeze_rate"],
+                    "wealth_gini": rep.get("wealth_gini", 0.0),
+                    "mean_bid_ask_spread": rep.get("mean_bid_ask_spread", 0.0),
+                    "mean_clearing_price": rep.get("mean_clearing_price", 12.0),
+                    "mean_capital_liquidation_volume": rep.get(
+                        "mean_capital_liquidation_volume", 0.0
+                    ),
+                    "poor_htm_share": htm_map.get("Poor_HtM", 0.0),
+                    "wealthy_htm_share": htm_map.get("Wealthy_HtM", 0.0),
+                    "non_htm_share": htm_map.get("Non_HtM", 0.0),
+                    "htm_debiased_jsd": rep["htm_miller_madow_jsd"]["debiased_jsd"],
+                    "bargaining_debiased_w1": w1["debiased_w1"],
+                    "bargaining_w1_ci95_lo": w1["ci_95"][0],
+                    "bargaining_w1_ci95_hi": w1["ci_95"][1],
+                    "bargaining_tost_equiv_bins": sum(
+                        1
+                        for b in rep["bargaining_per_bin_tost"]
+                        if b["statistically_equivalent"]
+                    ),
+                    "htm_tost_equiv_bins": sum(
+                        1
+                        for b in rep["htm_per_bin_tost"]
+                        if b["statistically_equivalent"]
+                    ),
+                    "windfall_mpc_slope": rep.get("windfall_mpc_slope", ""),
+                    "mpc_tost_equiv_bins": sum(
+                        1
+                        for b in rep.get("windfall_mpc_per_bin_tost", [])
+                        if b["statistically_equivalent"]
+                    ),
+                    "mean_endogenous_lambda": rep["mean_endogenous_lambda"],
+                    "max_sfc_conservation_error": rep["max_sfc_conservation_error"],
+                }
+            )
+    return csv_path
 
 
 # ============================================================================
@@ -211,72 +310,28 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Neuropolis v2: 2^3 Factorial Ablation & Multi-Seed Clustered Evaluation Runner"
     )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/mvp_config.yaml",
-        help="Path to SimulationConfig YAML file.",
-    )
+    parser.add_argument("--config", type=str, default="configs/mvp_config.yaml")
     parser.add_argument(
         "--cells",
         type=str,
         default="BASE_ZERO_INTELLIGENCE,BASE_CLOSED_FORM",
-        help=(
-            "Comma-separated cell IDs to execute, or 'ALL' (all 8 factorial cells + 4 controls), "
-            "or 'FACTORIAL_8' (C000..C111), or 'BASELINES' (ZI + Closed-Form)."
-        ),
     )
+    parser.add_argument("--seeds", type=int, default=30)
+    parser.add_argument("--allow-dev-seeds", action="store_true")
+    parser.add_argument("--num-agents", type=int, default=None)
+    parser.add_argument("--active-ticks", type=int, default=None)
+    parser.add_argument("--burn-in-ticks", type=int, default=None)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--skip-windfall-mpc", action="store_true")
+    parser.add_argument("--windfall-horizon", type=int, default=2)
     parser.add_argument(
-        "--seeds",
-        type=int,
-        default=30,
-        help="Number of independent economy seeds M (M >= 30 required for confirmatory power).",
+        "--max-runtime-minutes",
+        type=float,
+        default=420.0,
+        help="Graceful Kaggle session wall-clock cap (default 420m = 7h); flushes clean reports before stopping.",
     )
-    parser.add_argument(
-        "--allow-dev-seeds",
-        action="store_true",
-        help="Permit M < 30 for rapid local debugging (stamps output as DEV_UNDERPOWERED).",
-    )
-    parser.add_argument(
-        "--num-agents",
-        type=int,
-        default=None,
-        help="Override population size N per economy.",
-    )
-    parser.add_argument(
-        "--active-ticks",
-        type=int,
-        default=None,
-        help="Override post-burn-in active ticks per economy.",
-    )
-    parser.add_argument(
-        "--burn-in-ticks",
-        type=int,
-        default=None,
-        help="Override burn-in ticks per economy.",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=4,
-        help="Parallel CPU workers for non-LLM baseline cells (ZI / Closed-Form).",
-    )
-    parser.add_argument(
-        "--skip-windfall-mpc",
-        action="store_true",
-        help="Skip the paired exogenous windfall MPC shadow probe.",
-    )
-    parser.add_argument(
-        "--save-turn-logs",
-        action="store_true",
-        help="Write per-turn JSONL audit logs for every seed (disabled by default for speed).",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="results/neuropolis_v2",
-        help="Untracked output directory for manifests and statistical reports.",
-    )
+    parser.add_argument("--save-turn-logs", action="store_true")
+    parser.add_argument("--output-dir", type=str, default="results/neuropolis_v2")
     return parser.parse_args()
 
 
@@ -289,54 +344,38 @@ def _print_report_summary(
     power_banner = (
         f"CONFIRMATORY POWER ADEQUATE (M={m_seeds} >= 30)"
         if m_seeds >= 30
-        else f"DEV_UNDERPOWERED (M={m_seeds} < 30 — EXPLORATORY ONLY)"
+        else f"EXPLORATORY / PARTIAL RUN (M={m_seeds} < 30)"
     )
-    print("\n" + "=" * 114)
-    print(f" NEUROPOLIS v2 — CLUSTERED EVALUATION SUMMARY [{power_banner}]")
-    print("=" * 114)
+    print("\n" + "=" * 126)
+    print(f" NEUROPOLIS v2 — BEHAVIORAL ECONOMICS & CLUSTERED EVALUATION SUMMARY [{power_banner}]")
+    print("=" * 126)
     print(
-        f"{'Cell ID':<24} | {'M':>3} | {'Valid%':>6} | {'Surv%':>6} | {'Freeze%':>7} | "
-        f"{'Barg W1 (95% CI)':>23} | {'HtM JSD':>7} | {'W-HtM%':>6} | {'Max SFC Err':>11}"
+        f"{'Cell ID':<24} | {'M':>3} | {'Valid%':>6} | {'Surv%':>6} | {'Frz%':>5} | "
+        f"{'Gini':>5} | {'Sprd':>5} | {'W-HtM':>5} | {'Barg W1 (95% CI)':>21} | {'MPC_Slp':>7} | {'SFC Err':>8}"
     )
-    print("-" * 114)
+    print("-" * 126)
     for cid, rep in cell_reports.items():
         w1_info = rep["bargaining_w1"]
-        w1_str = f"{w1_info['debiased_w1']:.4f} [{w1_info['ci_95'][0]:.3f},{w1_info['ci_95'][1]:.3f}]"
-        jsd_val = rep["htm_miller_madow_jsd"]["debiased_jsd"]
+        w1_str = f"{w1_info['debiased_w1']:.3f} [{w1_info['ci_95'][0]:.2f},{w1_info['ci_95'][1]:.2f}]"
         whtm_bin = next(
             (b for b in rep["htm_per_bin_tost"] if b["bin_label"] == "Wealthy_HtM"),
             None,
         )
         whtm_mean = whtm_bin["sim_cluster_mean"] * 100.0 if whtm_bin else 0.0
+        mpc_slp = rep.get("windfall_mpc_slope")
+        mpc_str = f"{mpc_slp:+.3f}" if mpc_slp is not None else "  N/A  "
         print(
             f"{cid:<24} | {rep['n_economy_seeds_m']:>3d} | "
             f"{rep['json_valid_rate']*100:>5.1f}% | {rep['survival_rate']*100:>5.1f}% | "
-            f"{rep['market_freeze_rate']*100:>6.1f}% | {w1_str:>23} | "
-            f"{jsd_val:>7.4f} | {whtm_mean:>5.1f}% | {rep['max_sfc_conservation_error']:>11.2e}"
-        )
-
-    print("\n" + "-" * 114)
-    print(" PER-BIN TOST (INTERSECTION-UNION TEST, HOLM-BONFERRONI ADJUSTED) — TWO-ASSET HtM & BARGAINING")
-    print("-" * 114)
-    for cid, rep in cell_reports.items():
-        equiv_barg = sum(
-            1 for b in rep["bargaining_per_bin_tost"] if b["statistically_equivalent"]
-        )
-        equiv_htm = sum(
-            1 for b in rep["htm_per_bin_tost"] if b["statistically_equivalent"]
-        )
-        equiv_mpc = sum(
-            1 for b in rep["windfall_mpc_per_bin_tost"] if b["statistically_equivalent"]
-        )
-        print(
-            f"  {cid:<24}: Bargaining TOST Equiv Bins = {equiv_barg}/4 | "
-            f"HtM TOST Equiv Bins = {equiv_htm}/3 | Windfall MPC TOST Equiv Bins = {equiv_mpc}/3"
+            f"{rep['market_freeze_rate']*100:>4.1f}% | {rep.get('wealth_gini', 0.0):>5.3f} | "
+            f"{rep.get('mean_bid_ask_spread', 0.0):>5.2f} | {whtm_mean:>4.1f}% | "
+            f"{w1_str:>21} | {mpc_str:>7} | {rep['max_sfc_conservation_error']:>8.1e}"
         )
 
     if paired_contrasts:
-        print("\n" + "-" * 114)
-        print(" COMMON RANDOM NUMBERS (CRN) PAIRED CLUSTER CONTRASTS (Bargaining W1 Difference; Negative = Improvement)")
-        print("-" * 114)
+        print("\n" + "-" * 126)
+        print(" COMMON RANDOM NUMBERS (CRN) PAIRED CLUSTER CONTRASTS (Bargaining W1 Diff; Negative = Improvement)")
+        print("-" * 126)
         for label, c_res in paired_contrasts.items():
             print(
                 f"  {label:<44}: diff={c_res['paired_mean_diff']:+.4f} "
@@ -345,13 +384,13 @@ def _print_report_summary(
             )
 
     if factorial_analysis and factorial_analysis.get("complete_2x2x2_lattice"):
-        print("\n" + "-" * 114)
+        print("\n" + "-" * 126)
         print(" 2^3 FACTORIAL MAIN EFFECTS, INTERACTIONS & EXACT SHAPLEY CREDITS (on -Bargaining_W1)")
-        print("-" * 114)
+        print("-" * 126)
         print(f"  Main Effects:   {factorial_analysis['main_effects']}")
         print(f"  Interactions:   {factorial_analysis['interactions']}")
         print(f"  Exact Shapley:  {factorial_analysis['exact_shapley_values']}")
-    print("=" * 114 + "\n")
+    print("=" * 126 + "\n")
 
 
 def main() -> None:
@@ -361,7 +400,7 @@ def main() -> None:
     if args.seeds < 30 and not args.allow_dev_seeds:
         raise ValueError(
             f"Confirmatory clustered inference requires --seeds >= 30 (got {args.seeds}). "
-            f"Pass --allow-dev-seeds explicitly for exploratory local debugging."
+            f"Pass --allow-dev-seeds explicitly for smaller seed budgets."
         )
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -381,27 +420,13 @@ def main() -> None:
         selected_cell_ids = [
             "BASE_ZERO_INTELLIGENCE",
             "BASE_CLOSED_FORM",
-            "C000",
-            "C100",
-            "C010",
-            "C001",
-            "C110",
-            "C101",
-            "C011",
-            "C111",
+            "C000", "C100", "C010", "C001", "C110", "C101", "C011", "C111",
             "CTRL_PLACEBO_VEC",
             "CTRL_SHUFFLED_LAMBDA",
         ]
     elif cells_arg == "FACTORIAL_8":
         selected_cell_ids = [
-            "C000",
-            "C100",
-            "C010",
-            "C001",
-            "C110",
-            "C101",
-            "C011",
-            "C111",
+            "C000", "C100", "C010", "C001", "C110", "C101", "C011", "C111",
         ]
     elif cells_arg == "BASELINES":
         selected_cell_ids = ["BASE_ZERO_INTELLIGENCE", "BASE_CLOSED_FORM"]
@@ -419,7 +444,6 @@ def main() -> None:
         os.path.join(args.output_dir, "turn_logs") if args.save_turn_logs else None
     )
 
-    # Lazily mount the white-box LLM & disjoint RepE artifacts ONCE if any LLM cell is requested
     needs_llm = any(
         all_specs[cid].policy_mode == PolicyMode.LLM_AGENT
         for cid in selected_cell_ids
@@ -437,11 +461,10 @@ def main() -> None:
 
         print(
             f"[BOOT] Mounting White-Box model '{base_cfg.model.model_id}' "
-            f"(4bit={base_cfg.model.load_in_4bit}, attn={base_cfg.model.attn_implementation})..."
+            f"(4bit={base_cfg.model.load_in_4bit}, attn={base_cfg.model.attn_implementation})...",
+            flush=True,
         )
-        # CRITICAL FIX: Utilizing safe fallback logic for MVP runner to prevent token/license crashes
         shared_model, shared_tokenizer = WhiteBoxModelLoader.load_with_fallback(base_cfg)
-
         boot_repe = RepEManager(config=base_cfg.repe, seed=base_cfg.master_seed)
         shared_repe_artifacts = boot_repe.load_or_extract_artifacts(
             model=shared_model,
@@ -450,34 +473,36 @@ def main() -> None:
         )
         print(
             f"[BOOT] Disjoint RepE artifacts ready (Layer={shared_repe_artifacts.target_layer}, "
-            f"Probe Test AUROC={shared_repe_artifacts.probe_test_auroc:.4f}, "
-            f"Perm p={shared_repe_artifacts.probe_permutation_p:.4f}, "
-            f"Cos(w, v)={shared_repe_artifacts.probe_steering_cosine:.4f})."
+            f"Test AUROC={shared_repe_artifacts.probe_test_auroc:.4f}, "
+            f"Cos(w, v)={shared_repe_artifacts.probe_steering_cosine:.4f}).",
+            flush=True,
         )
 
-    # Execute all requested cells across M independent economy seeds
+    max_runtime_sec = max(60.0, float(args.max_runtime_minutes) * 60.0)
+    time_cap_reached = False
     clusters_by_cell: Dict[str, List[EconomySeedClusterMetrics]] = {}
+
     for cid in selected_cell_ids:
         cell_spec = all_specs[cid]
         cell_cfg = base_cfg.model_copy(
             deep=True, update={"factorial_cell": cell_spec}
         )
-        # Re-validate to synchronize deliberation/memory/repe switches with cell_spec
         cell_cfg = SimulationConfig(**cell_cfg.model_dump())
 
         print(
             f"\n[EXEC] Cell {cid:<24} | Policy={cell_cfg.policy_mode.value} | "
             f"A(Delib)={cell_cfg.deliberation.enabled} B(MemFric)={cell_cfg.memory_friction.enabled} "
-            f"C(RepE)={cell_cfg.repe.mode.value} | Seeds M={len(seed_list)}"
+            f"C(RepE)={cell_cfg.repe.mode.value} | Target Seeds M={len(seed_list)}",
+            flush=True,
         )
 
         if cell_cfg.policy_mode != PolicyMode.LLM_AGENT and args.workers > 1:
-            # Parallel execution over independent economy seeds for non-LLM baselines
             tasks = [
                 (
                     cell_cfg.model_dump(),
                     s_val,
                     not args.skip_windfall_mpc,
+                    args.windfall_horizon,
                     turn_log_dir,
                 )
                 for s_val in seed_list
@@ -492,27 +517,36 @@ def main() -> None:
             seed_results.sort(key=lambda r: r.economy_seed)
             clusters_by_cell[cid] = seed_results
         else:
-            # Memory-safe sequential execution on GPU sharing frozen weights & RepE artifacts
             from src.brain.inference_brain import TwoStageRepEController
             from src.brain.repe_manager import RepEManager
 
             ckpt_path = os.path.join(args.output_dir, f"checkpoint_{cid}.json")
-            cached_by_seed: Dict[int, EconomySeedClusterMetrics] = {}
-            if os.path.exists(ckpt_path):
-                with open(ckpt_path, "r", encoding="utf-8") as cf:
-                    for row in json.load(cf):
-                        sc_obj = EconomySeedClusterMetrics(**row)
-                        cached_by_seed[sc_obj.economy_seed] = sc_obj
+            cached_by_seed = _load_checkpoint_safely(ckpt_path)
+            if cached_by_seed:
                 print(
-                    f"       [RESUME] Loaded {len(cached_by_seed)} cached seeds from {ckpt_path}"
+                    f"       [RESUME] Loaded {len(cached_by_seed)} cached seeds from {ckpt_path}",
+                    flush=True,
                 )
 
             seed_results = []
+            seed_durations: List[float] = []
+
             for s_idx, s_val in enumerate(seed_list, start=1):
                 if s_val in cached_by_seed:
                     seed_results.append(cached_by_seed[s_val])
                     continue
 
+                elapsed_total = time.time() - t_run_start
+                if elapsed_total >= max_runtime_sec:
+                    print(
+                        f"       [TIME GUARD] Reached --max-runtime-minutes={args.max_runtime_minutes:.0f}m "
+                        f"after {len(seed_results)} seeds of {cid}. Flushing clean report now!",
+                        flush=True,
+                    )
+                    time_cap_reached = True
+                    break
+
+                t_seed = time.time()
                 if cell_cfg.policy_mode == PolicyMode.LLM_AGENT:
                     repe_mgr = RepEManager(
                         config=cell_cfg.repe,
@@ -534,10 +568,14 @@ def main() -> None:
                     economy_seed=s_val,
                     llm_controller=controller,
                     eval_windfall_mpc=not args.skip_windfall_mpc,
+                    windfall_horizon=args.windfall_horizon,
                     output_dir=turn_log_dir,
                 )
+                dt_seed = time.time() - t_seed
+                seed_durations.append(dt_seed)
                 seed_results.append(res)
                 cached_by_seed[s_val] = res
+
                 with open(ckpt_path, "w", encoding="utf-8") as cf:
                     json.dump(
                         [
@@ -548,17 +586,26 @@ def main() -> None:
                         indent=2,
                     )
 
-                if s_idx % 3 == 0 or s_idx == len(seed_list):
-                    print(
-                        f"       Completed {s_idx}/{len(seed_list)} seeds "
-                        f"(last seed={s_val}, Valid={res.json_valid_rate:.1%}, "
-                        f"Freeze={res.consumable_market_freeze_rate:.1%}, "
-                        f"SFC_Err={res.max_sfc_conservation_error:.2e})",
-                        flush=True,
-                    )
-            clusters_by_cell[cid] = seed_results
+                rem_seeds_cell = len(seed_list) - s_idx
+                avg_dt = sum(seed_durations) / len(seed_durations)
+                eta_min = (rem_seeds_cell * avg_dt) / 60.0
+                print(
+                    f"       Seed {s_idx:02d}/{len(seed_list)} (s={s_val}) done in {dt_seed:5.1f}s "
+                    f"| Cell ETA={eta_min:5.1f}m | Valid={res.json_valid_rate:.0%} "
+                    f"| Gini={res.wealth_gini:.3f} | Spread=${res.mean_bid_ask_spread:.2f} "
+                    f"| Freeze={res.consumable_market_freeze_rate:.0%} | SFC={res.max_sfc_conservation_error:.1e}",
+                    flush=True,
+                )
 
-    # Extract empirical Zero-Intelligence null floor if ZI baseline was run
+            if seed_results:
+                clusters_by_cell[cid] = seed_results
+            if time_cap_reached:
+                break
+
+    if not clusters_by_cell:
+        print("[WARN] No seeds completed before exit.")
+        return
+
     zi_barg_floor: Optional[float] = None
     zi_mpc_floor: Optional[float] = None
     if "BASE_ZERO_INTELLIGENCE" in clusters_by_cell:
@@ -571,18 +618,16 @@ def main() -> None:
         if zi_rep["windfall_mpc_w1"] is not None:
             zi_mpc_floor = float(zi_rep["windfall_mpc_w1"]["debiased_w1"])
 
-    # Aggregate clustered reports for every cell
     cell_reports: Dict[str, Dict[str, Any]] = {}
-    for cid in selected_cell_ids:
+    for cid, sc_list in clusters_by_cell.items():
         cell_reports[cid] = EconomyMetricsCollector.aggregate_cell_clusters(
             cell_id=cid,
-            seed_clusters=clusters_by_cell[cid],
+            seed_clusters=sc_list,
             config=base_cfg,
             zi_bargaining_floor_w1=zi_barg_floor,
             zi_mpc_floor_w1=zi_mpc_floor,
         )
 
-    # Compute Common Random Numbers (CRN) Paired Cluster Contrasts
     paired_contrasts: Dict[str, Any] = {}
     contrast_pairs = [
         ("C111_vs_C000_VanillaLLM", "C111", "C000"),
@@ -590,7 +635,11 @@ def main() -> None:
         ("C111_vs_CTRL_SHUFFLED_LAMBDA", "C111", "CTRL_SHUFFLED_LAMBDA"),
         ("C001_RepEOnly_vs_C000_Vanilla", "C001", "C000"),
         ("C111_vs_BASE_ZERO_INTELLIGENCE", "C111", "BASE_ZERO_INTELLIGENCE"),
-        ("BASE_CLOSED_FORM_vs_BASE_ZERO_INTELLIGENCE", "BASE_CLOSED_FORM", "BASE_ZERO_INTELLIGENCE"),
+        (
+            "BASE_CLOSED_FORM_vs_BASE_ZERO_INTELLIGENCE",
+            "BASE_CLOSED_FORM",
+            "BASE_ZERO_INTELLIGENCE",
+        ),
     ]
     for label, cell_a, cell_b in contrast_pairs:
         if cell_a in cell_reports and cell_b in cell_reports:
@@ -601,14 +650,12 @@ def main() -> None:
                 seed=base_cfg.master_seed,
             )
 
-    # Compute 2^3 Factorial Effects & Exact Shapley Attribution if all 8 cells ran
     bits_map: Dict[Tuple[int, int, int], float] = {}
     for a in (0, 1):
         for b in (0, 1):
             for c in (0, 1):
                 cid = f"C{a}{b}{c}"
                 if cid in cell_reports:
-                    # Negate W1 distance so positive Shapley / main effects indicate improvement
                     bits_map[(a, b, c)] = -float(
                         cell_reports[cid]["bargaining_w1"]["debiased_w1"]
                     )
@@ -618,16 +665,20 @@ def main() -> None:
         else None
     )
 
-    # Persist Provenance Manifest & Full Statistical Evaluation Report
+    min_completed_m = min(
+        len(sc_list) for sc_list in clusters_by_cell.values()
+    )
     cfg_sha = hashlib.sha256(base_cfg.model_dump_json().encode("utf-8")).hexdigest()[:16]
     manifest = {
         "experiment_id": base_cfg.experiment_id,
         "git_commit_sha": _resolve_git_sha(),
         "config_sha256": cfg_sha,
-        "selected_cells": selected_cell_ids,
-        "n_economy_seeds_m": args.seeds,
+        "selected_cells": list(clusters_by_cell.keys()),
+        "n_economy_seeds_target": args.seeds,
+        "n_economy_seeds_completed_min": min_completed_m,
+        "time_cap_triggered": time_cap_reached,
         "power_status": (
-            "CONFIRMATORY_ADEQUATE" if args.seeds >= 30 else "DEV_UNDERPOWERED"
+            "CONFIRMATORY_ADEQUATE" if min_completed_m >= 30 else "EXPLORATORY_OR_PARTIAL"
         ),
         "num_agents_n": base_cfg.num_agents,
         "burn_in_ticks": base_cfg.burn_in_ticks,
@@ -652,9 +703,7 @@ def main() -> None:
         json.dump(manifest, f, indent=2)
 
     with open(
-        os.path.join(args.output_dir, "cluster_metrics.json"),
-        "w",
-        encoding="utf-8",
+        os.path.join(args.output_dir, "cluster_metrics.json"), "w", encoding="utf-8"
     ) as f:
         json.dump(
             {
@@ -675,13 +724,16 @@ def main() -> None:
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(full_report, f, indent=2)
 
+    csv_path = _export_benchmark_csv(cell_reports, args.output_dir)
+
     _print_report_summary(
         cell_reports=cell_reports,
         factorial_analysis=factorial_analysis,
         paired_contrasts=paired_contrasts,
-        m_seeds=args.seeds,
+        m_seeds=min_completed_m,
     )
-    print(f"[SAVED] Full evaluation report written to: {report_path}")
+    print(f"[SAVED] JSON Report: {report_path}")
+    print(f"[SAVED] CSV Table:   {csv_path}")
 
 
 if __name__ == "__main__":
