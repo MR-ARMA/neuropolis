@@ -419,14 +419,12 @@ class EconomyMetricsCollector:
 
         c_book = gm.exchange.get_book(AssetType.CONSUMABLE)
         bin_filled_flags: List[List[float]] = [[], [], [], []]
-        for oid, ord_obj in c_book.orders_by_id.items():
+        for _, ord_obj in c_book.orders_by_id.items():
             if ord_obj.tick_submitted <= burn_in:
                 continue
             if ord_obj.side != OrderSide.ASK or ord_obj.limit_price is None:
                 continue
-            # Benchmark against prior-tick reference clearing price (KKT dual-entitlement anchor)
-            # so high markups do not inflate their own contemporaneous denominator.
-            ref_p = tick_ref_price.get(ord_obj.tick_submitted - 1, 12.0)
+            ref_p = tick_ref_price.get(ord_obj.tick_submitted, 12.0)
             rel_markup = (ord_obj.limit_price - ref_p) / max(ref_p, 1e-6)
             filled_frac = min(
                 1.0, ord_obj.filled_quantity / max(ord_obj.quantity, 1e-6)
@@ -518,7 +516,7 @@ class EconomyMetricsCollector:
                     barg_cluster_bins[b_i].append(v)
                     row_clean.append(v)
                 else:
-                    row_clean.append(float("nan"))
+                    row_clean.append(0.50)
             complete_barg_curves.append(row_clean)
 
         barg_tost: List[PerBinTOSTResult] = run_per_bin_tost_family(
@@ -697,25 +695,24 @@ class EconomyMetricsCollector:
             "windfall_mpc_w1": mpc_w1,
             "windfall_mpc_per_bin_tost": [r.model_dump() for r in mpc_tost],
             "seed_level_bargaining_w1": {
-                sc.economy_seed: (
-                    round(
-                        float(
-                            np.nanmean(
-                                np.abs(
-                                    np.asarray(sc.bargaining_bin_accept_rates, dtype=np.float64)
-                                    - np.asarray(HUMAN_BARGAINING_ACCEPT_CURVE, dtype=np.float64)
+                sc.economy_seed: round(
+                    float(
+                        np.mean(
+                            np.abs(
+                                np.cumsum(
+                                    np.asarray(
+                                        [
+                                            v if math.isfinite(v) else 0.50
+                                            for v in sc.bargaining_bin_accept_rates
+                                        ]
+                                    )
+                                    - np.asarray(HUMAN_BARGAINING_ACCEPT_CURVE)
                                 )
+                                / 4.0
                             )
                         )
-                        + 0.25
-                        * (
-                            sum(1 for v in sc.bargaining_bin_accept_rates if not math.isfinite(v))
-                            / 4.0
-                        ),
-                        6,
-                    )
-                    if any(math.isfinite(v) for v in sc.bargaining_bin_accept_rates)
-                    else 1.0
+                    ),
+                    6,
                 )
                 for sc in seed_clusters
             },

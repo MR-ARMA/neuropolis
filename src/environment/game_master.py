@@ -172,26 +172,24 @@ class GameMaster:
                 ob_r = round(0.28 * wage, 2)
                 exposure = round(float(self.rng.uniform(0.20, 0.45)), 2)
             elif bucket in (6, 7):
-                # Wealthy Hand-to-Mouth (W-HtM, ~17%–20%): paycheck-to-paycheck net cash (~$12.3/tick)
-                # matching subsistence food cost while holding substantial illiquid capital.
+                # Wealthy Hand-to-Mouth (W-HtM, ~17%–25%): substantial illiquid capital, low liquid cash!
                 role = "WORKER"
-                wage = round(float(np.clip(self.rng.normal(22.0, 1.5), 19.0, 25.5)), 2)
-                cash = round(float(np.clip(self.rng.normal(9.5, 2.0), 5.0, 14.0)), 2)
-                capital = round(float(np.clip(self.rng.normal(3.5, 0.7), 2.2, 5.2)), 2)
+                wage = round(float(np.clip(self.rng.normal(16.0, 2.0), 12.0, 21.0)), 2)
+                cash = round(float(np.clip(self.rng.normal(6.5, 2.0), 2.0, 10.0)), 2)
+                capital = round(float(np.clip(self.rng.normal(3.5, 0.8), 2.0, 5.5)), 2)
                 consumable = round(float(self.rng.choice([1.0, 2.0])), 2)
                 prod_q = 0.0
-                ob_r = round(0.56 * wage, 2)
+                ob_r = round(0.40 * wage, 2)
                 exposure = round(float(self.rng.uniform(0.60, 0.90)), 2)
             elif bucket in (8, 9):
-                # Poor Hand-to-Mouth (P-HtM, ~14%–17%): zero illiquid capital, net cash (~$12.3/tick)
-                # sufficient to survive normal periods while staying strictly liquid-constrained.
+                # Poor Hand-to-Mouth (P-HtM, ~17%): zero illiquid capital, low liquid cash
                 role = "WORKER"
-                wage = round(float(np.clip(self.rng.normal(21.5, 1.5), 18.5, 25.0)), 2)
-                cash = round(float(np.clip(self.rng.normal(8.5, 2.0), 4.0, 13.0)), 2)
+                wage = round(float(np.clip(self.rng.normal(13.0, 1.5), 10.0, 17.0)), 2)
+                cash = round(float(np.clip(self.rng.normal(5.5, 1.8), 2.0, 8.5)), 2)
                 capital = 0.0
                 consumable = round(float(self.rng.choice([1.0, 2.0])), 2)
                 prod_q = 0.0
-                ob_r = round(0.43 * wage, 2)
+                ob_r = round(0.42 * wage, 2)
                 exposure = round(float(self.rng.uniform(0.75, 1.00)), 2)
             else:
                 # Liquid Arbitrageurs / Balanced Workers (~17%)
@@ -873,12 +871,12 @@ class GameMaster:
         if (
             sheet.consumable_inventory < 1.5
             and spendable < 0.85 * anchor_p
-            and sheet.illiquid_capital >= 0.35
+            and sheet.illiquid_capital >= 1.0
         ):
             return Stage2ActionPayload(
                 action_type=AgentActionType.LIQUIDATE_CAPITAL,
                 asset=AssetType.CAPITAL,
-                capital_transfer_units=0.35,
+                capital_transfer_units=1.0,
             )
 
         # Surplus consumable holders post random ASK limit orders above cost floor
