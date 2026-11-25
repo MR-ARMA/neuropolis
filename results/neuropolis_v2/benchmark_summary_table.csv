@@ -1,3 +1,0 @@
-cell_id,n_economy_seeds_m,json_valid_rate,survival_rate,market_freeze_rate,wealth_gini,mean_bid_ask_spread,mean_clearing_price,mean_capital_liquidation_volume,poor_htm_share,wealthy_htm_share,non_htm_share,htm_debiased_jsd,bargaining_debiased_w1,bargaining_w1_ci95_lo,bargaining_w1_ci95_hi,bargaining_tost_equiv_bins,htm_tost_equiv_bins,windfall_mpc_slope,mpc_tost_equiv_bins,mean_endogenous_lambda,max_sfc_conservation_error
-BASE_ZERO_INTELLIGENCE,30,1.0,0.66668,0.01666,0.637017,6.392447,34.010277,4.351667,0.018707,0.078703,0.90257,0.042173,0.183413,0.153776,0.218638,1,0,0.265123,0,0.0,0.0
-BASE_CLOSED_FORM,30,1.0,0.72501,0.024993,0.668537,10.76753,35.871447,6.895,0.07209,0.21455,0.713343,0.003352,0.251521,0.237511,0.276466,0,2,0.404103,0,0.0,0.0

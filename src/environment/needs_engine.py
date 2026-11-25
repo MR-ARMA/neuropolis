@@ -226,10 +226,10 @@ class TwoAssetAccounting:
         """
         total_liquid = sheet.liquid_cash + sheet.escrow_cash
         total_illiquid = sheet.illiquid_capital + sheet.escrow_capital
-        paycheck_buf = 1.00 * max(sheet.base_wage, consumable_market_price)
+        half_wage = 0.50 * max(sheet.base_wage, consumable_market_price)
 
-        is_htm = (total_liquid <= paycheck_buf) or (
-            total_liquid <= sheet.borrowing_limit_b_bar + paycheck_buf
+        is_htm = (total_liquid <= half_wage) or (
+            total_liquid <= sheet.borrowing_limit_b_bar + half_wage
         )
         if not is_htm:
             return "NON_HTM"

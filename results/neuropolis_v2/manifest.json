@@ -1,19 +1,17 @@
 {
   "experiment_id": "neuropolis-v2-endogenous-repe-cda",
-  "git_commit_sha": "6df22fc",
-  "config_sha256": "52353f104cc37bf4",
+  "git_commit_sha": "9b9c7e0",
+  "config_sha256": "4a8340285345af46",
   "selected_cells": [
     "BASE_ZERO_INTELLIGENCE",
     "BASE_CLOSED_FORM"
   ],
-  "n_economy_seeds_target": 30,
-  "n_economy_seeds_completed_min": 30,
-  "time_cap_triggered": false,
-  "power_status": "CONFIRMATORY_ADEQUATE",
+  "n_economy_seeds_m": 2,
+  "power_status": "DEV_UNDERPOWERED",
   "num_agents_n": 12,
-  "burn_in_ticks": 3,
-  "active_ticks": 12,
-  "model_id": "Qwen/Qwen2.5-7B-Instruct",
-  "wall_clock_seconds": 5.12,
+  "burn_in_ticks": 2,
+  "active_ticks": 6,
+  "model_id": "Qwen/Qwen2.5-3B-Instruct",
+  "wall_clock_seconds": 3.72,
   "probe_artifacts_metadata": null
 }

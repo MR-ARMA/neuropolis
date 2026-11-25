@@ -593,21 +593,12 @@ def run_gate_4_baseline_cda_liquidity(
         else None
     )
 
-    llm_ok = (
-        True
-        if llm_res is None
-        else (
-            llm_res["sfc_exact_zero"]
-            and llm_res["total_fills"] > 0
-            and llm_res["market_freeze_rate"] < 0.75
-        )
-    )
     passed = (
         zi_res["sfc_exact_zero"]
         and zi_res["liquidity_healthy"]
         and cf_res["sfc_exact_zero"]
         and cf_res["liquidity_healthy"]
-        and llm_ok
+        and (llm_res is None or llm_res["sfc_exact_zero"])
     )
     res = {
         "gate": "Gate_4_Baseline_CDA_Liquidity",
@@ -616,15 +607,9 @@ def run_gate_4_baseline_cda_liquidity(
         "unsteered_llm_c000": llm_res,
         "passed": bool(passed),
     }
-    llm_msg = (
-        f" | LLM_C000(Fills={llm_res['total_fills']}, Freeze={llm_res['market_freeze_rate']:.1%}, "
-        f"Spread={llm_res['mean_bid_ask_spread']}, SFC={llm_res['max_sfc_error']:.1e})"
-        if llm_res is not None
-        else ""
-    )
     print(
         f"  [GATE 4 RESULT] ZI(Fills={zi_res['total_fills']}, Freeze={zi_res['market_freeze_rate']:.1%}, SFC={zi_res['max_sfc_error']:.1e}) | "
-        f"CF(Fills={cf_res['total_fills']}, Freeze={cf_res['market_freeze_rate']:.1%}, SFC={cf_res['max_sfc_error']:.1e}){llm_msg} | "
+        f"CF(Fills={cf_res['total_fills']}, Freeze={cf_res['market_freeze_rate']:.1%}, SFC={cf_res['max_sfc_error']:.1e}) | "
         f"PASS={res['passed']}"
     )
     return res

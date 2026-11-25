@@ -769,9 +769,9 @@ FILE_PATH: ./configs/mvp_config.yaml
 
 experiment_id: "neuropolis-v2-endogenous-repe-cda"
 master_seed: 42
-num_agents: 12
-burn_in_ticks: 3
-active_ticks: 12
+num_agents: 24
+burn_in_ticks: 10
+active_ticks: 50
 policy_mode: "LLM_AGENT"
 
 factorial_cell:
@@ -784,16 +784,15 @@ factorial_cell:
 
 model:
   model_id: "Qwen/Qwen2.5-7B-Instruct"
-  revision: "main"
   local_dir: "./models/Qwen--Qwen2.5-7B-Instruct"
   load_in_4bit: true
   bnb_4bit_quant_type: "nf4"
   bnb_4bit_use_double_quant: true
   compute_dtype: "float16"
   attn_implementation: "sdpa"
-  temperature: 0.50
+  temperature: 0.1
   top_p: 0.95
-  max_json_retries: 2
+  max_json_retries: 3
 
 economy:
   liquid_return_rate_rb: 0.002
@@ -826,19 +825,19 @@ cda:
 deliberation:
   enabled: true
   stress_activation_threshold: 0.0
-  cot_max_tokens_calm: 96
+  cot_max_tokens_calm: 128
   cot_min_tokens_stressed: 24
   stress_decay_steepness: 3.5
-  action_json_max_tokens: 80
+  action_json_max_tokens: 128
 
 memory_friction:
   enabled: true
   stress_activation_threshold: 0.0
-  top_k_calm: 6
+  top_k_calm: 8
   top_k_stressed: 2
   similarity_noise_sigma_max: 0.35
   recency_salience_weight: 0.30
-  max_episodic_capacity: 128
+  max_episodic_capacity: 256
   embedding_model_name: "BAAI/bge-small-en-v1.5"
   embedding_dim: 384
 
@@ -854,13 +853,13 @@ repe:
   probe_threshold_theta: 0.0
   probe_temperature: 1.0
   max_relative_norm_ratio: 0.25
-  probe_artifact_path: "artifacts/probes/inequity_probe_l18.pt"
+  probe_artifact_path: "artifacts/probes/inequity_probe_l16.pt"
   min_contrastive_pairs: 240
 
 shock:
   shock_type: "TFP_SUBSISTENCE_CONTRACTION"
-  start_tick: 7
-  duration_ticks: 6
+  start_tick: 20
+  duration_ticks: 15
   severity_sigma: 0.35
   persistence_rho: 0.85
 
@@ -1301,74 +1300,32 @@ def plot_fig4_two_asset_htm_distribution(
 
 
 def export_latex_summary_table(report: Dict[str, Any], out_dir: str, is_synthetic: bool) -> str:
-    import csv
-
     status_note = "SYNTHETIC PIPELINE TEST" if is_synthetic else "EXECUTED FROM CLUSTERED ARTIFACTS"
     lines = [
-        r"\begin{table*}[htbp]",
+        r"\begin{table}[htbp]",
         r"\centering",
-        rf"\caption{{Neuropolis v2 $2^3$ Factorial Behavioral Economics Benchmark Summary ({status_note})}}",
-        r"\resizebox{\textwidth}{!}{%",
-        r"\begin{tabular}{lrrrrrrrrr}",
+        rf"\caption{{Neuropolis v2 $2^3$ Factorial Clustered Evaluation ({status_note})}}",
+        r"\begin{tabular}{lrrrrrr}",
         r"\toprule",
-        r"Condition & $M$ & Valid\% & Frz\% & Gini & Spread & W-HtM\% & HtM JSD & Barg. $W_1$ (95\% CI) & MPC Slope \\",
+        r"Condition & $M$ & Valid \% & Freeze \% & Barg. $W_1$ (95\% CI) & HtM JSD & Max SFC Err \\",
         r"\midrule",
     ]
-
-    csv_rows: List[Dict[str, Any]] = []
     for cid, rep in report["cell_reports"].items():
         w1 = rep["bargaining_w1"]
         jsd = rep["htm_miller_madow_jsd"]["debiased_jsd"]
-        whtm_bin = next(
-            (b for b in rep.get("htm_per_bin_tost", []) if b["bin_label"] == "Wealthy_HtM"),
-            None,
-        )
-        whtm_pct = (float(whtm_bin["sim_cluster_mean"]) * 100.0) if whtm_bin else 0.0
-        gini_v = float(rep.get("wealth_gini", 0.0))
-        sprd_v = float(rep.get("mean_bid_ask_spread", 0.0))
-        mpc_s = rep.get("windfall_mpc_slope")
-        mpc_str = f"{float(mpc_s):+.3f}" if mpc_s is not None else "--"
-
         safe_cid = cid.replace("_", r"\_")
         lines.append(
             f"{safe_cid} & {rep['n_economy_seeds_m']} & {rep['json_valid_rate']*100:.1f}\\% & "
-            f"{rep['market_freeze_rate']*100:.1f}\\% & {gini_v:.3f} & {sprd_v:.2f} & "
-            f"{whtm_pct:.1f}\\% & {jsd:.4f} & "
+            f"{rep['market_freeze_rate']*100:.1f}\\% & "
             f"{w1['debiased_w1']:.3f} [{w1['ci_95'][0]:.3f}, {w1['ci_95'][1]:.3f}] & "
-            f"{mpc_str} \\\\"
+            f"{jsd:.4f} & {rep['max_sfc_conservation_error']:.1e} \\\\"
         )
-        csv_rows.append(
-            {
-                "condition": cid,
-                "n_seeds_m": rep["n_economy_seeds_m"],
-                "json_valid_rate": rep["json_valid_rate"],
-                "survival_rate": rep.get("survival_rate", 1.0),
-                "market_freeze_rate": rep["market_freeze_rate"],
-                "wealth_gini": gini_v,
-                "mean_bid_ask_spread": sprd_v,
-                "wealthy_htm_pct": round(whtm_pct, 2),
-                "htm_debiased_jsd": jsd,
-                "bargaining_debiased_w1": w1["debiased_w1"],
-                "bargaining_w1_ci95_lo": w1["ci_95"][0],
-                "bargaining_w1_ci95_hi": w1["ci_95"][1],
-                "windfall_mpc_slope": mpc_s if mpc_s is not None else "",
-                "max_sfc_error": rep["max_sfc_conservation_error"],
-            }
-        )
-
-    lines.extend([r"\bottomrule", r"\end{tabular}%", r"}", r"\end{table*}"])
+    lines.extend([r"\bottomrule", r"\end{tabular}", r"\end{table}"])
     out_tex = os.path.join(out_dir, "table_factorial_summary.tex")
     with open(out_tex, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
-
-    if csv_rows:
-        out_csv = os.path.join(out_dir, "table_factorial_summary.csv")
-        with open(out_csv, "w", newline="", encoding="utf-8") as cf:
-            writer = csv.DictWriter(cf, fieldnames=list(csv_rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(csv_rows)
-
     return out_tex
+
 
 def _build_synthetic_pipeline_test_report() -> Dict[str, Any]:
     """Strictly for unit-testing the plotting pipeline with visible SYNTHETIC watermark."""
@@ -6226,216 +6183,18 @@ class TurnOrchestrator:
 
     def run_tick(self, tick: int) -> TickMacroSummary:
         self.game_master.begin_tick(tick)
-        arrival_order = [
-            aid
-            for aid in self.game_master.households.keys()
-            if NeedsEngine.is_alive(self.game_master.households[aid])
-        ]
+        arrival_order = list(self.game_master.households.keys())
         self.rng.shuffle(arrival_order)
 
-        if (
-            self.config.policy_mode == PolicyMode.LLM_AGENT
-            and self.llm_controller is not None
-            and hasattr(self.llm_controller, "execute_two_stage_batch")
-            and len(arrival_order) > 1
-        ):
-            # Process living agents in GPU batches of up to 12 simultaneously
-            batch_sz = 12
-            for start_i in range(0, len(arrival_order), batch_sz):
-                self._execute_batched_llm_wave(
-                    tick, arrival_order[start_i : start_i + batch_sz]
-                )
-        else:
-            for agent_id in arrival_order:
-                self._execute_single_agent_turn(tick, agent_id)
+        for agent_id in arrival_order:
+            sheet = self.game_master.households[agent_id]
+            if not NeedsEngine.is_alive(sheet):
+                continue
+            self._execute_single_agent_turn(tick, agent_id)
 
         summary = self.game_master.step_end_of_tick_physics(tick)
         self._record_post_tick_sanitized_episodes(tick, summary)
         return summary
-
-    def _execute_batched_llm_wave(self, tick: int, wave_agent_ids: List[str]) -> None:
-        snapshots = self.game_master.exchange.get_all_snapshots(tick)
-        c_snap = snapshots[AssetType.CONSUMABLE]
-
-        pre_states: List[Tuple[float, float, float, float, float]] = []
-        allocs: List[DeliberationAllocation] = []
-        retrievals: List[RetrievalResult] = []
-        sys_prompts: List[str] = []
-        user_prompts: List[str] = []
-        cot_budgets: List[int] = []
-
-        for agent_id in wave_agent_ids:
-            sheet = self.game_master.households[agent_id]
-            pre_states.append(
-                (
-                    sheet.liquid_cash,
-                    sheet.illiquid_capital,
-                    sheet.consumable_inventory,
-                    sheet.needs.health,
-                    sheet.needs.composite_stress,
-                )
-            )
-            alloc = self.deliberation_ctrl.compute_allocation(sheet.needs)
-            allocs.append(alloc)
-            cot_budgets.append(alloc.cot_max_tokens)
-
-            mem_handle = self.memory_tms.get_scoped_handle(agent_id)
-            query_str = (
-                f"Cycle {tick} RESOURCE_A={sheet.consumable_inventory:.1f} "
-                f"Pool_Credits={sheet.liquid_cash:.1f} Vitality={sheet.needs.health:.2f} "
-                f"Board_Last={c_snap.last_trade_price}"
-            )
-            ret = mem_handle.retrieve(
-                agent_id=agent_id,
-                query_text=query_str,
-                current_tick=tick,
-                stress_index=sheet.needs.composite_stress,
-                rng=self.rng,
-            )
-            retrievals.append(ret)
-            peer_dir = mem_handle.get_top_peers_summary(agent_id=agent_id, max_peers=3)
-            open_orders = []
-            for book in self.game_master.exchange.books.values():
-                open_orders.extend(book.get_open_orders_for_agent(agent_id))
-
-            sp, up = SanitizedPromptCompiler.compile_stage1_prompt(
-                tick=tick,
-                sheet=sheet,
-                board_snapshots=snapshots,
-                open_orders=open_orders,
-                retrieval=ret,
-                peer_directory=peer_dir,
-                cfg=self.config,
-            )
-            sys_prompts.append(sp)
-            user_prompts.append(up)
-
-        # Single fused GPU batch for Stage 1 CoT + Stage 2 Steered Action JSON
-        gen_outputs: List[TwoStageGenerationOutput] = (
-            self.llm_controller.execute_two_stage_batch(  # type: ignore[union-attr]
-                stage1_system_prompts=sys_prompts,
-                stage1_user_prompts=user_prompts,
-                stage2_instruction=SanitizedPromptCompiler.STAGE2_JSON_INSTRUCTION,
-                cot_max_tokens_list=cot_budgets,
-                action_max_tokens=allocs[0].action_json_max_tokens,
-                agent_ids=wave_agent_ids,
-                tick=tick,
-                parse_action_fn=IsomorphicVocabulary.parse_sanitized_action_json,
-            )
-        )
-
-        # Submit actions sequentially in shuffled arrival order to preserve CDA Price-Time Priority
-        for i, agent_id in enumerate(wave_agent_ids):
-            pre_cash, pre_cap, pre_cons, pre_health, pre_stress = pre_states[i]
-            gen_out = gen_outputs[i]
-            exec_outcome = self.game_master.execute_agent_action(
-                tick=tick, agent_id=agent_id, payload=gen_out.stage2_action
-            )
-            self._record_execution_and_turn_log(
-                tick=tick,
-                agent_id=agent_id,
-                pre_cash=pre_cash,
-                pre_cap=pre_cap,
-                pre_cons=pre_cons,
-                pre_health=pre_health,
-                pre_stress=pre_stress,
-                alloc=allocs[i],
-                retrieval=retrievals[i],
-                gen_out=gen_out,
-                exec_outcome=exec_outcome,
-            )
-
-    def _record_execution_and_turn_log(
-        self,
-        tick: int,
-        agent_id: str,
-        pre_cash: float,
-        pre_cap: float,
-        pre_cons: float,
-        pre_health: float,
-        pre_stress: float,
-        alloc: DeliberationAllocation,
-        retrieval: RetrievalResult,
-        gen_out: TwoStageGenerationOutput,
-        exec_outcome: ActionExecutionOutcome,
-    ) -> AgentTurnRecord:
-        mem_handle = self.memory_tms.get_scoped_handle(agent_id)
-        for fill in exec_outcome.fills:
-            tok = IsomorphicVocabulary.ASSET_TO_TOKEN[fill.asset]
-            buyer_handle = self.memory_tms.get_scoped_handle(fill.buyer_id)
-            seller_handle = self.memory_tms.get_scoped_handle(fill.seller_id)
-
-            buyer_handle.write_episode(
-                agent_id=fill.buyer_id,
-                tick=tick,
-                event_type="TRADE_FILL",
-                summary_text=(
-                    f"[C{tick:03d}] Fill BID {tok} {fill.quantity:.1f}@{fill.execution_price:.2f} Peer={fill.seller_id}"
-                ),
-                salience_score=1.35,
-            )
-            seller_handle.write_episode(
-                agent_id=fill.seller_id,
-                tick=tick,
-                event_type="TRADE_FILL",
-                summary_text=(
-                    f"[C{tick:03d}] Fill ASK {tok} {fill.quantity:.1f}@{fill.execution_price:.2f} Peer={fill.buyer_id}"
-                ),
-                salience_score=1.35,
-            )
-            buyer_handle.update_peer_reliability(fill.buyer_id, fill.seller_id, 1.0, tick)
-            seller_handle.update_peer_reliability(fill.seller_id, fill.buyer_id, 1.0, tick)
-
-        if exec_outcome.accepted and exec_outcome.action_type in (
-            AgentActionType.LIQUIDATE_CAPITAL,
-            AgentActionType.INVEST_CAPITAL,
-        ):
-            proto_label = (
-                "PROTOCOL_B_OUT"
-                if exec_outcome.action_type == AgentActionType.LIQUIDATE_CAPITAL
-                else "PROTOCOL_B_IN"
-            )
-            mem_handle.write_episode(
-                agent_id=agent_id,
-                tick=tick,
-                event_type="CAPITAL_TRANSFER",
-                summary_text=(
-                    f"[C{tick:03d}] {proto_label} {gen_out.stage2_action.capital_transfer_units:.1f}u "
-                    f"Fee={exec_outcome.kmv_fee_paid:.2f} dCr={exec_outcome.net_cash_delta:+.2f}"
-                ),
-                salience_score=1.60,
-            )
-
-        record = AgentTurnRecord(
-            run_id=self.run_id,
-            economy_seed=self.economy_seed,
-            tick=tick,
-            agent_id=agent_id,
-            policy_mode=self.config.policy_mode,
-            factorial_cell_id=self.config.factorial_cell.cell_id,
-            pre_turn_cash=pre_cash,
-            pre_turn_capital=pre_cap,
-            pre_turn_consumable=pre_cons,
-            pre_turn_health=pre_health,
-            pre_turn_stress=pre_stress,
-            rag_top_k_used=retrieval.top_k_used,
-            rag_noise_sigma_used=retrieval.noise_sigma_used,
-            cot_token_budget_allocated=alloc.cot_max_tokens,
-            cot_tokens_generated=gen_out.cot_tokens_generated,
-            cot_truncated_by_bottleneck=gen_out.cot_truncated_by_bottleneck,
-            stage1_cot_text=gen_out.stage1_cot_text,
-            probe_measurement=gen_out.probe_measurement,
-            stage2_raw_json=gen_out.stage2_raw_json,
-            stage2_action=gen_out.stage2_action,
-            json_valid=gen_out.json_valid,
-            abstain=gen_out.abstain,
-            retries_used=gen_out.retries_used,
-            action_tokens_generated=gen_out.action_tokens_generated,
-            latency_ms=gen_out.latency_ms,
-            execution_status=exec_outcome.reason,
-        )
-        self.turn_records.append(record)
-        return record
 
     def _execute_single_agent_turn(self, tick: int, agent_id: str) -> AgentTurnRecord:
         t_start = time.perf_counter()
@@ -7242,6 +7001,12 @@ from src.orchestration.turn_orchestrator import TurnOrchestrator
 # PUBLISHED HUMAN EMPIRICAL REFERENCE CURVES (PREREGISTERED BENCHMARKS)
 # ============================================================================
 
+# 1. Oosterbeek, Sloof, & van de Kuilen (2004, Experimental Economics):
+#    Acceptance / order-clearing gradient across 4 relative markup / offer-share bins:
+#      Bin 0: Generous / Fair (markup <= 0.05) -> 0.94
+#      Bin 1: Moderate markup (0.05 < m <= 0.15) -> 0.76
+#      Bin 2: Unfair markup (0.15 < m <= 0.30) -> 0.42
+#      Bin 3: Extreme markup (m > 0.30) -> 0.14
 HUMAN_BARGAINING_BIN_LABELS = [
     "Bin0_Fair_le_5pct",
     "Bin1_Mod_5_to_15pct",
@@ -7251,39 +7016,31 @@ HUMAN_BARGAINING_BIN_LABELS = [
 HUMAN_BARGAINING_ACCEPT_CURVE = [0.94, 0.76, 0.42, 0.14]
 HUMAN_BARGAINING_SE = [0.03, 0.04, 0.05, 0.04]
 
+# 2. Kaplan, Violante, & Weidner (2014, BPEA):
+#    US SCF Two-Asset Hand-to-Mouth household distribution:
+#      [Poor_HtM, Wealthy_HtM, Non_HtM] = [0.12, 0.20, 0.68]
 HUMAN_HTM_LABELS = ["Poor_HtM", "Wealthy_HtM", "Non_HtM"]
 HUMAN_HTM_DISTRIBUTION = [0.12, 0.20, 0.68]
 
+# 3. Jappelli & Pistaferri (2014, AEJ: Macroeconomics):
+#    Exogenous-windfall MPC across 3 liquid-wealth terciles:
+#      [Low_Liquidity_Tercile, Mid_Liquidity_Tercile, High_Liquidity_Tercile]
 HUMAN_MPC_TERCILE_LABELS = ["Low_Liq_Tercile", "Mid_Liq_Tercile", "High_Liq_Tercile"]
 HUMAN_MPC_CURVE = [0.63, 0.46, 0.31]
 HUMAN_MPC_SE = [0.04, 0.03, 0.03]
-
-
-def compute_small_sample_gini(values: Sequence[float]) -> float:
-    """Computes small-sample bias-corrected Gini coefficient in [0, 1] over net worths."""
-    arr = [max(0.0, float(v)) for v in values if math.isfinite(float(v))]
-    n = len(arr)
-    if n <= 1:
-        return 0.0
-    total = sum(arr)
-    if total <= 1e-9:
-        return 0.0
-    arr.sort()
-    weighted_sum = sum((2 * (i + 1) - n - 1) * x for i, x in enumerate(arr))
-    raw_gini = weighted_sum / (n * total)
-    return round(min(1.0, max(0.0, raw_gini * (n / float(n - 1)))), 4)
 
 
 @dataclass
 class EconomySeedClusterMetrics:
     """
     Cluster-level summary for a SINGLE independent economy seed m.
-    Every statistical test operates strictly over M independent clusters.
+    Every downstream statistical test operates strictly on lists of
+    `EconomySeedClusterMetrics` across M >= 30 independent seeds.
     """
     cell_id: str
     economy_seed: int
     policy_mode: str
-    # Cognitive Control & Integrity Diagnostics
+    # Integrity & Cognitive Control Diagnostics
     json_valid_rate: float
     abstain_rate: float
     cot_truncation_rate: float
@@ -7301,56 +7058,35 @@ class EconomySeedClusterMetrics:
     # CDA Bargaining / Offer Acceptance Gradient across 4 Markup Bins
     bargaining_bin_accept_rates: List[float]
     bargaining_bin_obs_counts: List[int]
-    # Exogenous-Windfall Causal MPC across 3 Liquid-Wealth Terciles
+    # Exogenous-Windfall Causal MPC across 3 Liquid-Wealth Terciles (Zero Circularity)
     windfall_mpc_terciles: List[float]
     windfall_mpc_obs_counts: List[int]
     windfall_mpc_low_minus_high_slope: float
     windfall_probe_executed: bool
-    # Extended Macroeconomic & Behavioral Microstructure Benchmarks
-    wealth_gini: float = 0.0
-    mean_bid_ask_spread: float = 0.0
-    mean_clearing_price: float = 12.0
-    total_consumable_volume: float = 0.0
-    capital_liquidation_volume: float = 0.0
-    mean_final_health: float = 1.0
-
-
-@dataclass
-class ActiveWindfallShadowState:
-    """
-    Holds the single Treated Windfall shadow branch stepped in lockstep with
-    the main economy loop (which serves directly as the exact CRN Control branch,
-    eliminating 50% of shadow LLM inference overhead).
-    """
-    treat_orchestrator: TurnOrchestrator
-    living_agents_sorted_cash: List[Tuple[str, float]]
-    effective_windfall: float
-    start_tick: int
-    horizon_ticks: int
-    ctrl_spend: Dict[str, float] = field(default_factory=dict)
-    treat_spend: Dict[str, float] = field(default_factory=dict)
-    steps_completed: int = 0
 
 
 class ExogenousWindfallMPCProbe:
     """
-    Zero-Redundancy Exogenous Windfall Causal MPC Probe (Parker et al. 2013;
-    Jappelli & Pistaferri 2014):
-      - Forks ONLY the Treated Windfall shadow branch at `start_tick` while the
-        main economy loop acts directly as the exact Common Random Numbers Control.
-      - Transfers an exogenous lump-sum Delta_Y from `PublicTreasury` to living
-        households in the Treated branch (preserving exact SFC_Error == 0.0).
-      - Computes non-circular realized CDA spend MPC:
+    Measures strictly non-circular Marginal Propensity to Consume (MPC) via a
+    paired exogenous cash windfall experiment (Parker et al. 2013; Jappelli &
+    Pistaferri 2014):
+      - Clones the post-burn-in economy into two identical shadow branches
+        (Control vs. Windfall) with matched RNG streams.
+      - In the Windfall branch, transfers an exogenous lump-sum Delta_Y from
+        `PublicTreasury` to living households (preserving exact SFC_Error == 0.0).
+      - Runs h = 3 ticks on both branches and computes realized peer-to-peer CDA
+        consumable spend difference:
             MPC_i = (Spend_i^{Windfall} - Spend_i^{Control}) / Delta_Y
+      - Aggregates causal MPC by pre-windfall liquid-wealth tercile.
     """
 
     @staticmethod
-    def fork_treated_windfall_branch(
+    def run_paired_windfall_probe(
         orchestrator: TurnOrchestrator,
         start_tick: int,
         windfall_amount: float = 20.0,
-        horizon_ticks: int = 2,
-    ) -> Optional[ActiveWindfallShadowState]:
+        horizon_ticks: int = 3,
+    ) -> Tuple[List[float], List[int]]:
         gm_base = orchestrator.game_master
         living_agents = [
             (aid, sheet.liquid_cash)
@@ -7358,28 +7094,29 @@ class ExogenousWindfallMPCProbe:
             if NeedsEngine.is_alive(sheet)
         ]
         if len(living_agents) < 3:
-            return None
+            return ([0.0, 0.0, 0.0], [0, 0, 0])
 
-        # Deep-copy ONLY ONE branch (never duplicating LLM weights!)
+        # Clone GameMaster & Memory for paired Control vs. Treated Windfall worlds
+        # (Use lightweight policy clone so LLM weights are never deep-copied!)
         saved_llm = orchestrator.llm_controller
         orchestrator.llm_controller = None
         try:
+            ctrl_orch = copy.deepcopy(orchestrator)
             treat_orch = copy.deepcopy(orchestrator)
         finally:
             orchestrator.llm_controller = saved_llm
+
+        ctrl_orch.llm_controller = saved_llm
         treat_orch.llm_controller = saved_llm
 
+        # Inject exogenous lump-sum windfall from PublicTreasury in Treated world (strict SFC)
         n_living = len(living_agents)
         total_payout = round(windfall_amount * n_living, 8)
         if treat_orch.game_master.treasury_cash < total_payout:
+            # Ensure PublicTreasury holds sufficient balance via Firm -> Treasury transfer in BOTH branches
+            # or scale windfall to available treasury liquidity so SFC remains strictly 0.0
             eff_windfall = round(
-                max(
-                    2.0,
-                    min(
-                        windfall_amount,
-                        treat_orch.game_master.treasury_cash / (n_living + 1),
-                    ),
-                ),
+                max(2.0, min(windfall_amount, treat_orch.game_master.treasury_cash / (n_living + 1))),
                 2,
             )
         else:
@@ -7394,95 +7131,44 @@ class ExogenousWindfallMPCProbe:
             )
         treat_orch.game_master.audit_and_assert_sfc(start_tick)
 
+        ctrl_spend: Dict[str, float] = {aid: 0.0 for aid, _ in living_agents}
+        treat_spend: Dict[str, float] = {aid: 0.0 for aid, _ in living_agents}
+
+        for step_offset in range(horizon_ticks):
+            t_cur = start_tick + step_offset
+            s_ctrl = ctrl_orch.run_tick(t_cur)
+            s_treat = treat_orch.run_tick(t_cur)
+            for aid, _ in living_agents:
+                ctrl_spend[aid] += float(
+                    s_ctrl.realized_consumable_spend_by_agent.get(aid, 0.0)
+                )
+                treat_spend[aid] += float(
+                    s_treat.realized_consumable_spend_by_agent.get(aid, 0.0)
+                )
+
+        # Sort agents by pre-windfall liquid cash into 3 terciles
         living_agents.sort(key=lambda pair: pair[1])
-        return ActiveWindfallShadowState(
-            treat_orchestrator=treat_orch,
-            living_agents_sorted_cash=living_agents,
-            effective_windfall=eff_windfall,
-            start_tick=start_tick,
-            horizon_ticks=max(1, int(horizon_ticks)),
-            ctrl_spend={aid: 0.0 for aid, _ in living_agents},
-            treat_spend={aid: 0.0 for aid, _ in living_agents},
-            steps_completed=0,
-        )
+        tercile_splits = np.array_split(np.arange(len(living_agents)), 3)
 
-    @staticmethod
-    def step_treated_and_record(
-        shadow: ActiveWindfallShadowState,
-        tick: int,
-        main_control_summary: TickMacroSummary,
-    ) -> None:
-        s_treat = shadow.treat_orchestrator.run_tick(tick)
-        for aid, _ in shadow.living_agents_sorted_cash:
-            shadow.ctrl_spend[aid] += float(
-                main_control_summary.realized_consumable_spend_by_agent.get(aid, 0.0)
-            )
-            shadow.treat_spend[aid] += float(
-                s_treat.realized_consumable_spend_by_agent.get(aid, 0.0)
-            )
-        shadow.steps_completed += 1
-
-    @staticmethod
-    def finalize_tercile_mpc(
-        shadow: ActiveWindfallShadowState,
-    ) -> Tuple[List[float], List[int]]:
-        n_living = len(shadow.living_agents_sorted_cash)
-        tercile_splits = np.array_split(np.arange(n_living), 3)
         tercile_mpcs: List[float] = []
         tercile_counts: List[int] = []
-
         for idx_arr in tercile_splits:
             vals: List[float] = []
             for pos in idx_arr.tolist():
-                aid = shadow.living_agents_sorted_cash[pos][0]
-                delta_c = shadow.treat_spend[aid] - shadow.ctrl_spend[aid]
-                mpc_i = max(
-                    -0.5,
-                    min(1.5, delta_c / max(shadow.effective_windfall, 1e-6)),
-                )
+                aid = living_agents[pos][0]
+                delta_c = treat_spend[aid] - ctrl_spend[aid]
+                mpc_i = max(-0.5, min(1.5, delta_c / max(eff_windfall, 1e-6)))
                 vals.append(mpc_i)
             tercile_mpcs.append(round(float(np.mean(vals)), 4) if vals else 0.0)
             tercile_counts.append(len(vals))
 
         return (tercile_mpcs, tercile_counts)
 
-    @classmethod
-    def run_paired_windfall_probe(
-        cls,
-        orchestrator: TurnOrchestrator,
-        start_tick: int,
-        windfall_amount: float = 20.0,
-        horizon_ticks: int = 2,
-    ) -> Tuple[List[float], List[int]]:
-        """Standalone fallback preserving backward API compatibility."""
-        saved_llm = orchestrator.llm_controller
-        orchestrator.llm_controller = None
-        try:
-            ctrl_orch = copy.deepcopy(orchestrator)
-        finally:
-            orchestrator.llm_controller = saved_llm
-        ctrl_orch.llm_controller = saved_llm
-
-        shadow = cls.fork_treated_windfall_branch(
-            orchestrator=orchestrator,
-            start_tick=start_tick,
-            windfall_amount=windfall_amount,
-            horizon_ticks=horizon_ticks,
-        )
-        if shadow is None:
-            return ([0.0, 0.0, 0.0], [0, 0, 0])
-
-        for offset in range(shadow.horizon_ticks):
-            t_cur = start_tick + offset
-            s_ctrl = ctrl_orch.run_tick(t_cur)
-            cls.step_treated_and_record(shadow, t_cur, s_ctrl)
-        return cls.finalize_tercile_mpc(shadow)
-
 
 class EconomyMetricsCollector:
     """
-    Collects strictly objective per-economy-seed behavioral & macroeconomic metrics
-    from CDA order fills, Two-Asset balance sheets, and Stage 1/2 turn audit records.
+    Collects strictly objective per-economy-seed metrics from CDA order fills,
+    Two-Asset balance sheets, and Stage 1/2 turn audit records.
     """
 
     @staticmethod
@@ -7535,15 +7221,12 @@ class EconomyMetricsCollector:
         std_lam = round(float(np.std(lambdas)), 4) if lambdas else 0.0
         mean_rel_norm = round(float(np.mean(rel_norms)), 4) if rel_norms else 0.0
 
-        # 2. Macro Survival, Biological Vitality, Market Freeze, Spread, Volume & Wealth Gini
+        # 2. Macro Survival, Market Freeze & SFC Conservation Error
         n_agents = max(1, len(gm.households))
-        living_sheets = [
-            h for h in gm.households.values() if NeedsEngine.is_alive(h)
-        ]
-        survival_rate = round(len(living_sheets) / n_agents, 4)
-        mean_final_health = round(
-            float(np.mean([h.needs.health for h in gm.households.values()])), 4
+        living_now = sum(
+            1 for h in gm.households.values() if NeedsEngine.is_alive(h)
         )
+        survival_rate = round(living_now / n_agents, 4)
         freeze_rate = (
             round(
                 sum(1 for s in post_burn_in_summaries if s.consumable_market_frozen)
@@ -7557,46 +7240,6 @@ class EconomyMetricsCollector:
             max(s.sfc_audit.conservation_error_abs for s in post_burn_in_summaries)
             if post_burn_in_summaries
             else 0.0
-        )
-
-        spreads = [
-            float(s.consumable_book.spread)
-            for s in post_burn_in_summaries
-            if s.consumable_book.spread is not None
-        ]
-        mean_spread = round(float(np.mean(spreads)), 4) if spreads else 0.0
-
-        clearing_prices: List[float] = []
-        total_cons_vol = 0.0
-        for s in post_burn_in_summaries:
-            for fl in s.fills_this_tick:
-                if fl.asset == AssetType.CONSUMABLE:
-                    clearing_prices.append(float(fl.execution_price))
-                    total_cons_vol += float(fl.quantity)
-        mean_clearing_price = (
-            round(float(np.mean(clearing_prices)), 4)
-            if clearing_prices
-            else 12.0
-        )
-
-        # Net-worth Gini across all households valued at final clearing price
-        net_worths = [
-            TwoAssetAccounting.compute_net_worth(
-                h, gm.economy_cfg, consumable_price=mean_clearing_price
-            )
-            for h in gm.households.values()
-        ]
-        wealth_gini = compute_small_sample_gini(net_worths)
-
-        # Total distress capital liquidation volume executed post-burn-in
-        cap_liq_vol = round(
-            sum(
-                float(r.stage2_action.capital_transfer_units)
-                for r in active_records
-                if r.stage2_action.action_type == AgentActionType.LIQUIDATE_CAPITAL
-                and r.execution_status.startswith("LIQUIDATED_")
-            ),
-            4,
         )
 
         # 3. Wealthy / Poor HtM Shares (Post-Burn-In Average)
@@ -7620,6 +7263,8 @@ class EconomyMetricsCollector:
         ]
 
         # 4. CDA Bargaining / Order-Acceptance Gradient across 4 Relative Markup Bins
+        # Evaluate every consumable ASK limit order submitted post-burn-in relative to
+        # the prevailing tick mid/last price: did counterparties accept (fill) or reject (expire)?
         tick_ref_price: Dict[int, float] = {}
         for s in post_burn_in_summaries:
             ref_p = (
@@ -7631,7 +7276,7 @@ class EconomyMetricsCollector:
 
         c_book = gm.exchange.get_book(AssetType.CONSUMABLE)
         bin_filled_flags: List[List[float]] = [[], [], [], []]
-        for _, ord_obj in c_book.orders_by_id.items():
+        for oid, ord_obj in c_book.orders_by_id.items():
             if ord_obj.tick_submitted <= burn_in:
                 continue
             if ord_obj.side != OrderSide.ASK or ord_obj.limit_price is None:
@@ -7695,12 +7340,6 @@ class EconomyMetricsCollector:
             windfall_mpc_obs_counts=w_cnts,
             windfall_mpc_low_minus_high_slope=mpc_slope,
             windfall_probe_executed=w_ran,
-            wealth_gini=wealth_gini,
-            mean_bid_ask_spread=mean_spread,
-            mean_clearing_price=mean_clearing_price,
-            total_consumable_volume=round(total_cons_vol, 2),
-            capital_liquidation_volume=cap_liq_vol,
-            mean_final_health=mean_final_health,
         )
 
     @staticmethod
@@ -7711,6 +7350,11 @@ class EconomyMetricsCollector:
         zi_bargaining_floor_w1: Optional[float] = None,
         zi_mpc_floor_w1: Optional[float] = None,
     ) -> Dict[str, Any]:
+        """
+        Aggregates M independent economy seeds into clustered bootstrap summaries,
+        Per-Bin TOST (Holm-Bonferroni adjusted), Debiased Wasserstein-1, and
+        Miller-Madow Jensen-Shannon Divergence.
+        """
         stats_cfg = config.stats
         m = len(seed_clusters)
 
@@ -7817,7 +7461,7 @@ class EconomyMetricsCollector:
             else None
         )
 
-        # 4. Clustered Bootstrap Diagnostics & Behavioral Economics Aggregates
+        # 4. Clustered Bootstrap Diagnostics
         valid_boot = clustered_bootstrap_mean(
             [sc.json_valid_rate for sc in seed_clusters],
             min_required_m=stats_cfg.num_economy_seeds_m,
@@ -7838,41 +7482,6 @@ class EconomyMetricsCollector:
             min_required_m=stats_cfg.num_economy_seeds_m,
             seed=config.master_seed + 303,
         )
-        gini_boot = clustered_bootstrap_mean(
-            [sc.wealth_gini for sc in seed_clusters],
-            min_required_m=stats_cfg.num_economy_seeds_m,
-            seed=config.master_seed + 304,
-        )
-        spread_boot = clustered_bootstrap_mean(
-            [sc.mean_bid_ask_spread for sc in seed_clusters],
-            min_required_m=stats_cfg.num_economy_seeds_m,
-            seed=config.master_seed + 305,
-        )
-        price_boot = clustered_bootstrap_mean(
-            [sc.mean_clearing_price for sc in seed_clusters],
-            min_required_m=stats_cfg.num_economy_seeds_m,
-            seed=config.master_seed + 306,
-        )
-        cap_liq_boot = clustered_bootstrap_mean(
-            [sc.capital_liquidation_volume for sc in seed_clusters],
-            min_required_m=stats_cfg.num_economy_seeds_m,
-            seed=config.master_seed + 307,
-        )
-        mpc_slope_vals = [
-            sc.windfall_mpc_low_minus_high_slope
-            for sc in seed_clusters
-            if sc.windfall_probe_executed
-            and math.isfinite(sc.windfall_mpc_low_minus_high_slope)
-        ]
-        mpc_slope_boot = (
-            clustered_bootstrap_mean(
-                mpc_slope_vals,
-                min_required_m=stats_cfg.num_economy_seeds_m,
-                seed=config.master_seed + 308,
-            )
-            if mpc_slope_vals
-            else None
-        )
 
         return {
             "cell_id": cell_id,
@@ -7888,18 +7497,6 @@ class EconomyMetricsCollector:
             "survival_rate": surv_boot.cluster_mean,
             "survival_ci_95": surv_boot.ci_95,
             "mean_endogenous_lambda": lam_boot.cluster_mean,
-            "wealth_gini": gini_boot.cluster_mean,
-            "wealth_gini_ci_95": gini_boot.ci_95,
-            "mean_bid_ask_spread": spread_boot.cluster_mean,
-            "mean_bid_ask_spread_ci_95": spread_boot.ci_95,
-            "mean_clearing_price": price_boot.cluster_mean,
-            "mean_capital_liquidation_volume": cap_liq_boot.cluster_mean,
-            "windfall_mpc_slope": (
-                mpc_slope_boot.cluster_mean if mpc_slope_boot is not None else None
-            ),
-            "windfall_mpc_slope_ci_95": (
-                mpc_slope_boot.ci_95 if mpc_slope_boot is not None else None
-            ),
             "bargaining_w1": barg_w1,
             "bargaining_per_bin_tost": [r.model_dump() for r in barg_tost],
             "htm_miller_madow_jsd": htm_jsd,
@@ -8222,13 +7819,13 @@ class DisjointRepEArtifacts:
 
 class RepEManager:
     """
-    Module C Core (Optimized): Zero-Sync GPU-Cached Batched Two-Stage Probe-Gated RepE.
-      - Stage 1: Accumulates the opening `appraisal_window_tokens` residuals strictly on GPU
-        for all B agents simultaneously, transferring ONE `[B, hidden_size]` tensor to CPU
-        after generation finishes (zero per-token CUDA sync stalls).
-      - Stage 2: Pre-moves `v_hat` and per-agent `[B, 1, 1]` magnitudes to GPU once before
-        generation; computes norm capping purely in GPU tensor ops with zero `.item()` calls.
-      - Fully backward-compatible with single-agent calls (`B=1`) in `scripts/run_pilot_gates.py`.
+    Module C Core: Two-Stage Endogenous Probe-Gated Representation Engineering Manager.
+      - Stage 1 (Unsteered Appraisal): Read-only hook at `target_layer` capturing the
+        full-context appraisal onset vector `h_prefill_last` plus the opening
+        `[:appraisal_window_tokens]` generated CoT decode tokens. Computes continuous
+        gating scalar `lambda = sigmoid((w^T h + b - theta) / T)` purely endogenously.
+      - Stage 2 (Controlled Action): Freezes the probe and injects
+        `h' = h + lambda * gamma * v_hat` strictly into Stage 2 Action tokens.
     """
 
     def __init__(
@@ -8242,34 +7839,16 @@ class RepEManager:
         self.rng = np.random.default_rng(seed + 4099)
         self._recent_lambda_history: List[float] = []
 
-        # Batched Stage 1 pooled residual cache [B, hidden_size] on CPU
-        self._batch_pooled_cpu: Optional[torch.Tensor] = None
-        self._batch_tokens_inspected: List[int] = []
-        # Device-cached steering / placebo tensors keyed by (mode, device, dtype)
-        self._device_vec_cache: Dict[Tuple[str, str, str], torch.Tensor] = {}
+        self._captured_cot_residuals: List[torch.Tensor] = []
+        self._prefill_last_residual: Optional[torch.Tensor] = None
+        self._last_injected_l2_norm: float = 0.0
+        self._last_relative_norm_ratio: float = 0.0
 
     @staticmethod
     def resolve_effective_layer(target_layer: int, num_layers: int) -> int:
         if target_layer < num_layers:
             return max(0, int(target_layer))
         return max(0, num_layers // 2)
-
-    def _get_cached_device_vector(
-        self, active_mode: RepEMode, device: torch.device, dtype: torch.dtype
-    ) -> torch.Tensor:
-        assert self.artifacts is not None
-        vec_key = "placebo" if active_mode == RepEMode.PLACEBO_RANDOM_VECTOR else "steering"
-        cache_key = (vec_key, str(device), str(dtype))
-        cached = self._device_vec_cache.get(cache_key)
-        if cached is None:
-            src = (
-                self.artifacts.placebo_vector
-                if vec_key == "placebo"
-                else self.artifacts.steering_vector
-            )
-            cached = src.to(device=device, dtype=dtype).contiguous()
-            self._device_vec_cache[cache_key] = cached
-        return cached
 
     def load_or_extract_artifacts(
         self,
@@ -8309,7 +7888,6 @@ class RepEManager:
                         probe_steering_cosine=float(saved["probe_steering_cosine"]),
                         extracted_from_model=bool(saved["extracted_from_model"]),
                     )
-                    self._device_vec_cache.clear()
                     return self.artifacts
             except Exception:
                 pass
@@ -8324,6 +7902,7 @@ class RepEManager:
         h_probe_neg = self._extract_layer_residuals(
             model, tokenizer, [p[1] for p in probe_pairs], eff_layer
         )
+
         w_probe, b_probe, test_auroc, perm_p = self._fit_linear_probe(
             h_pos=h_probe_pos, h_neg=h_probe_neg, seed=101
         )
@@ -8343,6 +7922,7 @@ class RepEManager:
         rand_v = rand_v - torch.dot(rand_v, steering_vec) * steering_vec
         rand_v = rand_v - torch.dot(rand_v, w_unit) * w_unit
         placebo_vec = F.normalize(rand_v, p=2, dim=0, eps=1e-6)
+
         ps_cos = round(float(torch.dot(w_unit, steering_vec).item()), 4)
 
         artifacts = DisjointRepEArtifacts(
@@ -8359,6 +7939,7 @@ class RepEManager:
             probe_steering_cosine=ps_cos,
             extracted_from_model=True,
         )
+
         os.makedirs(os.path.dirname(artifact_path) or ".", exist_ok=True)
         torch.save(
             {
@@ -8378,7 +7959,6 @@ class RepEManager:
             artifact_path,
         )
         self.artifacts = artifacts
-        self._device_vec_cache.clear()
         return artifacts
 
     def _extract_layer_residuals(
@@ -8387,7 +7967,7 @@ class RepEManager:
         tokenizer: Any,
         texts: List[str],
         layer_idx: int,
-        batch_size: int = 8,
+        batch_size: int = 4,
     ) -> torch.Tensor:
         device = next(model.parameters()).device
         base_transformer = getattr(model, "model", model)
@@ -8430,6 +8010,8 @@ class RepEManager:
             finally:
                 handle.remove()
                 del input_ids, attn_mask
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             if batch_store:
                 captured_batches.append(batch_store[0])
@@ -8515,18 +8097,13 @@ class RepEManager:
         return (w_raw, b_raw, test_auroc, perm_p)
 
     # ========================================================================
-    # STAGE 1: ZERO-SYNC GPU-ACCUMULATED BATCHED RESIDUAL CAPTURE
+    # STAGE 1: UNSTEERED APPRAISAL RESIDUAL CAPTURE & ENDOGENOUS LAMBDA
     # ========================================================================
 
     @contextmanager
     def capture_stage1_cot_residuals(self, model: Any) -> Iterator[None]:
-        """
-        Accumulates Stage 1 appraisal residuals on GPU across all B agents in the batch
-        with ZERO per-token GPU->CPU transfers. Transfers one `[B, hidden_size]` pooled
-        tensor to CPU strictly once upon exiting the context manager.
-        """
-        self._batch_pooled_cpu = None
-        self._batch_tokens_inspected = []
+        self._captured_cot_residuals.clear()
+        self._prefill_last_residual = None
 
         if model is None or self.artifacts is None:
             yield
@@ -8541,174 +8118,150 @@ class RepEManager:
         layer_idx = self.resolve_effective_layer(
             self.artifacts.target_layer, len(layers)
         )
-        pooling_mode = self.config.probe_pooling
-        app_win = max(1, int(self.config.appraisal_window_tokens))
-
-        state: Dict[str, Any] = {
-            "prefill_done": False,
-            "prefill_last_gpu": None,
-            "sum_gpu": None,
-            "last_gpu": None,
-            "decode_steps": 0,
-            "accum_count": 0,
-        }
+        prefill_seen = {"done": False}
 
         def _stage1_read_hook(mod: Any, inp: Any, out: Any) -> None:
             h = out[0] if isinstance(out, tuple) else out
             if not isinstance(h, torch.Tensor) or h.dim() != 3:
                 return
             seq_len = int(h.size(1))
-            if seq_len > 1 and not state["prefill_done"]:
-                state["prefill_done"] = True
-                vec = h[:, -1, :].detach().float()
-                state["prefill_last_gpu"] = vec
-                if pooling_mode == "early_appraisal_cot":
-                    state["sum_gpu"] = vec.clone()
-                    state["accum_count"] = 1
+            if seq_len > 1 and not prefill_seen["done"]:
+                prefill_seen["done"] = True
+                self._prefill_last_residual = (
+                    h[0, -1, :].detach().to("cpu", dtype=torch.float32)
+                )
             else:
-                vec = h[:, -1, :].detach().float()
-                state["decode_steps"] += 1
-                state["last_gpu"] = vec
-                if pooling_mode == "early_appraisal_cot":
-                    if state["decode_steps"] <= app_win:
-                        if state["sum_gpu"] is None:
-                            state["sum_gpu"] = vec.clone()
-                        else:
-                            state["sum_gpu"].add_(vec)
-                        state["accum_count"] += 1
-                elif pooling_mode == "mean_cot":
-                    if state["sum_gpu"] is None:
-                        state["sum_gpu"] = vec.clone()
-                    else:
-                        state["sum_gpu"].add_(vec)
-                    state["accum_count"] += 1
+                self._captured_cot_residuals.append(
+                    h[0, -1, :].detach().to("cpu", dtype=torch.float32)
+                )
 
         handle = layers[layer_idx].register_forward_hook(_stage1_read_hook)
         try:
             yield
         finally:
             handle.remove()
-            if pooling_mode == "last_cot_token" and state["last_gpu"] is not None:
-                pooled_gpu = state["last_gpu"]
-                cnt = 1
-            elif state["sum_gpu"] is not None and state["accum_count"] > 0:
-                pooled_gpu = state["sum_gpu"] / float(state["accum_count"])
-                cnt = int(state["accum_count"])
-            elif state["prefill_last_gpu"] is not None:
-                pooled_gpu = state["prefill_last_gpu"]
-                cnt = 1
-            else:
-                pooled_gpu = None
-                cnt = 0
 
-            if pooled_gpu is not None:
-                self._batch_pooled_cpu = pooled_gpu.to("cpu", dtype=torch.float32)
-                bsz = int(self._batch_pooled_cpu.size(0))
-                self._batch_tokens_inspected = [cnt] * bsz
+    def compute_endogenous_lambda(self) -> ProbeGateMeasurement:
+        """
+        Pools Stage 1 appraisal residuals and computes endogenous scalar:
+            lambda = sigmoid((w^T h_pooled + b - theta) / T) in [0, 1].
+        Under `early_appraisal_cot`, pools `[h_prefill_last] + h_cot[:appraisal_window_tokens]`
+        (matching `extract_repe_vectors.py` token-for-token and guaranteeing zero B->C length coupling).
+        """
+        if self.artifacts is None or not self.config.enabled or self.config.mode == RepEMode.OFF:
+            return ProbeGateMeasurement(
+                layer_idx=self.config.target_layer,
+                cot_tokens_inspected=len(self._captured_cot_residuals),
+                raw_probe_score=0.0,
+                endogenous_lambda=0.0,
+                steering_gamma=0.0,
+                injected_vector_l2_norm=0.0,
+                relative_residual_norm_ratio=0.0,
+                repe_mode=RepEMode.OFF,
+            )
 
-    def compute_endogenous_lambda_batch(
-        self, batch_size: int
-    ) -> List[ProbeGateMeasurement]:
-        """Vectorized linear probe scoring across all B agents in the current batch."""
-        if (
-            self.artifacts is None
-            or not self.config.enabled
-            or self.config.mode == RepEMode.OFF
-            or self._batch_pooled_cpu is None
-        ):
-            return [
-                ProbeGateMeasurement(
-                    layer_idx=self.config.target_layer,
+        if self.config.probe_pooling == "early_appraisal_cot":
+            win = max(1, int(self.config.appraisal_window_tokens))
+            window_vecs: List[torch.Tensor] = []
+            if self._prefill_last_residual is not None:
+                window_vecs.append(self._prefill_last_residual)
+            window_vecs.extend(self._captured_cot_residuals[:win])
+            if not window_vecs:
+                return ProbeGateMeasurement(
+                    layer_idx=self.artifacts.target_layer,
                     cot_tokens_inspected=0,
                     raw_probe_score=0.0,
                     endogenous_lambda=0.0,
-                    steering_gamma=0.0,
-                    injected_vector_l2_norm=0.0,
-                    relative_residual_norm_ratio=0.0,
-                    repe_mode=RepEMode.OFF if not self.config.enabled else self.config.mode,
-                )
-                for _ in range(batch_size)
-            ]
-
-        h_clean = torch.nan_to_num(self._batch_pooled_cpu.float(), nan=0.0)
-        w = self.artifacts.probe_weights.float()
-        b = float(self.artifacts.probe_bias)
-        raw_scores = (torch.matmul(h_clean, w) + b).tolist()
-
-        theta = float(self.config.probe_threshold_theta)
-        temp = max(1e-4, float(self.config.probe_temperature))
-        gamma = float(self.config.steering_strength_gamma)
-        results: List[ProbeGateMeasurement] = []
-
-        for idx in range(min(batch_size, len(raw_scores))):
-            raw_s = float(raw_scores[idx])
-            shifted = (raw_s - theta) / temp
-            if self.config.gate_activation == "relu_clipped":
-                lam = max(0.0, min(1.0, shifted))
-            else:
-                lam = 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, shifted))))
-
-            self._recent_lambda_history.append(lam)
-            if len(self._recent_lambda_history) > 256:
-                self._recent_lambda_history.pop(0)
-
-            eff_lam = lam
-            if (
-                self.config.mode == RepEMode.SHUFFLED_LAMBDA
-                and len(self._recent_lambda_history) >= 2
-            ):
-                rand_i = int(self.rng.integers(0, len(self._recent_lambda_history)))
-                eff_lam = self._recent_lambda_history[rand_i]
-
-            n_insp = (
-                self._batch_tokens_inspected[idx]
-                if idx < len(self._batch_tokens_inspected)
-                else 0
-            )
-            results.append(
-                ProbeGateMeasurement(
-                    layer_idx=self.artifacts.target_layer,
-                    cot_tokens_inspected=n_insp,
-                    raw_probe_score=round(raw_s, 6),
-                    endogenous_lambda=round(float(eff_lam), 6),
-                    steering_gamma=gamma,
+                    steering_gamma=self.config.steering_strength_gamma,
                     injected_vector_l2_norm=0.0,
                     relative_residual_norm_ratio=0.0,
                     repe_mode=self.config.mode,
                 )
+            h_pooled = torch.stack(window_vecs, dim=0).mean(dim=0)
+            n_inspected = len(window_vecs)
+        elif self._captured_cot_residuals:
+            if self.config.probe_pooling == "last_cot_token":
+                h_pooled = self._captured_cot_residuals[-1]
+                n_inspected = 1
+            else:
+                h_pooled = torch.stack(self._captured_cot_residuals, dim=0).mean(dim=0)
+                n_inspected = len(self._captured_cot_residuals)
+        elif self._prefill_last_residual is not None:
+            h_pooled = self._prefill_last_residual
+            n_inspected = 1
+        else:
+            return ProbeGateMeasurement(
+                layer_idx=self.artifacts.target_layer,
+                cot_tokens_inspected=0,
+                raw_probe_score=0.0,
+                endogenous_lambda=0.0,
+                steering_gamma=self.config.steering_strength_gamma,
+                injected_vector_l2_norm=0.0,
+                relative_residual_norm_ratio=0.0,
+                repe_mode=self.config.mode,
             )
-        return results
 
-    def compute_endogenous_lambda(self) -> ProbeGateMeasurement:
-        """Single-agent convenience wrapper (used by `scripts/run_pilot_gates.py`)."""
-        return self.compute_endogenous_lambda_batch(1)[0]
+        h_clean = torch.nan_to_num(h_pooled.float(), nan=0.0)
+        w = self.artifacts.probe_weights.float()
+        b = float(self.artifacts.probe_bias)
+
+        raw_score = float(torch.dot(w, h_clean).item() + b)
+        shifted = (raw_score - float(self.config.probe_threshold_theta)) / max(
+            1e-4, float(self.config.probe_temperature)
+        )
+
+        if self.config.gate_activation == "relu_clipped":
+            lam = max(0.0, min(1.0, shifted))
+        else:
+            clamped = max(-30.0, min(30.0, shifted))
+            lam = 1.0 / (1.0 + math.exp(-clamped))
+
+        self._recent_lambda_history.append(lam)
+        if len(self._recent_lambda_history) > 128:
+            self._recent_lambda_history.pop(0)
+
+        effective_lam = lam
+        if (
+            self.config.mode == RepEMode.SHUFFLED_LAMBDA
+            and len(self._recent_lambda_history) >= 2
+        ):
+            rand_idx = int(self.rng.integers(0, len(self._recent_lambda_history)))
+            effective_lam = self._recent_lambda_history[rand_idx]
+
+        return ProbeGateMeasurement(
+            layer_idx=self.artifacts.target_layer,
+            cot_tokens_inspected=n_inspected,
+            raw_probe_score=round(raw_score, 6),
+            endogenous_lambda=round(float(effective_lam), 6),
+            steering_gamma=float(self.config.steering_strength_gamma),
+            injected_vector_l2_norm=0.0,
+            relative_residual_norm_ratio=0.0,
+            repe_mode=self.config.mode,
+        )
 
     # ========================================================================
-    # STAGE 2: ZERO-SYNC GPU-CACHED BATCHED VECTOR INJECTION
+    # STAGE 2: CONTROLLED ACTION GENERATION VECTOR INJECTION
     # ========================================================================
 
     @contextmanager
-    def inject_stage2_action_steering_batch(
+    def inject_stage2_action_steering(
         self,
         model: Any,
-        probe_measurements: List[ProbeGateMeasurement],
+        probe_measurement: ProbeGateMeasurement,
     ) -> Iterator[None]:
-        """
-        Pre-places `v_hat` and per-agent `[B, 1, 1]` magnitudes on GPU ONCE before
-        generation. Performs norm-capped latent injection purely on GPU with ZERO
-        `.item()` CPU sync stalls inside the forward hook.
-        """
-        active_mode = self.config.mode
+        self._last_injected_l2_norm = 0.0
+        self._last_relative_norm_ratio = 0.0
+
+        lam = float(probe_measurement.endogenous_lambda)
         gamma = float(self.config.steering_strength_gamma)
-        raw_mags = [float(pm.endogenous_lambda) * gamma for pm in probe_measurements]
+        active_mode = self.config.mode
 
         if (
             model is None
             or self.artifacts is None
             or not self.config.enabled
             or active_mode == RepEMode.OFF
-            or not raw_mags
-            or all(abs(m) <= 1e-8 for m in raw_mags)
+            or abs(lam * gamma) <= 1e-8
         ):
             yield
             return
@@ -8722,18 +8275,13 @@ class RepEManager:
         layer_idx = self.resolve_effective_layer(
             self.artifacts.target_layer, len(layers)
         )
-        first_param = next(layers[layer_idx].parameters())
-        layer_dev = first_param.device
+        base_vec_cpu = (
+            self.artifacts.placebo_vector
+            if active_mode == RepEMode.PLACEBO_RANDOM_VECTOR
+            else self.artifacts.steering_vector
+        )
         max_rel_ratio = float(self.config.max_relative_norm_ratio)
-
-        # Pre-allocate per-agent magnitudes on GPU once [B, 1, 1]
-        raw_mags_gpu = torch.tensor(
-            raw_mags, device=layer_dev, dtype=torch.float32
-        ).view(-1, 1, 1)
-        last_stats: Dict[str, Optional[torch.Tensor]] = {
-            "capped": None,
-            "rel_ratio": None,
-        }
+        raw_mag = lam * gamma
 
         def _stage2_inject_hook(mod: Any, inp: Any, out: Any) -> Any:
             is_tuple = isinstance(out, tuple)
@@ -8741,34 +8289,30 @@ class RepEManager:
             if not isinstance(h, torch.Tensor) or h.dim() != 3:
                 return out
 
-            bsz, seq_len, hidden_dim = h.shape
-            v_dev = self._get_cached_device_vector(active_mode, h.device, h.dtype)
-            if v_dev.size(-1) != hidden_dim:
+            v_dev = base_vec_cpu.to(device=h.device, dtype=h.dtype)
+            if v_dev.size(-1) != h.size(-1):
                 return out
 
-            mags_b = (
-                raw_mags_gpu
-                if raw_mags_gpu.size(0) == bsz
-                else raw_mags_gpu[:bsz]
-            )
-            if mags_b.device != h.device:
-                mags_b = mags_b.to(h.device)
-
+            seq_len = int(h.size(1))
             target_slice = h[:, -1:, :] if seq_len > 1 else h
+
             h_norm = target_slice.detach().float().norm(dim=-1, keepdim=True).clamp(min=1e-6)
-            max_mag = max_rel_ratio * h_norm
-            capped_mag = torch.sign(mags_b) * torch.minimum(mags_b.abs(), max_mag)
+            mean_h_norm = float(h_norm.mean().item())
+            max_allowed_mag = max_rel_ratio * mean_h_norm
 
-            last_stats["capped"] = capped_mag.detach().abs().view(-1)
-            last_stats["rel_ratio"] = (capped_mag.detach().abs() / h_norm).view(-1)
+            capped_mag = math.copysign(min(abs(raw_mag), max_allowed_mag), raw_mag)
+            delta = (v_dev * capped_mag).view(1, 1, -1)
 
-            delta = capped_mag.to(h.dtype) * v_dev.view(1, 1, -1)
-            if seq_len == 1:
-                h_mod = h + delta
-            else:
-                h_mod = h.clone()
+            h_mod = h.clone()
+            if seq_len > 1:
                 h_mod[:, -1:, :] = h_mod[:, -1:, :] + delta
+            else:
+                h_mod = h_mod + delta
 
+            self._last_injected_l2_norm = round(abs(capped_mag), 6)
+            self._last_relative_norm_ratio = round(
+                abs(capped_mag) / max(mean_h_norm, 1e-6), 6
+            )
             return (h_mod,) + out[1:] if is_tuple else h_mod
 
         handle = layers[layer_idx].register_forward_hook(_stage2_inject_hook)
@@ -8776,23 +8320,10 @@ class RepEManager:
             yield
         finally:
             handle.remove()
-            if last_stats["capped"] is not None and last_stats["rel_ratio"] is not None:
-                cap_list = last_stats["capped"].cpu().tolist()
-                rel_list = last_stats["rel_ratio"].cpu().tolist()
-                for idx, pm in enumerate(probe_measurements):
-                    if idx < len(cap_list):
-                        pm.injected_vector_l2_norm = round(float(cap_list[idx]), 6)
-                        pm.relative_residual_norm_ratio = round(float(rel_list[idx]), 6)
-
-    @contextmanager
-    def inject_stage2_action_steering(
-        self,
-        model: Any,
-        probe_measurement: ProbeGateMeasurement,
-    ) -> Iterator[None]:
-        """Single-agent convenience wrapper (used by `scripts/run_pilot_gates.py`)."""
-        with self.inject_stage2_action_steering_batch(model, [probe_measurement]):
-            yield
+            probe_measurement.injected_vector_l2_norm = self._last_injected_l2_norm
+            probe_measurement.relative_residual_norm_ratio = (
+                self._last_relative_norm_ratio
+            )
 
 ================================================================================
 FILE_PATH: ./src/brain/__init__.py
@@ -9047,48 +8578,11 @@ class WhiteBoxModelLoader:
             return cls.load_model_and_tokenizer(config.model)
 
 
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    LogitsProcessor,
-    LogitsProcessorList,
-)
-
-
-class PerSampleBudgetLogitsProcessor(LogitsProcessor):
-    """
-    Enforces exact per-agent Stage 1 Bounded Deliberation Budgets (Factor A)
-    inside a single fused GPU batch: once batch element `i` reaches its personal
-    `cot_max_tokens[i]`, emits `eos_token_id` strictly for row `i` without
-    perturbing any active token logits or blocking calmer agents in the batch.
-    """
-
-    def __init__(
-        self, prompt_len: int, budgets: List[int], eos_token_id: int
-    ) -> None:
-        self.prompt_len = int(prompt_len)
-        self.budgets = [max(1, int(b)) for b in budgets]
-        self.eos_token_id = int(eos_token_id)
-
-    def __call__(
-        self, input_ids: torch.LongTensor, scores: torch.FloatTensor
-    ) -> torch.FloatTensor:
-        gen_step = int(input_ids.shape[1]) - self.prompt_len
-        for row_idx, max_toks in enumerate(self.budgets):
-            if row_idx < scores.shape[0] and gen_step >= max_toks:
-                scores[row_idx, :] = float("-inf")
-                scores[row_idx, self.eos_token_id] = 0.0
-        return scores
-
-
 class TwoStageRepEController:
     """
-    Optimized Two-Stage Probe-Gated RepE Master Controller.
-      - Adds `execute_two_stage_batch()` to run all B living agents per tick in
-        ONE Stage-1 CoT GPU batch + ONE Stage-2 Action JSON GPU batch (~15x speedup
-        on Tesla T4 while preserving per-agent CoT budgets and per-agent RepE lambdas).
-      - Eliminates per-turn `gc.collect()` and `torch.cuda.empty_cache()` stalls.
-      - Retains `execute_two_stage_turn()` for 100% compatibility with Pilot Gates G1–G4.
+    Master LLM Inference Controller implementing `TwoStageLLMControllerProtocol`.
+    Executes Pass 1 (Unsteered CoT Appraisal + Frozen Linear Probe -> lambda)
+    followed by Pass 2 (Action-Only Vector Injection h' = h + lambda*gamma*v -> JSON).
     """
 
     def __init__(
@@ -9166,44 +8660,32 @@ class TwoStageRepEController:
         parts.append("Assistant:")
         return "\n".join(parts)
 
-    def _run_generate_batch(
+    def _run_generate(
         self,
-        prompt_texts: List[str],
-        max_new_tokens_per_item: List[int],
+        prompt_text: str,
+        max_new_tokens: int,
         temperature: float,
         top_p: float,
-    ) -> List[Tuple[str, int, bool]]:
-        """
-        Fused GPU batched generation with per-sample `max_new_tokens` enforcement
-        and zero per-turn `torch.cuda.empty_cache()` synchronization stalls.
-        """
+    ) -> Tuple[str, int, bool]:
         device = next(self.model.parameters()).device
-        self.tokenizer.padding_side = "left"
-        eos_id = self.tokenizer.eos_token_id
-        pad_id = (
-            self.tokenizer.pad_token_id
-            if self.tokenizer.pad_token_id is not None
-            else eos_id
-        )
-
         enc = self.tokenizer(
-            prompt_texts,
+            prompt_text,
             return_tensors="pt",
-            padding=True,
             truncation=True,
-            max_length=1024,
+            max_length=1536,
             add_special_tokens=True,
         )
         input_ids = enc["input_ids"].to(device)
         attention_mask = enc["attention_mask"].to(device)
         prompt_len = int(input_ids.size(1))
-        global_max_new = max(1, max(max_new_tokens_per_item))
+        eos_id = self.tokenizer.eos_token_id
+        pad_id = self.tokenizer.pad_token_id
 
         do_sample = temperature > 1e-5
         gen_kwargs: Dict[str, Any] = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "max_new_tokens": global_max_new,
+            "max_new_tokens": max(1, int(max_new_tokens)),
             "do_sample": do_sample,
             "use_cache": True,
             "pad_token_id": pad_id if pad_id is not None else eos_id,
@@ -9218,188 +8700,24 @@ class TwoStageRepEController:
             gen_kwargs["top_k"] = None
             gen_kwargs["repetition_penalty"] = 1.0
 
-        # Attach per-sample CoT budget enforcer only when batch items have differing budgets
-        if (
-            len(prompt_texts) > 1
-            and eos_id is not None
-            and len(set(max_new_tokens_per_item)) > 1
-        ):
-            gen_kwargs["logits_processor"] = LogitsProcessorList(
-                [
-                    PerSampleBudgetLogitsProcessor(
-                        prompt_len=prompt_len,
-                        budgets=max_new_tokens_per_item,
-                        eos_token_id=int(eos_id),
-                    )
-                ]
+        try:
+            with torch.inference_mode():
+                out_ids = self.model.generate(**gen_kwargs)
+            new_tokens = out_ids[0, prompt_len:].detach().cpu().tolist()
+            num_gen = len(new_tokens)
+            hit_limit = num_gen >= int(max_new_tokens) and (
+                eos_id is None or (num_gen > 0 and new_tokens[-1] != eos_id)
             )
-
-        with torch.inference_mode():
-            out_ids = self.model.generate(**gen_kwargs)
-
-        new_tokens_batch = out_ids[:, prompt_len:].detach().cpu().tolist()
-        del input_ids, attention_mask, out_ids
-
-        outputs: List[Tuple[str, int, bool]] = []
-        stop_ids = {t for t in (eos_id, pad_id) if t is not None}
-        for idx, tok_seq in enumerate(new_tokens_batch):
-            budget_i = int(max_new_tokens_per_item[idx])
-            # Trim tokens after first EOS / PAD
-            trimmed: List[int] = []
-            hit_eos = False
-            for tid in tok_seq[:budget_i]:
-                if tid in stop_ids:
-                    hit_eos = True
-                    break
-                trimmed.append(tid)
-            num_gen = len(trimmed)
-            hit_limit = (num_gen >= budget_i) and (not hit_eos)
             decoded = self.tokenizer.decode(
-                trimmed, skip_special_tokens=True
+                new_tokens, skip_special_tokens=True
             ).strip()
-            outputs.append((decoded, num_gen, hit_limit))
-        return outputs
-
-    def _run_generate(
-        self,
-        prompt_text: str,
-        max_new_tokens: int,
-        temperature: float,
-        top_p: float,
-    ) -> Tuple[str, int, bool]:
-        """Single-prompt wrapper (used by `scripts/run_pilot_gates.py`)."""
-        return self._run_generate_batch(
-            prompt_texts=[prompt_text],
-            max_new_tokens_per_item=[max_new_tokens],
-            temperature=temperature,
-            top_p=top_p,
-        )[0]
-
-    def execute_two_stage_batch(
-        self,
-        stage1_system_prompts: List[str],
-        stage1_user_prompts: List[str],
-        stage2_instruction: str,
-        cot_max_tokens_list: List[int],
-        action_max_tokens: int,
-        agent_ids: List[str],
-        tick: int,
-        parse_action_fn: Callable[
-            [str], Tuple[Stage2ActionPayload, bool, Optional[str]]
-        ] = IsomorphicVocabulary.parse_sanitized_action_json,
-    ) -> List[TwoStageGenerationOutput]:
-        """
-        Executes Stage 1 (Unsteered Appraisal CoT + Vectorized Linear Probe) and
-        Stage 2 (Per-Agent Steered JSON Action) across all B agents in two single
-        batched GPU forward passes, retrying ONLY invalid JSON indices.
-        """
-        t0 = time.perf_counter()
-        bsz = len(agent_ids)
-        base_temp = float(self.config.model.temperature)
-        top_p = float(self.config.model.top_p)
-        max_retries = max(1, int(self.config.model.max_json_retries))
-
-        # PASS 1: Batched Unsteered Stage 1 CoT + Zero-Sync GPU Residual Capture
-        stage1_prompts = [
-            self._format_chat_prompt(
-                system_prompt=stage1_system_prompts[i],
-                user_messages=[{"role": "user", "content": stage1_user_prompts[i]}],
-            )
-            for i in range(bsz)
-        ]
-        self._seed_torch_for_call(tick, "_".join(agent_ids[:3]), "stage1_batch", 0)
-
-        with self.repe_manager.capture_stage1_cot_residuals(self.model):
-            s1_outputs = self._run_generate_batch(
-                prompt_texts=stage1_prompts,
-                max_new_tokens_per_item=cot_max_tokens_list,
-                temperature=base_temp,
-                top_p=top_p,
-            )
-
-        probe_measurements = self.repe_manager.compute_endogenous_lambda_batch(bsz)
-
-        # PASS 2: Batched Steered Stage 2 JSON Action (retry ONLY failed indices)
-        stage2_prompts = [
-            self._format_chat_prompt(
-                system_prompt=stage1_system_prompts[i],
-                user_messages=[
-                    {"role": "user", "content": stage1_user_prompts[i]},
-                    {"role": "assistant", "content": s1_outputs[i][0] or "Evaluating reserves."},
-                    {"role": "user", "content": stage2_instruction},
-                ],
-            )
-            for i in range(bsz)
-        ]
-
-        final_actions: List[Optional[Stage2ActionPayload]] = [None] * bsz
-        final_raws: List[str] = [""] * bsz
-        final_valids: List[bool] = [False] * bsz
-        final_retries: List[int] = [max_retries] * bsz
-        final_act_toks: List[int] = [0] * bsz
-
-        pending_indices = list(range(bsz))
-        for retry_idx in range(max_retries):
-            if not pending_indices:
-                break
-            self._seed_torch_for_call(
-                tick, "_".join(agent_ids[i] for i in pending_indices[:3]), "stage2_batch", retry_idx
-            )
-            retry_temp = base_temp if retry_idx == 0 else max(0.25, base_temp * 0.75)
-            sub_prompts = [stage2_prompts[i] for i in pending_indices]
-            sub_pms = [probe_measurements[i] for i in pending_indices]
-            sub_budgets = [int(action_max_tokens)] * len(pending_indices)
-
-            with self.repe_manager.inject_stage2_action_steering_batch(
-                model=self.model, probe_measurements=sub_pms
-            ):
-                s2_sub_outs = self._run_generate_batch(
-                    prompt_texts=sub_prompts,
-                    max_new_tokens_per_item=sub_budgets,
-                    temperature=retry_temp,
-                    top_p=top_p,
-                )
-
-            next_pending: List[int] = []
-            for local_i, orig_i in enumerate(pending_indices):
-                raw_json, act_cnt, _ = s2_sub_outs[local_i]
-                final_raws[orig_i] = raw_json
-                final_act_toks[orig_i] = act_cnt
-                parsed, ok, _ = parse_action_fn(raw_json)
-                if ok:
-                    final_actions[orig_i] = parsed
-                    final_valids[orig_i] = True
-                    final_retries[orig_i] = retry_idx
-                else:
-                    next_pending.append(orig_i)
-            pending_indices = next_pending
-
-        per_agent_ms = round(((time.perf_counter() - t0) * 1000.0) / max(1, bsz), 2)
-        results: List[TwoStageGenerationOutput] = []
-        for i in range(bsz):
-            cot_txt, cot_cnt, cot_trunc = s1_outputs[i]
-            is_ok = final_valids[i]
-            payload = (
-                final_actions[i]
-                if (is_ok and final_actions[i] is not None)
-                else Stage2ActionPayload(action_type=AgentActionType.ABSTAIN)
-            )
-            results.append(
-                TwoStageGenerationOutput(
-                    stage1_cot_text=cot_txt,
-                    cot_tokens_generated=cot_cnt,
-                    cot_truncated_by_bottleneck=cot_trunc,
-                    probe_measurement=probe_measurements[i],
-                    stage2_raw_json=final_raws[i],
-                    stage2_action=payload,
-                    json_valid=is_ok,
-                    abstain=not is_ok,
-                    retries_used=final_retries[i],
-                    action_tokens_generated=final_act_toks[i],
-                    latency_ms=per_agent_ms,
-                )
-            )
-        return results
+            return (decoded, num_gen, hit_limit)
+        finally:
+            del input_ids, attention_mask
+            if "out_ids" in locals():
+                del out_ids
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def execute_two_stage_turn(
         self,
@@ -9414,17 +8732,96 @@ class TwoStageRepEController:
             [str], Tuple[Stage2ActionPayload, bool, Optional[str]]
         ] = IsomorphicVocabulary.parse_sanitized_action_json,
     ) -> TwoStageGenerationOutput:
-        """Single-agent wrapper delegating cleanly to `execute_two_stage_batch`."""
-        return self.execute_two_stage_batch(
-            stage1_system_prompts=[stage1_system_prompt],
-            stage1_user_prompts=[stage1_user_prompt],
-            stage2_instruction=stage2_instruction,
-            cot_max_tokens_list=[cot_max_tokens],
-            action_max_tokens=action_max_tokens,
-            agent_ids=[agent_id],
-            tick=tick,
-            parse_action_fn=parse_action_fn,
-        )[0]
+        t0 = time.perf_counter()
+        base_temp = float(self.config.model.temperature)
+        top_p = float(self.config.model.top_p)
+        max_retries = max(1, int(self.config.model.max_json_retries))
+
+        stage1_prompt = self._format_chat_prompt(
+            system_prompt=stage1_system_prompt,
+            user_messages=[{"role": "user", "content": stage1_user_prompt}],
+        )
+        self._seed_torch_for_call(tick, agent_id, "stage1_cot", 0)
+
+        with self.repe_manager.capture_stage1_cot_residuals(self.model):
+            cot_text, cot_tok_count, cot_truncated = self._run_generate(
+                prompt_text=stage1_prompt,
+                max_new_tokens=cot_max_tokens,
+                temperature=base_temp,
+                top_p=top_p,
+            )
+
+        probe_measurement: ProbeGateMeasurement = (
+            self.repe_manager.compute_endogenous_lambda()
+        )
+
+        stage2_prompt = self._format_chat_prompt(
+            system_prompt=stage1_system_prompt,
+            user_messages=[
+                {"role": "user", "content": stage1_user_prompt},
+                {"role": "assistant", "content": cot_text or "Evaluating reserves."},
+                {"role": "user", "content": stage2_instruction},
+            ],
+        )
+
+        last_raw_json = ""
+        last_action_tokens = 0
+
+        for retry_idx in range(max_retries):
+            self._seed_torch_for_call(tick, agent_id, "stage2_action", retry_idx)
+            retry_temp = base_temp if retry_idx == 0 else max(0.25, base_temp * 0.75)
+
+            with self.repe_manager.inject_stage2_action_steering(
+                model=self.model,
+                probe_measurement=probe_measurement,
+            ):
+                raw_json, act_tok_cnt, _ = self._run_generate(
+                    prompt_text=stage2_prompt,
+                    max_new_tokens=action_max_tokens,
+                    temperature=retry_temp,
+                    top_p=top_p,
+                )
+
+            last_raw_json = raw_json
+            last_action_tokens = act_tok_cnt
+
+            parsed_payload, is_valid, _ = parse_action_fn(raw_json)
+            if is_valid:
+                latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return TwoStageGenerationOutput(
+                    stage1_cot_text=cot_text,
+                    cot_tokens_generated=cot_tok_count,
+                    cot_truncated_by_bottleneck=cot_truncated,
+                    probe_measurement=probe_measurement,
+                    stage2_raw_json=raw_json,
+                    stage2_action=parsed_payload,
+                    json_valid=True,
+                    abstain=False,
+                    retries_used=retry_idx,
+                    action_tokens_generated=act_tok_cnt,
+                    latency_ms=latency_ms,
+                )
+
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return TwoStageGenerationOutput(
+            stage1_cot_text=cot_text,
+            cot_tokens_generated=cot_tok_count,
+            cot_truncated_by_bottleneck=cot_truncated,
+            probe_measurement=probe_measurement,
+            stage2_raw_json=last_raw_json,
+            stage2_action=Stage2ActionPayload(action_type=AgentActionType.ABSTAIN),
+            json_valid=False,
+            abstain=True,
+            retries_used=max_retries,
+            action_tokens_generated=last_action_tokens,
+            latency_ms=latency_ms,
+        )
 
 ================================================================================
 FILE_PATH: ./src/brain/memory_tms.py
@@ -9597,12 +8994,9 @@ class ScopedMemoryHandle:
 
 class EpisodicMemoryTMS:
     """
-    Factor B (Optimized): Episodic Memory Friction & TMS Store with Vectorized
-    In-Memory NumPy Cache and Hard 15-Tick Context Truncation.
+    Factor B (Domain-General Cognitive Bottleneck): Episodic Memory Friction &
+    Transactive Memory System (TMS) SQLite WAL Store.
     """
-
-    MAX_SUMMARY_CHARS = 110
-    MAX_RETENTION_TICKS = 15
 
     def __init__(
         self,
@@ -9622,8 +9016,6 @@ class EpisodicMemoryTMS:
         )
         if self._shared_conn is not None:
             self._shared_conn.row_factory = sqlite3.Row
-        # Fast vectorized cache: agent_id -> list of (record, float32[dim])
-        self._mem_cache: Dict[str, List[Tuple[EpisodicMemoryRecord, np.ndarray]]] = {}
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -9672,17 +9064,19 @@ class EpisodicMemoryTMS:
             self._close_if_not_shared(conn)
 
     def __deepcopy__(self, memo: Dict[int, Any]) -> "EpisodicMemoryTMS":
+        """
+        Safely clones `EpisodicMemoryTMS` (including its `:memory:` SQLite database)
+        via `conn.iterdump()` so paired exogenous-windfall shadow worlds can run
+        without triggering `TypeError: cannot pickle 'sqlite3.Connection' object`.
+        """
         cls = self.__class__
         new_obj = cls.__new__(cls)
         memo[id(self)] = new_obj
 
         new_obj.config = copy.deepcopy(self.config, memo)
         new_obj.db_path = ":memory:"
+        # Embedder is stateless/read-only; share safely without duplicating model weights
         new_obj.embedder = self.embedder
-        new_obj._mem_cache = {
-            aid: [(rec.model_copy(), emb.copy()) for rec, emb in entries]
-            for aid, entries in self._mem_cache.items()
-        }
 
         src_conn = self._connect()
         try:
@@ -9705,11 +9099,11 @@ class EpisodicMemoryTMS:
         self, stress_index: float
     ) -> Tuple[int, float]:
         s = max(0.0, min(1.0, float(stress_index)))
-        # Cap effective calm Top-K at 5 so prompt context remains strictly bounded across 15 ticks
-        k_max = min(5, int(self.config.top_k_calm))
-        k_min = min(k_max, int(self.config.top_k_stressed))
         if not self.config.enabled:
-            return (k_max, 0.0)
+            return (int(self.config.top_k_calm), 0.0)
+
+        k_max = int(self.config.top_k_calm)
+        k_min = int(self.config.top_k_stressed)
         eff_k = max(k_min, int(math.floor(k_max - (k_max - k_min) * s)))
         eff_sigma = round(float(self.config.similarity_noise_sigma_max) * s, 6)
         return (eff_k, eff_sigma)
@@ -9722,8 +9116,8 @@ class EpisodicMemoryTMS:
         summary_text: str,
         salience_score: float = 1.0,
     ) -> EpisodicMemoryRecord:
-        safe_summary = summary_text.strip()[: self.MAX_SUMMARY_CHARS]
-        emb = self.embedder.embed(safe_summary)
+        emb = self.embedder.embed(summary_text)
+        emb_list = [round(float(x), 6) for x in emb.tolist()]
         mem_id = f"ep_{tick:04d}_{uuid.uuid4().hex[:8]}"
         sal = max(0.05, float(salience_score))
 
@@ -9732,23 +9126,11 @@ class EpisodicMemoryTMS:
             agent_id=agent_id,
             tick=tick,
             event_type=event_type,  # type: ignore[arg-type]
-            summary_text=safe_summary,
+            summary_text=summary_text,
             salience_score=sal,
-            embedding=None,
+            embedding=emb_list,
         )
 
-        # Update vectorized in-memory cache with strict 15-tick & 48-record rolling cap
-        cap = min(48, int(self.config.max_episodic_capacity))
-        bucket = self._mem_cache.setdefault(agent_id, [])
-        bucket.append((record, emb))
-        min_keep_tick = tick - self.MAX_RETENTION_TICKS
-        if len(bucket) > cap or (bucket and bucket[0][0].tick < min_keep_tick):
-            bucket = [
-                (r, e) for r, e in bucket if r.tick >= min_keep_tick
-            ][-cap:]
-            self._mem_cache[agent_id] = bucket
-
-        # Persist summary to SQLite (skip serializing 384 floats as JSON when in-memory cache is active)
         conn = self._connect()
         try:
             conn.execute(
@@ -9764,8 +9146,21 @@ class EpisodicMemoryTMS:
                     record.event_type,
                     record.summary_text,
                     record.salience_score,
-                    "[]",
+                    json.dumps(emb_list),
                 ),
+            )
+            cap = int(self.config.max_episodic_capacity)
+            conn.execute(
+                """
+                DELETE FROM episodic_memory
+                WHERE agent_id = ? AND mem_id NOT IN (
+                    SELECT mem_id FROM episodic_memory
+                    WHERE agent_id = ?
+                    ORDER BY tick DESC, salience_score DESC
+                    LIMIT ?
+                );
+                """,
+                (agent_id, agent_id, cap),
             )
             conn.commit()
         finally:
@@ -9781,18 +9176,8 @@ class EpisodicMemoryTMS:
         rng: np.random.Generator,
     ) -> RetrievalResult:
         eff_k, eff_sigma = self.compute_effective_top_k_and_sigma(stress_index)
-        entries = self._mem_cache.get(agent_id, [])
-        if not entries:
-            return RetrievalResult(
-                agent_id=agent_id,
-                records=[],
-                top_k_used=eff_k,
-                noise_sigma_used=eff_sigma,
-                friction_enabled=self.config.enabled,
-                total_candidate_pool=0,
-            )
-
         q_vec = self.embedder.embed(query_text)
+
         if self.config.enabled and eff_sigma > 1e-8:
             emb_noise = rng.normal(
                 0.0,
@@ -9804,13 +9189,29 @@ class EpisodicMemoryTMS:
             if q_norm > 1e-8:
                 q_vec = q_noisy / q_norm
 
-        # Single vectorized dot-product across all cached memories (<0.05 ms)
-        e_mat = np.stack([e for _, e in entries], axis=0)
-        cos_sims = e_mat @ q_vec
-        ticks_arr = np.asarray([r.tick for r, _ in entries], dtype=np.float32)
-        sals_arr = np.asarray([r.salience_score for r, _ in entries], dtype=np.float32)
-        delta_t = np.maximum(0.0, float(current_tick) - ticks_arr)
-        sal_recency = sals_arr * np.exp(-0.15 * delta_t)
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT mem_id, agent_id, tick, event_type, summary_text, salience_score, embedding_json
+                FROM episodic_memory
+                WHERE agent_id = ?
+                ORDER BY tick DESC;
+                """,
+                (agent_id,),
+            ).fetchall()
+        finally:
+            self._close_if_not_shared(conn)
+
+        if not rows:
+            return RetrievalResult(
+                agent_id=agent_id,
+                records=[],
+                top_k_used=eff_k,
+                noise_sigma_used=eff_sigma,
+                friction_enabled=self.config.enabled,
+                total_candidate_pool=0,
+            )
 
         w_sal = float(self.config.recency_salience_weight)
         eff_w_sal = (
@@ -9818,12 +9219,38 @@ class EpisodicMemoryTMS:
             if self.config.enabled
             else w_sal
         )
-        scores = (1.0 - eff_w_sal) * cos_sims + eff_w_sal * sal_recency
-        if self.config.enabled and eff_sigma > 1e-8:
-            scores = scores + rng.normal(0.0, eff_sigma, size=scores.shape)
 
-        top_indices = np.argsort(scores)[::-1][:eff_k]
-        selected = [entries[int(i)][0] for i in top_indices]
+        scored: List[Tuple[float, EpisodicMemoryRecord]] = []
+        for r in rows:
+            emb_list = json.loads(r["embedding_json"])
+            m_vec = np.asarray(emb_list, dtype=np.float32)
+            cos_sim = float(np.dot(q_vec, m_vec))
+            delta_t = max(0, current_tick - int(r["tick"]))
+            sal_recency = float(r["salience_score"]) * math.exp(-0.15 * delta_t)
+
+            score_noise = (
+                float(rng.normal(0.0, eff_sigma))
+                if (self.config.enabled and eff_sigma > 1e-8)
+                else 0.0
+            )
+            total_score = (
+                (1.0 - eff_w_sal) * cos_sim
+                + eff_w_sal * sal_recency
+                + score_noise
+            )
+            rec = EpisodicMemoryRecord(
+                mem_id=r["mem_id"],
+                agent_id=r["agent_id"],
+                tick=int(r["tick"]),
+                event_type=r["event_type"],
+                summary_text=r["summary_text"],
+                salience_score=float(r["salience_score"]),
+                embedding=None,
+            )
+            scored.append((total_score, rec))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        selected = [rec for _, rec in scored[:eff_k]]
 
         return RetrievalResult(
             agent_id=agent_id,
@@ -9831,7 +9258,7 @@ class EpisodicMemoryTMS:
             top_k_used=eff_k,
             noise_sigma_used=eff_sigma,
             friction_enabled=self.config.enabled,
-            total_candidate_pool=len(entries),
+            total_candidate_pool=len(rows),
         )
 
     def _update_peer_directory(
